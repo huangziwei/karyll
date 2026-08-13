@@ -1,9 +1,18 @@
 //! karyll — a Markdown writing app for the Kindle Scribe.
 
+mod font;
+
+mod render;
+mod screenshot;
+
+mod window;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use karyll_core::Document;
+
+use font::Metrics as _;
 
 fn main() -> Result<()> {
     eprintln!("karyll {} build {BUILD}", env!("CARGO_PKG_VERSION"));
@@ -777,6 +786,37 @@ impl Editor {
         }
     }
 
+    /// The panel's geometry, sized from the Latin face alone.
+    ///
+    /// Deliberately not from the document's faces: rows are already `lh * 2`
+    /// with a 96 px floor, so there is room to spare for a Han label, and
+    /// asking about the Han faces here would load 10 MB of them to open the
+    /// Files panel in an English session. Each label's own baseline still comes
+    /// from the faces it draws — that is `ui::draw_line`'s business.
+    fn layout(&mut self) -> ui::Layout {
+        let text = self.fonts.line_height(ui::TEXT_PX, font::LATIN_ROW) as u16;
+        let title = self.fonts.line_height(ui::TITLE_PX, font::LATIN_ROW) as u16;
+        ui::Layout::compute(text, title, self.window.height())
+    }
+
+    /// Whether a window y is on the page rather than on the chrome.
+    ///
+    /// Only while writing: with a panel open the same pixels are a list of
+    /// files or keyboards, and those rows outrank the document behind them.
+    fn writing_area(&mut self, y: u16) -> bool {
+        matches!(self.mode, Mode::Writing) && y < self.page_bottom()
+    }
+
+    /// Where the page ends: above the strip, or the foot of the panel when the
+    /// strip is out of the way.
+    fn page_bottom(&mut self) -> u16 {
+        if self.strip_visible() {
+            self.layout().strip_top
+        } else {
+            self.window.height()
+        }
+    }
+
     /// Switch to another document, saving the current one first.
     fn open(&mut self, path: PathBuf) -> Result<()> {
         self.load(path)?;
@@ -938,6 +978,14 @@ impl Editor {
         Ok(())
     }
 
+    fn page_lines(&mut self) -> i32 {
+        let roles = std::mem::take(&mut self.roles);
+        let lines =
+            render::lines_per_page(&mut self.fonts, &self.theme, &roles, self.window.height());
+        self.roles = roles;
+        lines
+    }
+
     fn save(&mut self) -> Result<()> {
         self.write_document("saved")
     }
@@ -992,6 +1040,186 @@ impl Editor {
             self.dirty_since = Some(now);
             self.last_edit = Some(now);
         }
+    }
+
+    fn paint(&mut self) -> Result<()> {
+        if !matches!(self.mode, Mode::Writing) {
+            // A panel covers the page, so what was last drawn no longer
+            // describes the screen; dropping it forces a full repaint when the
+            // document comes back.
+            self.frame = None;
+            let status = match &self.mode {
+                // The composition counts as typing: a writer three keystrokes
+                // into 日本語 has not typed a name yet as far as `name` is
+                // concerned, and telling them to type one would be answering a
+                // question they are in the middle of.
+                Mode::Naming { name, .. } if name.is_empty() && self.preedit.is_empty() => {
+                    "Type a name, then Enter. Esc cancels.".to_string()
+                }
+                Mode::Naming { name, .. } => format!("{name}{}.md", self.preedit),
+                Mode::Files(files) => {
+                    let total = files.len();
+                    let window = self.page_window();
+                    match total {
+                        0 => format!("Nothing in {DOCUMENTS} yet."),
+                        1 => format!("1 document in {DOCUMENTS}"),
+                        // Which of them are on screen, once they stop all
+                        // fitting — otherwise `More` is a button with nothing
+                        // saying what it will bring.
+                        n if n > window.len() => format!(
+                            "{}–{} of {n} documents in {DOCUMENTS}",
+                            window.start + 1,
+                            window.end.min(n)
+                        ),
+                        n => format!("{n} documents in {DOCUMENTS}"),
+                    }
+                }
+                // Its own arm, or it falls through to whatever the last one
+                // says. There is no Save on this page and nothing to confirm,
+                // so that is what it says.
+                Mode::Config => "Changes apply as you tap.".to_string(),
+                // The two keys that are not in the list below, because a list
+                // of what the keys do cannot name the key that opened it or the
+                // key that closes it — by then it is too late to read either.
+                Mode::Help => "Ctrl/⌘ + H opens this page.  Esc closes it.".to_string(),
+                // What a tap will do, and — once the list is longer than the
+                // page — which part of it is on screen, the same report the
+                // Files panel gives.
+                Mode::Outline(sections) => {
+                    let total = sections.len();
+                    let window = self.page_window();
+                    match total {
+                        0 => "Ctrl/⌘ + 1 … 6 makes a heading.".to_string(),
+                        n if n > window.len() => format!(
+                            "{}–{} of {n} sections. Tap one to go there.",
+                            window.start + 1,
+                            window.end.min(n)
+                        ),
+                        1 => "1 section. Tap it to go there.".to_string(),
+                        n => format!("{n} sections. Tap one to go there."),
+                    }
+                }
+                Mode::Writing => String::new(),
+            };
+            return self.show_status(&status);
+        }
+        // A panel covered the page, so the next paint starts from scratch —
+        // and that is also exactly when the bar needs drawing again.
+        let fresh = self.frame.is_none();
+        let (chars, preedit) = self.display();
+        let markup = karyll_core::markdown::analyze(&chars);
+        // The page reaches the foot of the panel while the chrome is away, so
+        // both the text and the centring measure against that rather than
+        // against a strip that is not there.
+        let bottom = self.page_bottom();
+        // Before the page borrows the theme, and it needs the faces to measure
+        // the strip it hangs off.
+        let anchor = self.overlay_anchor();
+        let page = render::Page::new(
+            &chars,
+            &markup,
+            &self.theme,
+            (self.window.width(), self.window.height()),
+            bottom,
+        )
+        .focused_on(self.focus_span(&chars))
+        .composing(preedit);
+        // Kept so page movement measures the same row the page is drawn with.
+        // A document with Han in it has taller rows, and paging by Latin rows
+        // in one would step past a line every screen.
+        self.roles = page.roles.clone();
+        let mut lines = render::layout(&page, &mut self.fonts, self.theme.margin_y as i32);
+        // Normal writing lets the caret run to the foot of the page; focus mode
+        // holds the sentence in the middle of it. One behaviour for both makes
+        // ordinary writing read as a half-applied focus mode — see
+        // `render::Scroll`.
+        let how = render::scroll_mode(
+            self.focus,
+            self.find.is_some(),
+            // Taken, not read: this placement belongs to the arrival, and the
+            // next paint follows the cursor like any other.
+            std::mem::take(&mut self.landing),
+            self.theme.margin_y as i32,
+            bottom as i32,
+            self.window.height() as i32,
+        );
+        // Display indices throughout: the caret belongs past the preedit,
+        // which is where the next keystroke lands.
+        let cursor = self.display_cursor();
+        self.scroll = render::scroll_for(&lines, cursor, self.scroll, how);
+        render::shift(&mut lines, self.scroll);
+        // A selection cannot survive a composition *in the page* — typing over
+        // one replaces it — so there is nothing here to translate into display
+        // space. A composition bound for the find bar is a different matter:
+        // the selection is the hit being searched for, and it has to stay
+        // inverted while the next word is typed into the bar.
+        let selection = self
+            .page_preedit()
+            .is_empty()
+            .then(|| self.doc.selection())
+            .flatten();
+        let editing = render::Editing {
+            cursor,
+            selection,
+            overlay: overlay(&self.candidates, self.announcing, self.language),
+            anchor,
+        };
+        self.frame = Some(render::paint(
+            &mut self.window,
+            &mut self.fonts,
+            &page,
+            lines,
+            &editing,
+            self.frame.as_ref(),
+        )?);
+        // The strip is chrome: always present, and always the way out. It only
+        // needs drawing when something covered it — a panel, or the first
+        // paint. Typing damages the page above it, so redrawing per keystroke
+        // would throw away the damage rectangle just computed.
+        //
+        // While composing it carries the candidates instead, and then it does
+        // change on every keystroke, because that is the whole point of it.
+        //
+        // Redrawn when what it would say differs from what is on it, the same
+        // rule the page uses. A flag for "was showing candidates" gets it wrong
+        // the other way: switching language repaints nothing, and the button
+        // goes on naming the previous one until something else forces a paint.
+        //
+        // While the chrome is away there is nothing to draw and nothing to
+        // remember drawing: the page has already been painted over those rows,
+        // and `strip_drawn` is cleared so that bringing the strip back does
+        // not compare equal and skip itself.
+        if !self.strip_visible() {
+            self.strip_drawn.clear();
+            self.status_drawn.clear();
+            return Ok(());
+        }
+        let cells = self.strip_cells();
+        // The status is compared alongside the buttons because it shares their
+        // band and their repaint. It is also the half that actually changes: the
+        // buttons say the same three words all session, while this counts the
+        // words and reports the save. Comparing only the cells would leave a
+        // count from before the last paragraph on screen — and, worse, leave it
+        // reading `not yet saved` after the autosave had run, which is the one
+        // thing this line exists to say.
+        let status = self.status_line();
+        if fresh || cells != self.strip_drawn || status != self.status_drawn {
+            let layout = self.layout();
+            let stretch = self.strip_stretch();
+            ui::paint_cells(
+                &mut self.window,
+                &mut self.fonts,
+                layout,
+                &cells,
+                &stretch,
+                &status,
+            );
+            self.strip_drawn = cells;
+            self.status_drawn = status;
+            self.window
+                .present(layout.strip_rect(self.window.width()))?;
+        }
+        Ok(())
     }
 
     /// Move the cursor by whole visual lines, dragging the selection along if
