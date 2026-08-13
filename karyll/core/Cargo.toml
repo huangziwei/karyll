@@ -1,0 +1,12 @@
+[package]
+name = "karyll-core"
+description = "Buffer, editing and line breaking for karyll. No I/O, no platform dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately dependency-free. Everything here is pure logic so it can be
+# exercised with `cargo test` on the host, and so it adds nothing to the static
+# cross-link.
+[dependencies]

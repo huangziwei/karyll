@@ -1,0 +1,5 @@
+# Default rustfmt style throughout. `edition` is pinned only so that rustfmt
+# invoked directly by an editor (rust-analyzer format-on-save, IDE actions)
+# matches `cargo fmt`, which otherwise reads the edition from each crate's
+# Cargo.toml.
+edition = "2024"

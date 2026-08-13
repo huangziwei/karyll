@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["karyll/core", "karyll/native"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[profile.release]
+# The device has ~514 MB free and ships the binary over MTP, so size is worth
+# more than the last few percent of speed.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
