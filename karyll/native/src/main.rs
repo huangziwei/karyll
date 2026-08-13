@@ -1,6 +1,10 @@
 //! karyll — a Markdown writing app for the Kindle Scribe.
 
+mod evdev;
 mod font;
+mod hid;
+
+mod keymap;
 
 mod render;
 mod screenshot;
@@ -13,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use karyll_core::Document;
 
 use font::Metrics as _;
+use keymap::{Action, Mods};
 
 fn main() -> Result<()> {
     eprintln!("karyll {} build {BUILD}", env!("CARGO_PKG_VERSION"));
@@ -817,6 +822,85 @@ impl Editor {
         }
     }
 
+    /// The Keyboard section: a line per keyboard, and the scan that finds more.
+    ///
+    /// Remembered keyboards first — the daemon keeps them and their link keys
+    /// across restarts, so this is where "already paired" is visible at all —
+    /// then anything a scan has turned up that is not already known, then the
+    /// scan itself.
+    ///
+    /// Each keyboard is **one line with its actions beside it** rather than the
+    /// two stacked rows this was when it had a screen of its own, where Forget
+    /// sat under the device it forgot and read like a second keyboard.
+    fn keyboard_items(&self) -> Vec<(ui::Item, ConfigRow)> {
+        let mut items: Vec<(ui::Item, ConfigRow)> = self
+            .paired
+            .iter()
+            .map(|device| {
+                // **A real toggle, because the chip was never inert.** It read
+                // `Connected` and was documented as doing nothing, but the
+                // action list beside it said `Connect` in both states — so
+                // tapping a keyboard that was already connected asked the
+                // daemon to connect it *again*, which tears the link down and
+                // builds it back up. That is the worst of the three readings:
+                // it looks like a status, it says it does nothing, and it
+                // disconnects you. The daemon has had `/disconnect` all along.
+                let connected = self.keyboard_present;
+                (
+                    ui::Item::Choice {
+                        label: device.name.clone(),
+                        options: vec![
+                            if connected { "Disconnect" } else { "Connect" }.into(),
+                            "Forget".into(),
+                        ],
+                        on: vec![connected, false],
+                    },
+                    ConfigRow::Keyboard(vec![
+                        if connected {
+                            KeyAction::Disconnect(device.clone())
+                        } else {
+                            KeyAction::Connect(device.clone())
+                        },
+                        KeyAction::Forget(device.clone()),
+                    ]),
+                )
+            })
+            .collect();
+
+        items.extend(
+            self.found
+                .iter()
+                .filter(|d| !self.paired.iter().any(|p| p.address == d.address))
+                .map(|device| {
+                    (
+                        ui::Item::Choice {
+                            label: format!("{}  ({})", device.name, device.protocol),
+                            options: vec!["Pair".into()],
+                            on: vec![false],
+                        },
+                        ConfigRow::Keyboard(vec![KeyAction::Pair(device.clone())]),
+                    )
+                }),
+        );
+
+        // Deliberately not started on opening Config. Scanning suspends the
+        // daemon — the log says `Connection cancelled (suspend)` — which drops
+        // the very keyboard being typed on. What is remembered shows without
+        // asking; scanning is a choice.
+        items.push((
+            ui::Item::Choice {
+                label: "Bluetooth".into(),
+                options: vec![match self.scanning {
+                    Some(started) => format!("Scanning… {}s", started.elapsed().as_secs()),
+                    None => "Scan for keyboards".into(),
+                }],
+                on: vec![self.scanning.is_some()],
+            },
+            ConfigRow::Keyboard(vec![KeyAction::Scan]),
+        ));
+        items
+    }
+
     /// Switch to another document, saving the current one first.
     fn open(&mut self, path: PathBuf) -> Result<()> {
         self.load(path)?;
@@ -853,6 +937,237 @@ impl Editor {
             power::prevent_screensaver(true);
             self.holding_awake = true;
         }
+    }
+
+    /// Start a scan. Results are collected by [`Editor::poll_scan`] on the
+    /// loop's tick.
+    ///
+    /// Not a blocking sleep: holding the loop for twenty seconds stops the
+    /// panel repainting and queues taps behind it, which reads as the app being
+    /// dead and invites tapping again.
+    fn start_scan(&mut self) -> Result<()> {
+        // Tapping the chip again while it counts would restart the ten seconds
+        // and leave the writer waiting longer for having asked twice.
+        if self.scanning.is_some() {
+            return Ok(());
+        }
+        if self.keyboard_present {
+            // Worth saying, because the keyboard will go quiet for the duration
+            // and come back on its own afterwards.
+            self.show_status("Scanning disconnects the keyboard for a moment…")?;
+        }
+        if !self.bluetooth.is_up()
+            && let Err(err) = self.bluetooth.start()
+        {
+            self.scanning = None;
+            return self.show_status(&format!("Bluetooth would not start: {err:#}"));
+        }
+        if let Err(err) = self.bluetooth.scan() {
+            self.scanning = None;
+            return self.show_status(&format!("Could not scan: {err:#}"));
+        }
+        self.scanning = Some(std::time::Instant::now());
+        self.polled = Some(std::time::Instant::now());
+        self.show_status("Scanning…")
+    }
+
+    /// Follow the framework if it has turned the screen under us.
+    ///
+    /// The compositor rotates our pixels for us, so nothing needs redrawing —
+    /// but the touchscreen is panel-fixed, so the mapping does change, and
+    /// without this every tap after a 180° flip lands on the mirror of where it
+    /// was aimed and the buttons appear dead.
+    /// Turn the page to match the way the device is being held.
+    ///
+    /// **Not a *Rotate* button**, which would be an invisible mode: turning the
+    /// Scribe ninety degrees would do nothing until you remembered the button
+    /// was there, and until you tapped it the app's idea of which way was up
+    /// would silently disagree with the
+    /// device's. The same argument that put the input source on the strip
+    /// applies here in reverse: the fix is to delete the mode, not to label it.
+    ///
+    /// An unrecognised code holds the current orientation rather than guessing.
+    /// The sensor emits a settling burst when it powers up, and a page that
+    /// spun on that would be worse than one that ignored it.
+    fn follow_device(&mut self, tilt: i32) -> Result<()> {
+        let Some(want) = orientation::Orientation::from_tilt(tilt) else {
+            return Ok(());
+        };
+        if want == self.window.orientation() {
+            return Ok(());
+        }
+        eprintln!("orientation: device turned, asking for {want:?}");
+        self.window.set_orientation(want)?;
+        self.touch_orientation = want;
+        self.orientation_checked = std::time::Instant::now();
+        // Kept only as the starting point for the next session's first paint,
+        // before the sensor has said anything. It is no longer a setting.
+        write_orientation(want);
+        // The window manager answers with a resize, which the loop picks up.
+        // Repaint anyway: if it declines, nothing else would.
+        self.frame = None;
+        self.paint()
+    }
+
+    /// Collect scan results while one is running. Called on every tick.
+    fn poll_scan(&mut self) -> Result<()> {
+        // Only while the panel that asked for it is open, or the poll goes on
+        // repainting the panel over whatever the writer went back to.
+        if !matches!(self.mode, Mode::Config) {
+            self.scanning = None;
+            return Ok(());
+        }
+        let Some(started) = self.scanning else {
+            return Ok(());
+        };
+        // Once a second, not once a tick.
+        let due = self
+            .polled
+            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1));
+        if !due {
+            return Ok(());
+        }
+        self.polled = Some(std::time::Instant::now());
+        let elapsed = started.elapsed().as_secs();
+        let (devices, done) = match self.bluetooth.scan_results() {
+            // Asked for but not begun. Waiting is the whole job here; calling it
+            // finished would end the scan before the radio had done anything.
+            Ok(hid::Scan::Starting) => {
+                return if elapsed >= SCAN_SECONDS {
+                    self.scanning = None;
+                    self.show_status("The scan never started. Try again.")
+                } else {
+                    self.show_status(&format!("Starting the scan… {elapsed}s"))
+                };
+            }
+            Ok(hid::Scan::Running(devices)) => (devices, elapsed >= SCAN_SECONDS),
+            Ok(hid::Scan::Done(devices)) => (devices, true),
+            Err(err) => {
+                self.scanning = None;
+                return self.show_status(&format!("Scan failed: {err:#}"));
+            }
+        };
+
+        let changed = self.found != devices;
+        if done {
+            self.scanning = None;
+        }
+        if changed || done {
+            self.found = devices;
+            return self.paint();
+        }
+        self.show_status(&format!("Scanning… {elapsed}s"))
+    }
+
+    /// Re-read what the daemon has paired.
+    fn refresh_paired(&mut self) {
+        self.paired = self.bluetooth.devices().unwrap_or_default();
+    }
+
+    /// Ask the daemon to reconnect a keyboard it already knows.
+    fn reconnect(&mut self, device: &hid::Device) -> Result<()> {
+        self.show_status(&format!("Connecting to {}…", device.name))?;
+        match self.bluetooth.connect(device) {
+            Ok(()) => self.show_status(&format!("Asked {} to connect.", device.name)),
+            Err(err) => self.show_status(&format!("Could not connect: {err:#}")),
+        }
+    }
+
+    /// Ask the daemon to drop the link, keeping the pairing.
+    ///
+    /// The node goes with it, and the session notices on the next tick and says
+    /// so, which is what makes this safe to offer: without that, dropping the
+    /// link would leave the app holding a dead descriptor for good.
+    fn disconnect(&mut self, device: &hid::Device) -> Result<()> {
+        self.show_status(&format!("Disconnecting {}…", device.name))?;
+        match self.bluetooth.disconnect(device) {
+            Ok(()) => self.show_status(&format!("Asked {} to disconnect.", device.name)),
+            Err(err) => self.show_status(&format!("Could not disconnect: {err:#}")),
+        }
+    }
+
+    /// Remove a paired keyboard, so it can be paired afresh.
+    fn forget(&mut self, device: &hid::Device) -> Result<()> {
+        self.show_status(&format!("Forgetting {}…", device.name))?;
+        if let Err(err) = self.bluetooth.remove(&device.address) {
+            return self.show_status(&format!("Could not forget it: {err:#}"));
+        }
+        self.refresh_paired();
+        self.show_status(&format!("Forgot {}.", device.name))
+    }
+
+    fn pair_with(&mut self, device: &hid::Device) -> Result<()> {
+        self.show_status(&format!("Pairing with {}…", device.name))?;
+        // Read the daemon's log from here on. A BLE keyboard has no display, so
+        // the host shows a passkey and the writer types it on the keyboard —
+        // and the daemon prints that passkey to its log and nowhere else. Every
+        // attempt makes a fresh one, so start from this attempt's mark.
+        let mark = self.bluetooth.log_mark();
+        if let Err(err) = self.bluetooth.pair(device) {
+            self.show_status(&format!("Could not pair: {err:#}"))?;
+            return Ok(());
+        }
+        let mut asked = false;
+        for _ in 0..PAIR_TICKS {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            // Repaint only when the passkey first appears: this is a panel on
+            // an e-ink screen, and once a second would be a flashing mess.
+            if !asked && let Some(hid::Prompt::Passkey(key)) = self.bluetooth.pair_prompt(mark) {
+                self.show_status(&format!("Type {key} on the keyboard, then Enter."))?;
+                asked = true;
+            }
+            match self.bluetooth.pair_done(&device.address) {
+                Ok(None) => continue,
+                Ok(Some(true)) => {
+                    let _ = self.bluetooth.connect(device);
+                    self.refresh_paired();
+                    self.show_status("Paired. Start typing.")?;
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    self.mode = Mode::Writing;
+                    return self.paint();
+                }
+                Ok(Some(false)) | Err(_) => {
+                    // Emphatically **not** removing the device here. A pair that
+                    // reports failure may still have completed — and deleting it
+                    // throws away a saved link key, so the next attempt starts
+                    // from nothing instead of reconnecting.
+                    let why = match self.bluetooth.pair_prompt(mark) {
+                        Some(hid::Prompt::Failed(reason)) => reason,
+                        // Nothing said: SMP simply ran out of its 30 seconds,
+                        // which is what an unanswered passkey looks like.
+                        _ if asked => "The code was not typed in time.".into(),
+                        _ => "Put it in pairing mode and try again.".into(),
+                    };
+                    self.show_status(&format!("Pairing failed. {why}"))?;
+                    return Ok(());
+                }
+            }
+        }
+        self.show_status("Pairing timed out.")
+    }
+
+    /// Repaint the current panel with `status` under its title.
+    fn show_status(&mut self, status: &str) -> Result<()> {
+        let layout = self.layout();
+        let items = self.visible_items();
+        let strip = self.strip_labels();
+        let title = match self.mode {
+            Mode::Files(_) => "Files",
+            Mode::Config => "Config",
+            Mode::Naming { for_new: true, .. } => "New document",
+            Mode::Naming { for_new: false, .. } => "Rename",
+            Mode::Help => "Help",
+            Mode::Outline(_) => "Outline",
+            Mode::Writing => "Karyll",
+        };
+        ui::Panel {
+            title,
+            status,
+            items: &items,
+            strip: &strip,
+            overlay: overlay(&self.candidates, self.announcing, self.language),
+        }
+        .paint(&mut self.window, &mut self.fonts, layout)
     }
 
     fn apply(&mut self, action: Action) -> Result<()> {
@@ -1262,6 +1577,118 @@ impl Editor {
         self.frame = Some(frame);
     }
 }
+
+/// Scan for Bluetooth keyboards and pair with one.
+///
+/// Needs a terminal — kterm or ssh — because it prints a list and reads a
+/// choice. Once a keyboard is paired the link key is kept, so this is a
+/// one-time step per keyboard and the editor never needs it again.
+///
+/// karyll drives this itself rather than deferring to the Bluetooth stack's own
+/// interactive mode, so there is one way in and one place the behaviour lives.
+fn pair() -> Result<()> {
+    let mut bluetooth = hid::Hid::beside_executable()?;
+    eprintln!("Starting the Bluetooth stack. This displaces the stock one until karyll exits.");
+    bluetooth.start()?;
+
+    let known = bluetooth.devices().unwrap_or_default();
+    if !known.is_empty() {
+        eprintln!("\nAlready paired:");
+        for device in &known {
+            eprintln!("  {} [{}] {}", device.address, device.protocol, device.name);
+        }
+    }
+
+    eprintln!("\nScanning. Put the keyboard into pairing mode now.");
+    bluetooth.scan()?;
+
+    let mut found = Vec::new();
+    for _ in 0..SCAN_SECONDS {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        match bluetooth.scan_results()? {
+            hid::Scan::Starting => continue,
+            hid::Scan::Running(devices) => {
+                found = devices;
+                eprint!("\r  {} found…    ", found.len());
+            }
+            hid::Scan::Done(devices) => {
+                found = devices;
+                break;
+            }
+        }
+    }
+    eprintln!();
+
+    if found.is_empty() {
+        bail!("nothing found — is the keyboard in pairing mode?");
+    }
+    for (i, device) in found.iter().enumerate() {
+        println!(
+            "  {:>2}. {} [{}] {}",
+            i + 1,
+            device.name,
+            device.protocol,
+            device.address
+        );
+    }
+
+    print!("\nPair with which? (number, or blank to cancel): ");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice)?;
+    let Some(device) = choice
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| found.get(n - 1))
+    else {
+        eprintln!("Cancelled.");
+        return Ok(());
+    };
+
+    eprintln!("Pairing with {}…", device.name);
+    let mark = bluetooth.log_mark();
+    bluetooth.pair(device)?;
+    let mut asked = false;
+    for _ in 0..PAIR_TICKS {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        // A BLE keyboard types the passkey in; the host is the side that shows
+        // it, and the daemon only ever writes it to its log.
+        if !asked && let Some(hid::Prompt::Passkey(key)) = bluetooth.pair_prompt(mark) {
+            eprintln!("Type {key} on the keyboard, then press Enter.");
+            asked = true;
+        }
+        match bluetooth.pair_done(&device.address)? {
+            None => continue,
+            Some(true) => {
+                // Connect straight away so the keyboard is usable now rather
+                // than after the next reconnect cycle.
+                if let Err(err) = bluetooth.connect(device) {
+                    eprintln!("Paired, but connecting now failed ({err:#}).");
+                }
+                eprintln!("Paired. Tap the karyll tile; it brings the keyboard up itself.");
+                return Ok(());
+            }
+            Some(false) => match bluetooth.pair_prompt(mark) {
+                Some(hid::Prompt::Failed(reason)) => bail!("pairing failed — {reason}"),
+                _ if asked => bail!("pairing failed — the code was not typed in time"),
+                _ => bail!("pairing failed — try again with the keyboard in pairing mode"),
+            },
+        }
+    }
+    bail!("pairing did not finish in time")
+}
+
+/// The daemon scans for a fixed **10 seconds** (`controller._do_scan`), BLE and
+/// Classic concurrently. This is only the safety net for a scan that never
+/// reports itself finished — the UI follows the daemon's own `scanning` flag,
+/// so a scan normally ends as soon as it is actually over.
+const SCAN_SECONDS: u64 = 14;
+/// Seconds to wait for pairing to settle. Longer than the SMP pairing timeout
+/// of 30 seconds plus the few the daemon spends suspending, powering the chip
+/// and connecting before it starts — otherwise this gives up first and reports
+/// a timeout of its own instead of the daemon's actual reason.
+const PAIR_TICKS: usize = 45;
 
 /// How often the loop wakes when nothing has happened. A held finger produces
 /// no events, so the long press needs a tick to be noticed; the same tick looks
