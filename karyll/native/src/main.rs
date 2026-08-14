@@ -1654,6 +1654,68 @@ impl Editor {
         Ok(false)
     }
 
+    /// A tap on a document's Delete chip: arm it, or carry it out.
+    ///
+    /// **Two taps, because there is no undo and no bin.** The chip says which
+    /// tap it is on, so the confirmation is where the finger already is rather
+    /// than in a panel covering the name being read off the list.
+    ///
+    /// Arming another document disarms the first, which is what makes a stray
+    /// tap harmless: the only way to reach the second tap is to aim at the same
+    /// chip twice.
+    fn arm_or_delete(&mut self, row: usize) -> Result<()> {
+        let Mode::Files(files) = &self.mode else {
+            return Ok(());
+        };
+        let Some(path) = files.get(row).map(|l| l.path.clone()) else {
+            return Ok(());
+        };
+        if self.arming.as_ref() != Some(&path) {
+            self.arming = Some(path);
+            return self.paint();
+        }
+        self.arming = None;
+        self.delete_document(&path)
+    }
+
+    /// Remove a document, and everything karyll remembers about it.
+    fn delete_document(&mut self, path: &Path) -> Result<()> {
+        if let Err(err) = std::fs::remove_file(path) {
+            return self.show_status(&format!("Could not delete it: {err:#}"));
+        }
+        forget_position(path);
+        eprintln!("deleted {}", path.display());
+
+        // **The open document needs disowning before anything else runs**, or
+        // the next thing to touch it puts it back: `open` saves a dirty buffer
+        // on the way out, and the buffer is still holding every word of the
+        // file just removed.
+        if self.path.as_deref() == Some(path) {
+            self.path = None;
+            self.doc.mark_saved();
+            let next = match list_documents().into_iter().next() {
+                Some(listing) => listing.path,
+                // Nothing left. A fresh one rather than an empty screen with no
+                // file behind it, which is a page that cannot be saved into —
+                // the same rule the launcher follows when it finds the
+                // directory empty.
+                None => {
+                    let path = new_document();
+                    let _ = std::fs::write(&path, "");
+                    path
+                }
+            };
+            self.load(next)?;
+        }
+
+        // Read again rather than dropping the row: the words and ages of
+        // everything else are a snapshot from when the panel opened, and one of
+        // them may be the document just opened in place of this.
+        self.mode = Mode::Files(list_documents());
+        self.panel_page = 0;
+        self.paint()
+    }
+
     /// Show what the keys and the glass do.
     fn open_help(&mut self) -> Result<()> {
         self.mode = Mode::Help;
@@ -1694,6 +1756,21 @@ impl Editor {
         // page remembering something the writer has moved on from.
         self.arming = None;
         self.mode = Mode::Writing;
+        self.paint()
+    }
+
+    /// Open the name prompt, for a new document or to rename the open one.
+    fn start_naming(&mut self, for_new: bool) -> Result<()> {
+        let name = if for_new {
+            String::new()
+        } else {
+            self.path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        self.mode = Mode::Naming { for_new, name };
         self.paint()
     }
 
@@ -1962,6 +2039,17 @@ impl Editor {
         if !self.holding_awake {
             power::prevent_screensaver(true);
             self.holding_awake = true;
+        }
+    }
+
+    /// Record where the cursor is in the open document.
+    ///
+    /// Called wherever a document is left — saved, switched away from, or
+    /// quit. Not in `Drop`: this binary is built with `panic = "abort"`, so
+    /// `Drop` is not a place anything important can live.
+    fn remember_position(&self) {
+        if let Some(path) = &self.path {
+            write_position(path, self.doc.cursor());
         }
     }
 
@@ -2290,6 +2378,89 @@ impl Editor {
             return self.paint();
         }
         self.show_status(&format!("Scanning… {elapsed}s"))
+    }
+
+    /// A keystroke the IME did not want, while a name is being typed. True once
+    /// the name is settled.
+    ///
+    /// Reached only after [`Editor::compose_key`] has passed, so `Enter` here
+    /// always means "this is the name" rather than "commit the word", and `Esc`
+    /// always means "never mind" rather than "drop the syllable".
+    fn typed_name(&mut self, action: &Action) -> Result<bool> {
+        let Mode::Naming { for_new, name } = &mut self.mode else {
+            return Ok(false);
+        };
+        let (for_new, mut name) = (*for_new, std::mem::take(name));
+
+        match action {
+            // `CommitTyped` as well, because that is what Shift+Enter is once
+            // there is no composition to commit, and a name field should not
+            // care which way the writer's little finger fell.
+            Action::Newline | Action::CommitTyped => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    // Enter on an empty name still means "make me one" for a
+                    // new document; it only cancels a rename, where there is
+                    // nothing sensible to invent.
+                    if for_new {
+                        let path = new_document();
+                        let _ = std::fs::write(&path, "");
+                        self.open(path)?;
+                    } else {
+                        self.mode = Mode::Writing;
+                        self.paint()?;
+                    }
+                    return Ok(true);
+                }
+                let path = PathBuf::from(format!("{DOCUMENTS}/{name}.md"));
+                if for_new {
+                    if !path.exists() {
+                        let _ = std::fs::write(&path, "");
+                    }
+                    self.open(path)?;
+                } else {
+                    self.rename_to(path)?;
+                }
+                return Ok(true);
+            }
+            Action::Escape => {
+                self.mode = Mode::Writing;
+                self.paint()?;
+                return Ok(true);
+            }
+            Action::Backspace => {
+                name.pop();
+            }
+            // As in the find bar: with a CJK engine on, every letter goes to
+            // the engine, so this is the only way back to a Latin filename.
+            Action::CycleLanguage => {
+                self.mode = Mode::Naming { for_new, name };
+                self.cycle_language();
+                self.paint()?;
+                return Ok(false);
+            }
+            Action::Insert(c) if in_filename(*c) => name.push(*c),
+            _ => {}
+        }
+        self.mode = Mode::Naming { for_new, name };
+        self.paint()?;
+        Ok(false)
+    }
+
+    /// Move the open document to `path`, keeping its contents.
+    fn rename_to(&mut self, path: PathBuf) -> Result<()> {
+        if let Some(old) = self.path.clone() {
+            self.save()?;
+            if old != path {
+                let _ = std::fs::rename(&old, &path);
+            }
+        } else {
+            let _ = std::fs::write(&path, self.doc.text());
+        }
+        self.path = Some(path);
+        self.doc.mark_saved();
+        self.mode = Mode::Writing;
+        self.paint()
     }
 
     /// Re-read what the daemon has paired.
@@ -3364,6 +3535,110 @@ fn write_language(language: Language) {
     let _ = std::fs::write(language_file(), language.letter().to_string());
 }
 
+/// Where each document was last being written.
+///
+/// **A writer opening a draft wants to carry on, not to travel.** `karyll.sh`
+/// already reopens the most recently touched document, so without this karyll
+/// remembers *which* draft and forgets *where* — which is the half that shows.
+///
+/// One line per document, `<index>\t<path>`, most recent first, and character
+/// indices throughout like everything else in `karyll-core` — a byte offset
+/// would land inside a codepoint in a Chinese draft.
+fn positions_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/positions")
+}
+
+/// How many documents are remembered. Small on purpose: the list is rewritten
+/// whole on every save, and a writer works on a handful of drafts.
+const POSITIONS_KEPT: usize = 64;
+
+/// The index comes first so that a path containing a tab still round-trips:
+/// everything after the first separator is the path.
+fn parse_positions(body: &str) -> Vec<(usize, String)> {
+    body.lines()
+        .filter_map(|line| {
+            let (index, path) = line.split_once('\t')?;
+            Some((index.trim().parse().ok()?, path.to_string()))
+        })
+        .collect()
+}
+
+/// Put `path` at the front with its new index, dropping any older entry for it.
+///
+/// Most-recent-first with a cap, so the file cannot grow without bound as
+/// drafts come and go.
+fn updated_positions(
+    mut entries: Vec<(usize, String)>,
+    path: &str,
+    cursor: usize,
+) -> Vec<(usize, String)> {
+    entries.retain(|(_, p)| p != path);
+    entries.insert(0, (cursor, path.to_string()));
+    entries.truncate(POSITIONS_KEPT);
+    entries
+}
+
+fn render_positions(entries: &[(usize, String)]) -> String {
+    entries
+        .iter()
+        .map(|(index, path)| format!("{index}\t{path}\n"))
+        .collect()
+}
+
+fn read_positions() -> Vec<(usize, String)> {
+    parse_positions(&std::fs::read_to_string(positions_file()).unwrap_or_default())
+}
+
+/// Where `path` was left, if it is remembered.
+fn read_position(path: &Path) -> Option<usize> {
+    let wanted = path.to_string_lossy();
+    read_positions()
+        .into_iter()
+        .find(|(_, p)| *p == wanted)
+        .map(|(index, _)| index)
+}
+
+/// Drop what was remembered about a document that no longer exists.
+///
+/// The list is short and capped, so a stale entry would age out on its own —
+/// but a new document can be given a deleted one's name, and inheriting a
+/// cursor from prose that is gone would open it somewhere meaningless.
+fn forget_position(path: &Path) {
+    let wanted = path.to_string_lossy();
+    let mut entries = read_positions();
+    entries.retain(|(_, p)| *p != wanted);
+    let _ = std::fs::write(positions_file(), render_positions(&entries));
+}
+
+fn write_position(path: &Path, cursor: usize) {
+    let entries = updated_positions(read_positions(), &path.to_string_lossy(), cursor);
+    let _ = std::fs::write(positions_file(), render_positions(&entries));
+}
+
+/// Where to put the cursor when a document opens.
+///
+/// **With nothing remembered the answer is the top.** Opening at the end would
+/// be a claim that the file is a draft being continued, and nothing supports
+/// that for a document karyll has never opened: it may as easily have arrived
+/// over USB or been put there by the app itself. The welcome document is the
+/// case that settles it — a page written to be read from its first line.
+///
+/// A stored index is clamped rather than distrusted. The file is plain Markdown
+/// on a volume that mounts over USB, so it can have been edited elsewhere and
+/// grown shorter — and landing mid-word is only a problem in theory, where
+/// refusing to restore at all is one in practice.
+fn opening_cursor_from(stored: Option<usize>, len: usize) -> usize {
+    stored.unwrap_or(0).min(len)
+}
+
+fn opening_cursor(path: &Path, len: usize) -> usize {
+    opening_cursor_from(read_position(path), len)
+}
+
+/// Where documents live. Outside the extension on purpose: updating karyll
+/// replaces that directory wholesale, and prose must not go with it.
+const DOCUMENTS: &str = "/mnt/us/karyll";
+
 /// What the keys and the glass do.
 ///
 /// **Laid out to the same grid as Config and Files**: the thing on the left, and
@@ -3460,6 +3735,120 @@ fn bracket(label: &str) -> String {
     } else {
         format!("[ {label} ]")
     }
+}
+
+/// Whether a character may go in a filename.
+///
+/// Only the three that would make a path of it. Han, kana and accented Latin
+/// are all perfectly good filenames on this filesystem, and a writer who works
+/// in Chinese should be able to say what a document is called in Chinese.
+fn in_filename(c: char) -> bool {
+    !matches!(c, '/' | '\\' | '\0')
+}
+
+/// A document as the Files panel knows it.
+///
+/// **Read once, when the panel opens.** `panel_items` is asked four times for a
+/// single tap — hit-test, invert, restore, dispatch — and counting the words in
+/// every document that often is real reading off eMMC. The count is a fact
+/// about the file at the moment it was listed, which is what a list is.
+#[derive(Debug, Clone)]
+struct Listing {
+    path: PathBuf,
+    words: usize,
+    modified: std::time::SystemTime,
+}
+
+/// Every `.md` in the documents directory, newest first.
+fn list_documents() -> Vec<Listing> {
+    let mut files: Vec<Listing> = std::fs::read_dir(DOCUMENTS)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .map(|path| {
+            let modified = path
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let words = std::fs::read_to_string(&path)
+                .map(|text| karyll_core::words::count(&text.chars().collect::<Vec<_>>()))
+                .unwrap_or(0);
+            Listing {
+                path,
+                words,
+                modified,
+            }
+        })
+        .collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.modified));
+    files
+}
+
+/// How long ago, in the coarsest unit that still says something.
+///
+/// **No calendar and no timezone.** A civil date needs both, and neither is in
+/// `std` — but "3 days ago" is what a writer actually wants to know about a
+/// draft, and it needs only a duration. It is also the more useful answer:
+/// nobody remembers which of their drafts was 12 August.
+fn ago(since: std::time::Duration) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let s = since.as_secs();
+    let plural = |n: u64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{n} {unit}s ago")
+        }
+    };
+    match s {
+        0..MINUTE => "just now".into(),
+        MINUTE..HOUR => plural(s / MINUTE, "minute"),
+        HOUR..DAY => plural(s / HOUR, "hour"),
+        // Not "1 day ago", which is a clumsy way to say a word that exists.
+        DAY..172_800 => "yesterday".into(),
+        172_800..2_592_000 => plural(s / DAY, "day"),
+        2_592_000..31_536_000 => plural(s / 2_592_000, "month"),
+        _ => plural(s / 31_536_000, "year"),
+    }
+}
+
+/// What the Files panel says about one document, beside its name.
+fn describe_listing(words: usize, modified: std::time::SystemTime, open: bool) -> String {
+    let when = std::time::SystemTime::now()
+        .duration_since(modified)
+        // A file stamped in the future — a device whose clock has just been
+        // set, which this one does after every sleep. Not an error worth
+        // showing; it was written as recently as anything can have been.
+        .map(ago)
+        .unwrap_or_else(|_| "just now".into());
+    let words = karyll_core::words::describe(words);
+    if open {
+        // Said in words as well as in bold, because this is the document the
+        // strip's Rename acts on and that must not be a guess.
+        format!("open  ·  {words}  ·  {when}")
+    } else {
+        format!("{words}  ·  {when}")
+    }
+}
+
+/// A path for a new document. Numbered rather than timestamped, because the
+/// clock on a device that has been asleep is not to be trusted for naming.
+fn new_document() -> PathBuf {
+    for n in 1..1000 {
+        // `exists` alone. Checking the listing as well asks the same question
+        // of the same directory twice — and the listing reads every document to
+        // count its words, which is a lot
+        // of I/O to choose a filename with.
+        let path = PathBuf::from(format!("{DOCUMENTS}/draft-{n}.md"));
+        if !path.exists() {
+            return path;
+        }
+    }
+    PathBuf::from(format!("{DOCUMENTS}/draft.md"))
 }
 
 /// How far a finger may wander and still count as having stayed put.
@@ -3624,6 +4013,42 @@ mod tests {
     }
 
     #[test]
+    fn a_documents_age_reads_in_the_coarsest_unit_that_says_something() {
+        let secs = |n| ago(Duration::from_secs(n));
+        assert_eq!(secs(0), "just now");
+        assert_eq!(secs(59), "just now");
+        assert_eq!(secs(60), "1 minute ago");
+        assert_eq!(secs(3599), "59 minutes ago");
+        assert_eq!(secs(3600), "1 hour ago");
+        assert_eq!(secs(86_399), "23 hours ago");
+        // The one unit with a word of its own, and using it is the point.
+        assert_eq!(secs(86_400), "yesterday");
+        assert_eq!(secs(172_799), "yesterday");
+        assert_eq!(secs(172_800), "2 days ago");
+        assert_eq!(secs(2_591_999), "29 days ago");
+        assert_eq!(secs(2_592_000), "1 month ago");
+        assert_eq!(secs(31_535_999), "12 months ago");
+        assert_eq!(secs(31_536_000), "1 year ago");
+    }
+
+    /// The device sets its clock after a sleep, so a file can carry a stamp
+    /// slightly in the future. That is not an error worth putting on screen.
+    #[test]
+    fn a_file_stamped_in_the_future_reads_as_just_now() {
+        let ahead = std::time::SystemTime::now() + Duration::from_secs(600);
+        assert!(describe_listing(3, ahead, false).ends_with("just now"));
+    }
+
+    #[test]
+    fn the_open_document_says_so_beside_its_name() {
+        let now = std::time::SystemTime::now();
+        assert!(describe_listing(1_284, now, true).starts_with("open"));
+        assert!(describe_listing(1_284, now, true).contains("1,284 words"));
+        assert!(!describe_listing(1_284, now, false).contains("open"));
+        assert!(describe_listing(0, now, false).contains("empty"));
+    }
+
+    #[test]
     fn text_before_the_preedit_is_at_the_same_index_in_both_spaces() {
         // Cursor at 5 with three characters composing. Everything up to the
         // cursor is untouched by the splice.
@@ -3668,6 +4093,18 @@ mod tests {
         let composing = page_composition("にほん", Sink::Find).chars().count();
         for display in 0..12 {
             assert_eq!(document_index(display, 5, composing), display);
+        }
+    }
+
+    #[test]
+    fn a_filename_may_be_written_in_any_script() {
+        // Only what would make a path of it is barred. A writer who works in
+        // Chinese should be able to say what a document is called in Chinese.
+        for c in ['日', '本', 'ぬ', 'é', '中', '_', ' ', '.'] {
+            assert!(in_filename(c), "{c} is a perfectly good filename");
+        }
+        for c in ['/', '\\', '\0'] {
+            assert!(!in_filename(c));
         }
     }
 
@@ -3892,4 +4329,76 @@ mod tests {
         }
     }
 
+    mod position {
+        use super::*;
+
+        /// The whole point of the feature: a draft opens where it was left.
+        #[test]
+        fn a_remembered_place_is_where_the_document_opens() {
+            assert_eq!(opening_cursor_from(Some(1200), 5000), 1200);
+        }
+
+        /// **The fallback is the top.** The end would be a claim that the file
+        /// is a draft being continued, which nothing supports for a document
+        /// karyll has never opened.
+        #[test]
+        fn a_document_never_seen_before_opens_at_its_top() {
+            assert_eq!(opening_cursor_from(None, 5000), 0);
+            assert_eq!(opening_cursor_from(None, 0), 0);
+        }
+
+        /// The file is plain Markdown on a volume that mounts over USB, so it
+        /// can have been shortened elsewhere between sessions. Clamping beats
+        /// refusing to restore.
+        #[test]
+        fn a_stale_place_past_the_end_is_clamped() {
+            assert_eq!(opening_cursor_from(Some(9000), 40), 40);
+        }
+
+        #[test]
+        fn positions_survive_a_round_trip() {
+            let entries = vec![
+                (12, "/mnt/us/karyll/draft.md".to_string()),
+                (0, "/mnt/us/karyll/你好.md".to_string()),
+            ];
+            assert_eq!(parse_positions(&render_positions(&entries)), entries);
+        }
+
+        /// A path is allowed to contain the separator, because the index is
+        /// written first and everything after it is the path.
+        #[test]
+        fn a_tab_in_a_path_survives() {
+            let entries = vec![(7, "/mnt/us/karyll/od\td.md".to_string())];
+            assert_eq!(parse_positions(&render_positions(&entries)), entries);
+        }
+
+        #[test]
+        fn a_damaged_line_is_skipped_rather_than_taking_the_file_with_it() {
+            let parsed = parse_positions("not a position\n12\t/a.md\n\nxx\t/b.md\n");
+            assert_eq!(parsed, vec![(12, "/a.md".to_string())]);
+        }
+
+        /// Writing a place again replaces the old one instead of stacking, or
+        /// the file grows by a line per save and the stale entry is found first.
+        #[test]
+        fn writing_a_place_again_moves_it_to_the_front() {
+            let entries = vec![(1, "/a.md".to_string()), (2, "/b.md".to_string())];
+            let after = updated_positions(entries, "/b.md", 99);
+            assert_eq!(
+                after,
+                vec![(99, "/b.md".to_string()), (1, "/a.md".to_string())]
+            );
+        }
+
+        #[test]
+        fn the_list_is_capped_so_it_cannot_grow_forever() {
+            let mut entries = Vec::new();
+            for i in 0..POSITIONS_KEPT + 20 {
+                entries = updated_positions(entries, &format!("/{i}.md"), i);
+            }
+            assert_eq!(entries.len(), POSITIONS_KEPT);
+            // Newest first, so the draft just written is the one kept.
+            assert_eq!(entries[0].1, format!("/{}.md", POSITIONS_KEPT + 19));
+        }
+    }
 }

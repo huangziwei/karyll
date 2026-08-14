@@ -225,6 +225,24 @@ impl Panel<'_> {
     }
 }
 
+/// Where a row's own action chip sits: the right margin, and the same height
+/// and vertical placing as any other chip.
+///
+/// It is measured from the right rather than laid out from the left, so it
+/// holds the same edge whatever the row is called — a column of them lines up
+/// down the page, and none of them moves when a document is renamed.
+pub fn action_rect(
+    layout: Layout,
+    item: usize,
+    width: u16,
+    label: &str,
+    mut measure_text: impl FnMut(&str) -> u16,
+) -> Rect {
+    let w = measure_text(label).saturating_add(CHIP_PAD * 2);
+    let x = width.saturating_sub(MARGIN_X).saturating_sub(w);
+    chip_slot(layout, item, x, w)
+}
+
 /// Whether a point is inside a rectangle.
 fn inside(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
@@ -1148,6 +1166,71 @@ mod tests {
         assert!(a.y >= l.strip_top, "and stay inside the strip");
         assert_eq!(a.y + a.height, l.strip_top + STRIP_H);
         assert!(b.width > a.width, "the longer label gets the wider cell");
+    }
+
+    /// A row opens what it names, so the chip that removes it is pinned to the
+    /// far margin — and has to be asked about *before* the row it sits on, or a
+    /// tap meant to delete a document would open it instead.
+    #[test]
+    fn a_rows_action_chip_is_hit_before_the_row_under_it() {
+        let l = layout();
+        let items = vec![Item::Row {
+            label: "Welcome.md".into(),
+            detail: "482 words · just now".into(),
+            on: true,
+            action: Some("Delete".into()),
+        }];
+        let middle = l.rows_top + l.row_h / 2;
+        let chip = action_rect(l, 0, WIDTH, "Delete", stub);
+
+        assert_eq!(
+            hit(&items, l, WIDTH, chip.x + chip.width / 2, middle, stub),
+            Some(Hit::Option(0, 0)),
+            "the chip is the chip"
+        );
+        assert_eq!(
+            hit(&items, l, WIDTH, ROW_INSET + 10, middle, stub),
+            Some(Hit::Row(0)),
+            "and the name is still the row"
+        );
+        // Which is only safe because they are nowhere near each other.
+        assert!(
+            chip.x > WIDTH / 2,
+            "the chip is at the far margin, not beside the name: {chip:?}"
+        );
+        assert_eq!(chip.x + chip.width, WIDTH - MARGIN_X);
+    }
+
+    /// The chip holds one edge whatever the row is called, so a column of them
+    /// lines up and none of them moves when a document is renamed.
+    #[test]
+    fn action_chips_line_up_however_long_the_names_are() {
+        let l = layout();
+        let short = action_rect(l, 0, WIDTH, "Delete", stub);
+        let same = action_rect(l, 3, WIDTH, "Delete", stub);
+        assert_eq!(short.x, same.x);
+        // And an armed one grows leftward rather than off the edge.
+        let armed = action_rect(l, 0, WIDTH, "Delete?", stub);
+        assert_eq!(armed.x + armed.width, short.x + short.width);
+        assert!(armed.x < short.x);
+    }
+
+    /// A row with no action is untouched by any of it: every tap on it is the
+    /// row, including one at the far margin where another row's chip would be.
+    #[test]
+    fn a_row_without_an_action_has_no_dead_corner() {
+        let l = layout();
+        let items = vec![Item::Row {
+            label: "draft.md".into(),
+            detail: "12 words · yesterday".into(),
+            on: false,
+            action: None,
+        }];
+        let middle = l.rows_top + l.row_h / 2;
+        assert_eq!(
+            hit(&items, l, WIDTH, WIDTH - MARGIN_X - 10, middle, stub),
+            Some(Hit::Row(0))
+        );
     }
 
     #[test]
