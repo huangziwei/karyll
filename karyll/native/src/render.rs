@@ -93,6 +93,19 @@ fn ink(inverted: bool, quiet: bool) -> u8 {
     }
 }
 
+/// How wide the caret is drawn, at a given type size.
+///
+/// Scaled rather than fixed, so it stays the same weight against the text
+/// whatever `body_px` becomes. At 46 px that is 6 px — about 0.5 mm on a 300 ppi
+/// panel. 2 px is 0.17 mm and reads as a hairline. The floor keeps it visible
+/// if the type is ever set very small.
+///
+/// A bar rather than a block: this editor is always inserting and the caret sits
+/// *between* two characters, so a block would sit on top of the one after it.
+fn caret_width(px: f32) -> u16 {
+    (px / 8.0).round().max(3.0) as u16
+}
+
 /// The text column on a surface `width` wide: where it starts, and how wide.
 ///
 /// **Fitted to the surface, not taken from the theme.** The measure scales with

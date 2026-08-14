@@ -3,7 +3,7 @@
 mod evdev;
 mod font;
 mod hid;
-
+mod ime;
 mod keymap;
 
 mod render;
@@ -215,6 +215,146 @@ fn wait(fds: &[std::os::unix::io::RawFd], timeout_ms: i32) -> Result<Vec<bool>> 
     }
 }
 
+/// An input source: what Ctrl+Space and the language button move between.
+///
+/// One cycle rather than a layout switch and an IME switch, because they are
+/// one decision to the writer — "I am writing German now" — and two controls
+/// for one decision is the same trap as two lists for one thing.
+///
+/// This is macOS's model, which is the reference for input behaviour here: the
+/// list holds keyboards *and* input methods together, and one shortcut walks it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Language {
+    #[default]
+    /// English. Named for the language rather than for the `US` layout it is
+    /// written on — the layout is what [`Language::layout`] answers, and `US`
+    /// is not a language.
+    English,
+    German,
+    Chinese,
+    /// Traditional Chinese. The same pinyin engine — there is only one Chinese
+    /// dictionary on the device and it is Simplified — with the engine's own
+    /// converter applied to every candidate.
+    ChineseTraditional,
+    /// Japanese: romaji typed, kana and kanji out. A different engine from
+    /// Chinese's — Omron iWnn rather than XT9 — behind the same plugin ABI.
+    Japanese,
+}
+
+impl Language {
+    const ALL: [Language; 5] = [
+        Language::English,
+        Language::German,
+        Language::Chinese,
+        Language::ChineseTraditional,
+        Language::Japanese,
+    ];
+
+    /// What the button says. Each names itself the way its writers would, and
+    /// the CJK entries name themselves in their own script.
+    fn label(self) -> &'static str {
+        match self {
+            Language::English => "EN",
+            Language::German => "DE",
+            Language::Chinese => "简体",
+            Language::ChineseTraditional => "繁體",
+            Language::Japanese => "日本語",
+        }
+    }
+
+    fn letter(self) -> char {
+        match self {
+            Language::English => 'e',
+            Language::German => 'd',
+            Language::Chinese => 'c',
+            Language::ChineseTraditional => 't',
+            Language::Japanese => 'j',
+        }
+    }
+
+    fn from_letter(s: &str) -> Language {
+        match s.trim() {
+            "d" => Language::German,
+            "c" => Language::Chinese,
+            "t" => Language::ChineseTraditional,
+            "j" => Language::Japanese,
+            _ => Language::English,
+        }
+    }
+
+    /// Whether the engine should convert its candidates to Traditional.
+    fn traditional(self) -> bool {
+        matches!(self, Language::ChineseTraditional)
+    }
+
+    /// Which input method's rules apply, and so which engine to load. `None`
+    /// for the languages typed straight onto the page.
+    fn script(self) -> Option<ime::Script> {
+        match self {
+            Language::Chinese | Language::ChineseTraditional => Some(ime::Script::Chinese),
+            Language::Japanese => Some(ime::Script::Japanese),
+            Language::English | Language::German => None,
+        }
+    }
+
+    /// Which regional convention the Han faces should follow while this
+    /// language is selected.
+    ///
+    /// The Latin languages keep whatever was last set rather than forcing a
+    /// convention of their own: switching to English to type a word in the
+    /// middle of a Japanese paragraph must not re-cut the kanji around it.
+    fn region(self) -> Option<karyll_core::script::Region> {
+        match self {
+            Language::Chinese => Some(karyll_core::script::Region::Simplified),
+            Language::ChineseTraditional => Some(karyll_core::script::Region::Traditional),
+            Language::Japanese => Some(karyll_core::script::Region::Japanese),
+            Language::English | Language::German => None,
+        }
+    }
+
+    /// The next input source in the cycle, among those switched on.
+    ///
+    /// **Cycling only the enabled ones is the whole point of enabling them.**
+    /// This writer uses five; someone who writes only English should not press
+    /// `Ctrl+Space` four times to arrive back where they started. The order is
+    /// `ALL`'s, so turning one off closes the gap rather than reshuffling the
+    /// rest.
+    ///
+    /// A source that is not itself enabled still cycles forward from where it
+    /// sits in `ALL` — that is what makes turning off the *current* language
+    /// leave somewhere sensible to go.
+    fn next(self, enabled: &[Language]) -> Language {
+        let from = Language::ALL.iter().position(|l| *l == self).unwrap_or(0);
+        Language::ALL
+            .iter()
+            .cycle()
+            .skip(from + 1)
+            .take(Language::ALL.len())
+            .find(|l| enabled.contains(l))
+            .copied()
+            .unwrap_or(self)
+    }
+
+    /// The keyboard arrangement this language is written on.
+    ///
+    /// **A language determines its layout — they are not two settings.** There
+    /// is no layout control anywhere in karyll, only this: choosing German
+    /// chooses QWERTZ, and a French entry would choose AZERTY.
+    ///
+    /// Chinese is US, and Japanese would be too. Pinyin and romaji are both
+    /// defined against the QWERTY letter arrangement — that is what every IME
+    /// assumes and what macOS does regardless of the hardware underneath — so
+    /// they do not inherit whatever keyboard was last used for prose.
+    fn layout(self) -> keymap::Layout {
+        match self {
+            Language::German => keymap::Layout::German,
+            // Everything else is written on QWERTY: pinyin and romaji are both
+            // defined against that arrangement.
+            _ => keymap::Layout::Us,
+        }
+    }
+}
+
 /// What the screen is showing. The menus are modal: they take the whole
 /// surface, because a finger needs room and the document has nothing useful to
 /// say behind them.
@@ -254,6 +394,27 @@ enum Mode {
     /// Read when the panel opens, like the Files list, and for the same reason:
     /// the list is a fact about the document at the moment it was asked for.
     Outline(Vec<Section>),
+}
+
+/// Where typed text lands.
+///
+/// There is one IME, one composition and one candidate box. The only thing that
+/// differs between typing into the page, into the find bar and into a filename
+/// is where a finished word goes and where the half-typed one is shown — so
+/// that difference is named once, here, and every path that commits text asks.
+///
+/// The alternative is a second copy of the compose loop per field, which is
+/// "one list, not two" with the IME attached: the engine holds one composition
+/// whichever field is being typed into, and two places deciding what to do with
+/// it would disagree the first time one of them was changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    /// The document.
+    Page,
+    /// The find bar's query.
+    Find,
+    /// The filename being typed.
+    Name,
 }
 
 struct Editor {
@@ -812,6 +973,27 @@ impl Editor {
         matches!(self.mode, Mode::Writing) && y < self.page_bottom()
     }
 
+    /// Which candidate a point falls on, if the box is on screen and the point
+    /// is inside it.
+    ///
+    /// Measured against the box the last paint actually drew, the way the tap
+    /// test already works for the strip — recomputing the geometry here is how
+    /// the two copies drift apart.
+    fn candidate_at(&mut self, x: u16, y: u16) -> Option<usize> {
+        let rect = self.frame.as_ref()?.candidate_box()?;
+        if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
+            return None;
+        }
+        // The cells the box was drawn from, by the same function that drew
+        // them. Measuring something other than what is on screen is how a tap
+        // lands on the wrong one.
+        let labels = ui::Overlay::Candidates(&self.candidates).labels();
+        let cells = ui::overlay_cells(&mut self.fonts, rect, self.theme.body_px, &labels);
+        // `None` past the last cell: inside the box but beyond the choices
+        // belongs to nothing.
+        ui::cell_at(&cells, x)
+    }
+
     /// Where the page ends: above the strip, or the foot of the panel when the
     /// strip is out of the way.
     fn page_bottom(&mut self) -> u16 {
@@ -1007,6 +1189,74 @@ impl Editor {
         // Repaint anyway: if it declines, nothing else would.
         self.frame = None;
         self.paint()
+    }
+
+    /// The document as it should appear right now, with any preedit spliced in
+    /// at the cursor, and where that preedit sits.
+    ///
+    /// **Every `Page` in the app is built from this and nothing else.** Once
+    /// the preedit is in the text, display indices stop matching document
+    /// indices, and a second place that laid out `doc.chars()` instead would
+    /// disagree with the frame on screen about where every character after the
+    /// cursor is. One buffer, one index space; [`Editor::document_index`] is
+    /// the only way back.
+    fn display(&self) -> (Vec<char>, Option<std::ops::Range<usize>>) {
+        let mut chars = self.doc.chars();
+        let composing = self.page_preedit();
+        if composing.is_empty() {
+            return (chars, None);
+        }
+        let at = self.doc.cursor().min(chars.len());
+        let preedit: Vec<char> = composing.chars().collect();
+        let span = at..at + preedit.len();
+        chars.splice(at..at, preedit);
+        (chars, Some(span))
+    }
+
+    /// Where a keystroke goes right now.
+    ///
+    /// Naming outranks the find bar for the same reason the key loop routes
+    /// that way: a panel covers the page, and a bar underneath one is not
+    /// reachable. They cannot in fact both be open — the find bar takes the
+    /// strip, so there is no `New` button on it — but the order says which
+    /// would win rather than leaving it to whichever test is written first.
+    fn sink(&self) -> Sink {
+        sink_for(
+            matches!(self.mode, Mode::Naming { .. }),
+            self.find.is_some(),
+        )
+    }
+
+    /// The composition **as far as the page is concerned**: empty unless the
+    /// page is what is being typed into.
+    ///
+    /// Everything that lays the document out asks here rather than reading
+    /// `preedit` directly — the splice, the caret, the index conversion, the
+    /// selection. A composition bound for the find bar must not appear in the
+    /// prose, and must not shift the indices of the text after the cursor
+    /// either: the hits are document indices, and a preedit that moved them
+    /// would highlight the wrong characters while a word was being typed.
+    fn page_preedit(&self) -> &str {
+        page_composition(&self.preedit, self.sink())
+    }
+
+    /// Where the caret goes in display space: past the preedit, which is where
+    /// the next keystroke will land.
+    fn display_cursor(&self) -> usize {
+        self.doc.cursor() + self.page_preedit().chars().count()
+    }
+
+    /// Turn a display index back into a document one.
+    ///
+    /// Anything at or after the preedit is that much further along in the
+    /// display than it is in the document. The preedit's own characters belong
+    /// to no document position, so they collapse onto the cursor.
+    fn document_index(&self, display: usize) -> usize {
+        document_index(
+            display,
+            self.doc.cursor(),
+            self.page_preedit().chars().count(),
+        )
     }
 
     /// Collect scan results while one is running. Called on every tick.
@@ -1301,6 +1551,285 @@ impl Editor {
         lines
     }
 
+    /// Move to the next input source. Ctrl+Space and the language button are
+    /// the same action, so they cannot disagree about what is selected.
+    fn cycle_language(&mut self) {
+        self.set_language(self.language.next(&self.enabled));
+        // Say which one, beside the caret. The strip is hidden while writing,
+        // so nothing else answers it and `Ctrl+Space` would cycle blind.
+        self.announcing = true;
+    }
+
+    /// Select an input source: its keyboard, its input method, and the regional
+    /// convention its Han faces follow.
+    ///
+    /// Each engine is loaded the first time it is asked for rather than at
+    /// startup, because bringing a plugin up maps its dictionaries — 1.4 MB for
+    /// Chinese, some 17 MB for Japanese — and a session that only writes German
+    /// should not pay for either. A failure is reported and the source is left
+    /// selected without an engine: an editor that refused to switch language
+    /// because a plugin was missing would be a worse editor than one that types
+    /// Latin letters.
+    /// Take up the language the last session ended in.
+    ///
+    /// Through [`Editor::set_language`], because a language is not a label — it
+    /// is an IME, a keyboard layout and a set of Han faces, and only that
+    /// function applies all four. Assigning the field at construction restored
+    /// the button and nothing behind it: the strip read 日本語 while the keys
+    /// typed English, and the next cycle stepped on from the name rather than
+    /// from what was actually selected.
+    ///
+    /// The engine loads here for a session resuming into CJK, which is the
+    /// point — a session that resumes into English still loads none.
+    fn resume_language(mut self, language: Language) -> Self {
+        self.set_language(language);
+        self
+    }
+
+    fn set_language(&mut self, language: Language) {
+        self.abandon_composition();
+        self.language = language;
+        write_language(language);
+
+        if let Some(region) = language.region() {
+            self.fonts.set_region(region);
+        }
+
+        self.cjk = match language.script() {
+            Some(script) => self.load_engine(script),
+            None => false,
+        };
+        if let Some(engine) = self.engine() {
+            engine.set_traditional(language.traditional());
+        }
+        eprintln!(
+            "language: {} ({} keyboard)",
+            language.label(),
+            language.layout().name()
+        );
+    }
+
+    /// Make sure `script`'s engine is loaded, and say whether it is usable.
+    fn load_engine(&mut self, script: ime::Script) -> bool {
+        if self.engines.iter().any(|(s, _)| *s == script) {
+            return true;
+        }
+        let loaded: Result<Box<dyn ime::Ime>, String> = match script {
+            ime::Script::Chinese => ime::Chinese::open().map(|e| Box::new(e) as Box<dyn ime::Ime>),
+            ime::Script::Japanese => {
+                ime::Japanese::open().map(|e| Box::new(e) as Box<dyn ime::Ime>)
+            }
+        };
+        match loaded {
+            Ok(engine) => {
+                eprintln!("ime: {script:?} engine loaded");
+                self.engines.push((script, engine));
+                true
+            }
+            Err(err) => {
+                eprintln!("ime: {err}");
+                false
+            }
+        }
+    }
+
+    /// The engine for the language now selected, if it has one and it loaded.
+    fn engine(&mut self) -> Option<&mut Box<dyn ime::Ime>> {
+        let script = self.language.script()?;
+        self.engines
+            .iter_mut()
+            .find(|(s, _)| *s == script)
+            .map(|(_, e)| e)
+    }
+
+    /// Offer a keystroke to Chinese input. Returns whether it was consumed.
+    ///
+    /// Every rule about *what* a key means lives in [`ime::compose`], which is
+    /// pure and tested. This is only the part that needs the engine and the
+    /// document.
+    fn compose_key(&mut self, action: &Action) -> bool {
+        let Some(script) = self.language.script() else {
+            return false;
+        };
+        if !self.cjk {
+            return false;
+        }
+        // Asked of [`Editor::composing`] rather than of `typed`, so that one
+        // answer drives the rules, the bar and the hit-testing together. They
+        // can disagree: Japanese swallows a space as a conversion request, so
+        // `typed` grows a character the engine's own composition does not have,
+        // and a backspace then empties `typed` while the engine is still
+        // holding kana. Keying the rules off `typed` would stop composing with
+        // a composition still on screen.
+        match ime::compose(action, self.composing(), script) {
+            ime::Compose::Pass => return false,
+            // Backspace is fed to the engine, which drops one unit and
+            // re-predicts, so what is shown follows rather than leads.
+            ime::Compose::Feed('\u{8}') => {
+                self.typed.pop();
+                self.feed('\u{8}');
+                if self.typed.is_empty() {
+                    self.candidates.clear();
+                }
+            }
+            ime::Compose::Feed(c) => {
+                self.typed.push(c);
+                self.feed(c);
+            }
+            ime::Compose::Select(n) => self.select_candidate(n),
+            // A capital ends the word being composed and then lands on the
+            // page itself, the same shape as punctuation: typing `中国NASA`
+            // should not need the mode switched off and back.
+            ime::Compose::Latin(c) => {
+                self.commit_composition(script);
+                self.insert_committed(&c.to_string());
+            }
+            // The letters as struck, rather than the kana they turned into.
+            ime::Compose::CommitTyped => {
+                let text = std::mem::take(&mut self.typed);
+                self.abandon_composition();
+                self.insert_committed(&text);
+            }
+            // Punctuation ends the word being composed and then adds the mark.
+            // Typing "nihao," should give 你好， without a separate keystroke
+            // to accept 你好.
+            ime::Compose::Punctuate(key) => {
+                self.commit_composition(script);
+                if let Some(text) = self.punctuation.resolve(script, key) {
+                    self.insert_committed(text);
+                }
+            }
+            // What is composed, as it stands: pinyin for an English word that
+            // did not need converting, kana for Japanese that is meant to stay
+            // kana. Nothing is fed to the engine, so it is told to reset.
+            ime::Compose::CommitRaw => {
+                let text = std::mem::take(&mut self.preedit);
+                self.abandon_composition();
+                self.insert_committed(&text);
+            }
+            ime::Compose::Cancel => self.abandon_composition(),
+        }
+        true
+    }
+
+    /// Send one key to the engine, and take back both of the things it changes:
+    /// the candidate list, and the composition as the engine now reads it.
+    ///
+    /// The composition is asked for rather than assumed, because for Japanese
+    /// it is not what was typed — `nihon` composes にほん — and only the engine
+    /// holds the transliteration. An engine that keeps no composition of its
+    /// own says so, and then the keys as typed are the composition, which is
+    /// exactly right for pinyin.
+    fn feed(&mut self, key: char) {
+        let Some(engine) = self.engine() else {
+            return;
+        };
+        let candidates = engine.key(key);
+        let composed = engine.preedit();
+        self.candidates = candidates;
+        self.preedit = composed.unwrap_or_else(|| self.typed.clone());
+    }
+
+    /// Accept a candidate by position, from the number row or a tap on the bar.
+    ///
+    /// Out of range does nothing rather than committing something else: the
+    /// engine offers fewer than ten candidates often, and pressing 7 for a list
+    /// of three should not insert the third.
+    fn select_candidate(&mut self, n: usize) {
+        let Some(text) = self.candidates.get(n).cloned() else {
+            return;
+        };
+        if let Some(engine) = self.engine() {
+            engine.commit(n);
+        }
+        self.typed.clear();
+        self.preedit.clear();
+        self.candidates.clear();
+        self.insert_committed(&text);
+    }
+
+    /// Finish the word under way, the way this language finishes one.
+    ///
+    /// The two differ, and it is a difference in the languages rather than in
+    /// the plugins:
+    ///
+    /// * **Chinese takes the best candidate.** Pinyin predicts as it goes, so
+    ///   the top candidate is what the writer has been watching the whole time
+    ///   and is what they mean by typing on.
+    /// * **Japanese takes the composition itself**, because that is already the
+    ///   answer either way: the engine's composition getter returns the raw
+    ///   kana while nothing is selected, and the selected candidate once space
+    ///   has asked for a conversion. Taking candidate 0 instead would convert
+    ///   words the writer meant to leave as kana — ここ becoming 個々 — which
+    ///   is a wrong word rather than a missing one.
+    fn commit_composition(&mut self, script: ime::Script) {
+        if !self.composing() {
+            return;
+        }
+        if script == ime::Script::Chinese && !self.candidates.is_empty() {
+            self.select_candidate(0);
+            return;
+        }
+        let text = std::mem::take(&mut self.preedit);
+        self.abandon_composition();
+        self.insert_committed(&text);
+    }
+
+    /// Put committed text where it is being typed, as one undo step.
+    ///
+    /// **Every path out of the IME ends here** — a chosen candidate, a
+    /// converted word, raw pinyin, CJK punctuation, a capital letter typed
+    /// mid-composition — so this is the only place that has to know which field
+    /// is taking text. See [`Sink`].
+    fn insert_committed(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self.sink() {
+            Sink::Page => {
+                self.doc.insert(text);
+                self.last_edit = Some(std::time::Instant::now());
+            }
+            // Whichever of the bar's fields is taking keys, so a writer can say
+            // what to look for *and* what to put in its place in Chinese.
+            Sink::Find => {
+                let text = text.to_string();
+                if self.edit_field(|field| field.push_str(&text)) {
+                    self.research();
+                }
+            }
+            Sink::Name => {
+                if let Mode::Naming { name, .. } = &mut self.mode {
+                    name.extend(text.chars().filter(|c| in_filename(*c)));
+                }
+            }
+        }
+    }
+
+    /// Throw away the half-typed word, in the engine as well as here. Leaving
+    /// the engine holding symbols would make the next word start mid-syllable.
+    fn abandon_composition(&mut self) {
+        if let Some(engine) = self.engine() {
+            engine.clear();
+        }
+        self.typed.clear();
+        self.preedit.clear();
+        self.candidates.clear();
+    }
+
+    /// Whether a word is being composed, which is what swaps the action strip
+    /// for the candidate bar.
+    ///
+    /// A composition with no candidates still counts, and has to: the letters
+    /// typed towards a word never reach the document, so if the bar is not
+    /// showing them they are invisible. Chinese reaches that state on a
+    /// syllable the dictionary does not have; Japanese passes through it at the
+    /// start of every word, because the first letters of a romaji syllable are
+    /// not yet kana and there is nothing to convert.
+    fn composing(&self) -> bool {
+        !self.preedit.is_empty() || !self.candidates.is_empty()
+    }
+
     fn save(&mut self) -> Result<()> {
         self.write_document("saved")
     }
@@ -1537,6 +2066,37 @@ impl Editor {
         Ok(())
     }
 
+    /// What the candidate box hangs off, or `None` for the caret.
+    ///
+    /// The find bar's own cell, when that is where the typing is going. The
+    /// caret is over at the last match by then, and hanging the choices there
+    /// would put them beside a word the writer is not typing — the same
+    /// disorientation the box exists to avoid.
+    fn overlay_anchor(&mut self) -> Option<window::Rect> {
+        if self.sink() != Sink::Find {
+            return None;
+        }
+        // The field taking the keys, found by what it *is* rather than by where
+        // the bar happens to put it.
+        let field = self.find.as_ref().map(|f| f.field).unwrap_or_default();
+        let cell = self
+            .strip()
+            .iter()
+            .position(|bar| *bar == field.cell())
+            .unwrap_or(0);
+        let width = self.window.width();
+        let layout = self.layout();
+        let cells = self.strip_cells();
+        let stretch = self.strip_stretch();
+        let fonts = &mut self.fonts;
+        // Measured from the cells actually drawn, not from a second guess at
+        // the geometry: the box has to sit over the field it belongs to.
+        let bounds = ui::cell_bounds(width, &cells, &stretch, |s| {
+            ui::measure(fonts, s, ui::TEXT_PX) as u16
+        });
+        Some(ui::strip_cell_rect(layout, &bounds, cell))
+    }
+
     /// Move the cursor by whole visual lines, dragging the selection along if
     /// `extend`.
     ///
@@ -1715,6 +2275,88 @@ fn autosave_due(idle_for: Option<std::time::Duration>, dirty_for: std::time::Dur
     idle_for.is_none_or(|idle| idle >= AUTOSAVE_IDLE) || dirty_for >= AUTOSAVE_MAX
 }
 
+/// The selected input source, remembered for the same reason as the layout: a
+/// writer who left in Chinese comes back to Chinese.
+fn language_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/language")
+}
+
+/// What floats beside the caret right now.
+///
+/// Candidates outrank the language notice, though the two cannot really
+/// collide: switching language abandons any composition.
+///
+/// Takes the three things it reads rather than the editor, so that borrowing it
+/// does not borrow the window and the faces the same paint is about to write to.
+fn overlay(candidates: &[String], announcing: bool, language: Language) -> ui::Overlay<'_> {
+    if !candidates.is_empty() {
+        ui::Overlay::Candidates(candidates)
+    } else if announcing {
+        ui::Overlay::Notice(language.label())
+    } else {
+        ui::Overlay::None
+    }
+}
+
+/// The composition as far as the document is concerned.
+///
+/// The engine holds one composition wherever it is being typed, and only the
+/// page splices it into text and shifts every index after the cursor. A
+/// composition bound anywhere else is not the page's to show or to count.
+fn page_composition(preedit: &str, sink: Sink) -> &str {
+    if sink == Sink::Page { preedit } else { "" }
+}
+
+/// A display index as a document one, given where the preedit sits and how long
+/// it is. Free of the editor so the mapping can be tested on its own.
+fn document_index(display: usize, cursor: usize, preedit: usize) -> usize {
+    if display <= cursor {
+        display
+    } else {
+        display.saturating_sub(preedit).max(cursor)
+    }
+}
+
+fn languages_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/languages")
+}
+
+/// Which input sources the language button cycles through.
+///
+/// **All five unless told otherwise**, so a writer who never opens Config is
+/// exactly where they were. An unreadable or empty file means the same thing:
+/// a set with nothing in it would leave no way to type at all, which is worse
+/// than ignoring the file.
+fn read_languages() -> Vec<Language> {
+    let stored = std::fs::read_to_string(languages_file()).unwrap_or_default();
+    let chosen: Vec<Language> = Language::ALL
+        .into_iter()
+        .filter(|l| stored.contains(l.letter()))
+        .collect();
+    if chosen.is_empty() {
+        Language::ALL.to_vec()
+    } else {
+        chosen
+    }
+}
+
+fn write_languages(enabled: &[Language]) {
+    let letters: String = enabled.iter().map(|l| l.letter()).collect();
+    let _ = std::fs::write(languages_file(), letters);
+}
+
+fn read_language() -> Language {
+    // Not logged here. `set_language` reports what was actually taken up, and
+    // two lines saying the same name would have hidden that they could differ.
+    std::fs::read_to_string(language_file())
+        .map(|s| Language::from_letter(&s))
+        .unwrap_or_default()
+}
+
+fn write_language(language: Language) {
+    let _ = std::fs::write(language_file(), language.letter().to_string());
+}
+
 /// What a chip in Config's Keyboard section does.
 ///
 /// Built alongside the labels so the two cannot drift: working out what row 3
@@ -1737,6 +2379,54 @@ enum KeyAction {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn text_before_the_preedit_is_at_the_same_index_in_both_spaces() {
+        // Cursor at 5 with three characters composing. Everything up to the
+        // cursor is untouched by the splice.
+        assert_eq!(document_index(0, 5, 3), 0);
+        assert_eq!(document_index(5, 5, 3), 5);
+    }
+
+    #[test]
+    fn text_after_the_preedit_is_that_much_further_along_on_screen() {
+        // Display 8 is the first character after a three-long preedit, and it
+        // is document 5 — the character the cursor is sitting before.
+        assert_eq!(document_index(8, 5, 3), 5);
+        assert_eq!(document_index(12, 5, 3), 9);
+    }
+
+    #[test]
+    fn the_preedit_itself_collapses_onto_the_cursor() {
+        // Its characters are in no document position at all — tapping one has
+        // to mean the place the word is being written into.
+        for display in 6..=8 {
+            assert_eq!(document_index(display, 5, 3), 5, "display {display}");
+        }
+    }
+
+    #[test]
+    fn with_nothing_composing_the_two_spaces_are_the_same() {
+        for display in 0..12 {
+            assert_eq!(document_index(display, 5, 0), display);
+        }
+    }
+
+    #[test]
+    fn a_composition_bound_elsewhere_is_not_in_the_document() {
+        // The page splices its composition into the text, which moves every
+        // index after the cursor. A word being typed into the find bar must
+        // move nothing: the hits are document indices, and shifting them would
+        // invert the wrong characters while the next word is spelled out.
+        assert_eq!(page_composition("にほん", Sink::Page), "にほん");
+        assert_eq!(page_composition("にほん", Sink::Find), "");
+        assert_eq!(page_composition("にほん", Sink::Name), "");
+
+        let composing = page_composition("にほん", Sink::Find).chars().count();
+        for display in 0..12 {
+            assert_eq!(document_index(display, 5, composing), display);
+        }
+    }
 
     #[test]
     fn a_descriptor_that_can_no_longer_deliver_counts_as_ready() {
@@ -1807,6 +2497,134 @@ mod tests {
     #[test]
     fn the_backstop_is_the_looser_of_the_two() {
         assert!(AUTOSAVE_MAX > AUTOSAVE_IDLE);
+    }
+
+    mod language {
+        use super::*;
+
+        /// A language names its keyboard. Pinyin and romaji are both defined
+        /// against the QWERTY letter arrangement, so Chinese and Japanese are
+        /// US however the last prose was typed.
+        #[test]
+        fn each_language_names_its_own_layout() {
+            assert_eq!(Language::English.layout(), keymap::Layout::Us);
+            assert_eq!(Language::German.layout(), keymap::Layout::German);
+            assert_eq!(Language::Chinese.layout(), keymap::Layout::Us);
+            assert_eq!(Language::Japanese.layout(), keymap::Layout::Us);
+        }
+
+        #[test]
+        fn cycling_visits_every_enabled_language_and_returns() {
+            let all = Language::ALL;
+            let mut seen = Vec::new();
+            let mut language = Language::default();
+            for _ in 0..all.len() {
+                seen.push(language);
+                language = language.next(&all);
+            }
+            assert_eq!(language, Language::default(), "the cycle does not close");
+            let mut sorted = seen.clone();
+            sorted.dedup();
+            assert_eq!(sorted.len(), all.len(), "a language is skipped");
+        }
+
+        #[test]
+        fn cycling_skips_the_ones_that_are_switched_off() {
+            // The point of switching them off: someone who writes two should
+            // press Ctrl+Space twice to get back, not five times.
+            let two = [Language::English, Language::Japanese];
+            assert_eq!(Language::English.next(&two), Language::Japanese);
+            assert_eq!(Language::Japanese.next(&two), Language::English);
+        }
+
+        #[test]
+        fn one_language_on_its_own_cycles_to_itself() {
+            let one = [Language::German];
+            assert_eq!(Language::German.next(&one), Language::German);
+        }
+
+        #[test]
+        fn a_language_switched_off_still_has_somewhere_to_go() {
+            // Turning off the source in use has to leave the keyboard
+            // somewhere the cycle can still reach, and it moves forward from
+            // where that source sat rather than back to the start.
+            let rest = [Language::English, Language::Japanese];
+            assert_eq!(Language::German.next(&rest), Language::Japanese);
+            assert_eq!(Language::ChineseTraditional.next(&rest), Language::Japanese);
+        }
+
+        /// Only the CJK languages load an engine; the Latin ones must not pay
+        /// for one, and must keep working if every plugin is missing.
+        #[test]
+        fn only_the_cjk_languages_want_an_input_method() {
+            assert_eq!(Language::Chinese.script(), Some(ime::Script::Chinese));
+            assert_eq!(
+                Language::ChineseTraditional.script(),
+                Some(ime::Script::Chinese)
+            );
+            assert_eq!(Language::Japanese.script(), Some(ime::Script::Japanese));
+            assert_eq!(Language::English.script(), None);
+            assert_eq!(Language::German.script(), None);
+        }
+
+        /// Both Chinese entries share an engine — one plugin, one dictionary —
+        /// while Japanese is a separate one. Getting this wrong would either
+        /// load the plugin twice or ask XT9 for kana.
+        #[test]
+        fn the_chinese_entries_share_an_engine_and_japanese_does_not() {
+            assert_eq!(
+                Language::Chinese.script(),
+                Language::ChineseTraditional.script()
+            );
+            assert_ne!(Language::Japanese.script(), Language::Chinese.script());
+        }
+
+        /// The Han faces follow the language, and the Latin languages leave
+        /// them alone: switching to English to type one word in the middle of a
+        /// Japanese paragraph must not re-cut the kanji around it.
+        #[test]
+        fn each_cjk_language_names_its_own_han_convention() {
+            use karyll_core::script::Region;
+            assert_eq!(Language::Chinese.region(), Some(Region::Simplified));
+            assert_eq!(
+                Language::ChineseTraditional.region(),
+                Some(Region::Traditional)
+            );
+            assert_eq!(Language::Japanese.region(), Some(Region::Japanese));
+            assert_eq!(Language::English.region(), None);
+            assert_eq!(Language::German.region(), None);
+        }
+
+        /// Both Chinese entries are the same pinyin engine on the same QWERTY
+        /// arrangement — they differ only in whether the candidates are
+        /// converted, because the device has exactly one Chinese dictionary.
+        #[test]
+        fn the_two_chinese_entries_differ_only_in_script() {
+            assert_eq!(
+                Language::Chinese.layout(),
+                Language::ChineseTraditional.layout()
+            );
+            assert!(!Language::Chinese.traditional());
+            assert!(Language::ChineseTraditional.traditional());
+        }
+
+        /// Nothing but Traditional asks for conversion — a Latin language
+        /// reaching the converter would mean the engine was consulted for text
+        /// it never produced.
+        #[test]
+        fn only_traditional_converts() {
+            assert_eq!(Language::ALL.iter().filter(|l| l.traditional()).count(), 1);
+        }
+
+        /// The remembered letter has to survive a round trip, or a writer who
+        /// left in Chinese comes back to English.
+        #[test]
+        fn every_language_survives_being_written_down() {
+            for language in Language::ALL {
+                let letter = language.letter().to_string();
+                assert_eq!(Language::from_letter(&letter), language);
+            }
+        }
     }
 
 }
