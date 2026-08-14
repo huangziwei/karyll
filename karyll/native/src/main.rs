@@ -6,8 +6,11 @@ mod hid;
 mod ime;
 mod keymap;
 
+mod pen;
+
 mod render;
 mod screenshot;
+mod touch;
 
 mod window;
 
@@ -952,6 +955,43 @@ impl Editor {
         }
     }
 
+    /// What a key event means, or `None` for a release, a modifier, or a key
+    /// that is bound to nothing.
+    ///
+    /// **One place**, because four surfaces read the keyboard now — the page,
+    /// the find bar, the name prompt and the panels — and every one of them has
+    /// to track the modifier state, ignore releases and resolve against the
+    /// selected layout in exactly the same way. The find bar first read raw
+    /// codes instead, which is why it could not be given CJK input: the IME
+    /// speaks [`keymap::Action`], and a second reading of the keyboard had
+    /// nothing to hand it.
+    fn pressed_action(&mut self, event: &evdev::KeyEvent) -> Option<Action> {
+        if self.mods.track(event.code, event.pressed) || !event.pressed {
+            return None;
+        }
+        // The writer is here. Every key comes through this, which is what makes
+        // it the place to say so — and a keystroke is the one kind of input the
+        // framework's own idle timer cannot see, because the keyboard is
+        // grabbed.
+        self.note_input();
+        let Some(action) = keymap::action(event.code, self.mods, self.language.layout()) else {
+            // Named, because a key that does nothing is otherwise
+            // indistinguishable from one that never arrived. Compact keyboards
+            // have no `Home`, and whether their `fn`+← reaches us as code 102
+            // or as something else depends on the kernel's Apple quirk driver —
+            // one press and this line settles it.
+            eprintln!("key: {} unbound ({:?})", event.code, self.mods);
+            return None;
+        };
+        // The language notice goes with the next keystroke: anything that is
+        // not another switch means the writer has read it and moved on. Here
+        // rather than in the writing loop because the panels take keys too, and
+        // a notice raised on one of those has to be cleared by the same path
+        // that raised it.
+        self.announcing = matches!(action, Action::CycleLanguage);
+        Some(action)
+    }
+
     /// The panel's geometry, sized from the Latin face alone.
     ///
     /// Deliberately not from the document's faces: rows are already `lh * 2`
@@ -963,6 +1003,68 @@ impl Editor {
         let text = self.fonts.line_height(ui::TEXT_PX, font::LATIN_ROW) as u16;
         let title = self.fonts.line_height(ui::TITLE_PX, font::LATIN_ROW) as u16;
         ui::Layout::compute(text, title, self.window.height())
+    }
+
+    /// Raw panel coordinates in, window coordinates out.
+    ///
+    /// Split out from `target` because a tap on the page is answered by a
+    /// character index rather than by a control, and both need this first.
+    fn point(
+        &mut self,
+        raw_x: i32,
+        raw_y: i32,
+        extent: (touch::Extent, touch::Extent),
+    ) -> (u16, u16) {
+        let size = (self.window.width(), self.window.height());
+        // Scale into the **panel's** own pixel space, which is always portrait,
+        // before rotating into the window. Scaling against the window instead
+        // stretched one axis and squashed the other whenever the two differed:
+        // in landscape a tap aimed at the third button of five landed on the
+        // second, because its axis had been compressed by 1860/2480.
+        let panel = (size.0.min(size.1), size.0.max(size.1));
+        let (x, y) = self.touch_orientation.apply(
+            extent.0.to_pixels(raw_x, panel.0),
+            extent.1.to_pixels(raw_y, panel.1),
+            size,
+        );
+        (
+            x.clamp(0, size.0 as i32) as u16,
+            y.clamp(0, size.1 as i32) as u16,
+        )
+    }
+
+    /// Which control a window point lands on.
+    fn target(&mut self, x: u16, y: u16) -> Option<Target> {
+        let size = (self.window.width(), self.window.height());
+        let layout = self.layout();
+        // The bottom strip outranks the list: it spans the full width. With
+        // the chrome hidden `page_bottom` is the foot of the panel, so nothing
+        // is ever on a strip that is not drawn.
+        let bottom = self.page_bottom();
+        let hit = if y >= bottom && y >= layout.strip_top {
+            let cells = self.strip_cells();
+            let stretch = self.strip_stretch();
+            let fonts = &mut self.fonts;
+            let bounds = ui::cell_bounds(size.0, &cells, &stretch, |s| {
+                ui::measure(fonts, s, ui::TEXT_PX) as u16
+            });
+            // `None` past the last cell. The buttons are packed at their own
+            // width now, so most of this band is the status line's — and a tap
+            // on a line that only reports must not run the button nearest it.
+            ui::cell_at(&bounds, x).map(Target::Strip)
+        } else {
+            let items = self.visible_items();
+            let fonts = &mut self.fonts;
+            ui::hit(&items, layout, size.0, x, y, |s| {
+                ui::measure(fonts, s, ui::TEXT_PX) as u16
+            })
+            .map(|hit| match hit {
+                ui::Hit::Row(row) => Target::Row(row),
+                ui::Hit::Option(item, option) => Target::Option(item, option),
+            })
+        };
+        eprintln!("touch: ({x},{y}) {:?} -> {hit:?}", self.touch_orientation);
+        hit
     }
 
     /// Whether a window y is on the page rather than on the chrome.
@@ -1002,6 +1104,334 @@ impl Editor {
         } else {
             self.window.height()
         }
+    }
+
+    /// The character a window point is nearest, against the frame on screen.
+    fn index_at_point(&mut self, x: u16, y: u16) -> Option<usize> {
+        let frame = self.frame.take()?;
+        // The buffer the frame was laid out from, so the glyph under the
+        // finger is the one that was drawn there.
+        let (chars, preedit) = self.display();
+        let markup = karyll_core::markdown::analyze(&chars);
+        let bottom = self.page_bottom();
+        let page = render::Page::new(
+            &chars,
+            &markup,
+            &self.theme,
+            (self.window.width(), self.window.height()),
+            bottom,
+        )
+        .focused_on(self.focus_span(&chars))
+        .composing(preedit);
+        let index = render::index_at_point(&page, &mut self.fonts, &frame, x as f32, y as f32);
+        self.frame = Some(frame);
+        // Back to document space: the caller is going to move the cursor with
+        // it, and the cursor lives in the document.
+        index.map(|i| self.document_index(i))
+    }
+
+    /// What a finger — or the nib — lifting off the page means.
+    ///
+    /// **A contact is only Down and Up**, each carrying a position. The
+    /// touchscreen reports nothing between them, and [`crate::pen`] deliberately
+    /// reports nothing either. That suits the panel: pressing at one place and
+    /// lifting at another *is* a drag, and resolving it on the lift paints the
+    /// selection once instead of on every motion event. The cost is no live
+    /// feedback under the finger, which is the right trade at ten milliseconds
+    /// a refresh.
+    fn tap_text(&mut self, x: u16, y: u16) -> Result<()> {
+        let down = self.touch_down.take();
+        let far = |a: (u16, u16), b: (u16, u16)| {
+            a.0.abs_diff(b.0) > TOUCH_SLOP || a.1.abs_diff(b.1) > TOUCH_SLOP
+        };
+        let dragged = down.is_some_and(|d| far(d, (x, y)));
+
+        // **A tap in a margin moves the page.** Asked before the character
+        // under it, because a margin holds no character worth putting a cursor
+        // in — and a drag is exempt, so selecting a run that ends past the last
+        // word of a line still selects.
+        if !dragged && let Some(edge) = self.page_edge(x, y) {
+            self.last_tap = None;
+            return self.go(edge);
+        }
+
+        let Some(index) = self.index_at_point(x, y) else {
+            return Ok(());
+        };
+
+        // A drag: the two ends are where the finger went down and came up.
+        if let Some(from) = down.filter(|&d| far(d, (x, y)))
+            && let Some(start) = self.index_at_point(from.0, from.1)
+        {
+            self.doc.select(start.min(index)..start.max(index));
+            self.last_tap = None;
+            return self.paint();
+        }
+
+        // Shift+tap extends, which needs no new gesture: the keyboard is in
+        // front of the writer anyway and shift-click is the habit already.
+        if self.mods.shift {
+            self.doc.extend_to(index);
+            self.last_tap = None;
+            return self.paint();
+        }
+
+        // A second tap in the same place selects the word under it. Both the
+        // interval and the distance have to match, or a quick tap somewhere
+        // else would count as the second half of a double-tap.
+        let again = self
+            .last_tap
+            .is_some_and(|(when, at)| when.elapsed() < DOUBLE_TAP && !far(at, (x, y)));
+        if again {
+            self.doc.select_word_at(index);
+            self.last_tap = None;
+        } else {
+            self.doc.set_cursor(index);
+            self.last_tap = Some((std::time::Instant::now(), (x, y)));
+        }
+        self.paint()
+    }
+
+    /// Run a batch of contacts through the editor, reporting whether one of
+    /// them asked to leave.
+    ///
+    /// **One handler for the glass, whatever touched it.** The finger panel and
+    /// the pen speak different evdev protocols and report in different
+    /// coordinate spaces, and both arrive here as the same three contacts with
+    /// their own extents — so a tap means the same thing, a drag selects the
+    /// same way, and neither device can grow a behaviour the other lacks.
+    fn contacts(
+        &mut self,
+        taps: Vec<touch::Touch>,
+        extent: (touch::Extent, touch::Extent),
+    ) -> Result<bool> {
+        for tap in taps {
+            match tap {
+                touch::Touch::Down { x, y } => self.pressed(x, y, extent)?,
+                touch::Touch::Up { x, y } => {
+                    // Restore first, and synchronously, so the button is
+                    // visibly released before whatever it does repaints over it.
+                    self.release()?;
+                    if self.tapped(x, y, extent)? {
+                        return Ok(true);
+                    }
+                }
+                // The firmware's own two-corner gesture. It never fires while
+                // karyll is foreground, so karyll answers it.
+                touch::Touch::Screenshot => match screenshot::capture(&self.window) {
+                    Ok(path) => eprintln!("screenshot: {}", path.display()),
+                    Err(err) => eprintln!("screenshot failed: {err:#}"),
+                },
+            }
+        }
+        Ok(false)
+    }
+
+    /// Invert whatever the finger landed on, and show it immediately.
+    fn pressed(
+        &mut self,
+        raw_x: i32,
+        raw_y: i32,
+        extent: (touch::Extent, touch::Extent),
+    ) -> Result<()> {
+        let (x, y) = self.point(raw_x, raw_y, extent);
+        // A finger on the page is remembered rather than drawn: where it lands
+        // only means something once it lifts, and inverting a row of prose
+        // under it would be feedback for a control that is not there.
+        if self.writing_area(y) {
+            self.touch_down = Some((x, y));
+            return Ok(());
+        }
+        self.touch_down = None;
+        let Some(target) = self.target(x, y) else {
+            return Ok(());
+        };
+        self.draw_target(target, true)?;
+        // Timed from after the server has it, so the hold is a hold on screen
+        // rather than on a queued request.
+        self.holding = Some((target, std::time::Instant::now()));
+        Ok(())
+    }
+
+    /// Put back whatever was inverted.
+    ///
+    /// A quick tap arrives as Down and Up in the same read, so without holding
+    /// the inverted state briefly it is drawn and undone between two panel
+    /// updates and never becomes visible — which looks exactly like the
+    /// feedback running one key behind.
+    fn release(&mut self) -> Result<()> {
+        let Some((target, shown)) = self.holding.take() else {
+            return Ok(());
+        };
+        if let Some(remaining) = FEEDBACK.checked_sub(shown.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+        self.draw_target(target, false)
+    }
+
+    fn draw_target(&mut self, target: Target, pressed: bool) -> Result<()> {
+        let layout = self.layout();
+        let rect = match target {
+            Target::Strip(index) => {
+                let cells = self.strip_cells();
+                let stretch = self.strip_stretch();
+                ui::paint_strip_cell(
+                    &mut self.window,
+                    &mut self.fonts,
+                    layout,
+                    &cells,
+                    index,
+                    pressed,
+                    &stretch,
+                )
+            }
+            Target::Row(index) => {
+                // Rows only exist in a panel; in the document there is nothing
+                // under the finger to acknowledge.
+                if matches!(self.mode, Mode::Writing) {
+                    return Ok(());
+                }
+                let items = self.visible_items();
+                ui::paint_row(
+                    &mut self.window,
+                    &mut self.fonts,
+                    layout,
+                    &items,
+                    index,
+                    pressed,
+                )
+            }
+            Target::Option(item, option) => {
+                if matches!(self.mode, Mode::Writing) {
+                    return Ok(());
+                }
+                let items = self.visible_items();
+                ui::paint_chip(
+                    &mut self.window,
+                    &mut self.fonts,
+                    layout,
+                    &items,
+                    item,
+                    option,
+                    pressed,
+                )
+            }
+        };
+        // Synchronous: an invert that is only queued gets merged with the
+        // restore that follows it, and neither is ever seen.
+        self.window.present_sync(rect)
+    }
+
+    /// Handle a tap, in raw panel coordinates. True when the app should close.
+    fn tapped(
+        &mut self,
+        raw_x: i32,
+        raw_y: i32,
+        extent: (touch::Extent, touch::Extent),
+    ) -> Result<bool> {
+        // Resolved by the **same** function that decided what to invert. A
+        // second copy of the mapping puts the invert on one control and runs
+        // another: after a 180° flip the right button lights and the wrong one
+        // fires, and in landscape a tap highlights a button and triggers its
+        // neighbour.
+        let (x, y) = self.point(raw_x, raw_y, extent);
+        // Any touch brings the chrome back. iA Writer reveals on mouse
+        // movement; the nearest thing a touchscreen has is a finger arriving,
+        // so the reveal is the whole glass rather than a band along the bottom.
+        let waking = !self.strip_visible();
+        self.set_chrome_hidden(false);
+        // **A tap that lands where the strip is about to appear reveals it and
+        // stops there.** It must not press a button that was not on screen when
+        // the finger came down: with the chrome away those rows are blank page,
+        // and tapping blank page ran Save — and would as easily have run Close.
+        // Elsewhere the tap still does its job, so placing the cursor does not
+        // cost two taps.
+        if waking && y >= self.layout().strip_top {
+            self.touch_down = None;
+            return self.paint().map(|()| false);
+        }
+        // The candidate box floats over the page, so it is asked before the
+        // page is: a tap on a candidate is choosing it, not moving the cursor
+        // to whatever prose the box happens to be covering.
+        if let Some(n) = self.candidate_at(x, y) {
+            self.touch_down = None;
+            self.select_candidate(n);
+            self.paint()?;
+            return Ok(false);
+        }
+        // **Anything else ends the word under way**, which is the rule
+        // [`ime::compose`] already applies to an arrow or a chord, for the
+        // reason recorded there: leaving a half-typed word pending while the
+        // writer goes somewhere else is worse than costing them a keystroke.
+        //
+        // One place, and it has to be: a composition belongs to the field it
+        // was started in, and a tap is the only way to leave a field with one
+        // still held — every keyboard route out of a composition is consumed by
+        // the engine first. Left held, [`Editor::page_preedit`] splices the
+        // half-typed word into the prose at the cursor.
+        self.abandon_composition();
+        if self.writing_area(y) {
+            self.tap_text(x, y)?;
+            // A tap that resolved to no character repaints nothing, which
+            // would leave a revealed strip undrawn. The dropped frame is what
+            // says the reveal has not been honoured yet.
+            if self.frame.is_none() {
+                self.paint()?;
+            }
+            return Ok(false);
+        }
+        // A finger that went down on the page and lifted on the strip: the
+        // press is spent, and leaving it set would make the *next* tap on the
+        // page look like a drag from wherever that one started.
+        self.touch_down = None;
+        let Some(target) = self.target(x, y) else {
+            return Ok(false);
+        };
+        let row = match target {
+            Target::Strip(cell) => {
+                let cells = self.strip();
+                return self.strip_action(cells[cell.min(cells.len() - 1)]);
+            }
+            // **Page-relative in, absolute out.** A tap reports the row it
+            // landed on within what is drawn; the lists it dispatches against
+            // are the whole thing.
+            Target::Row(row) => self.page_window().start + row,
+            Target::Option(item, option) => {
+                let item = self.page_window().start + item;
+                match self.mode {
+                    Mode::Config => self.config_action(item, option)?,
+                    // A file row's only chip is Delete.
+                    Mode::Files(_) => self.arm_or_delete(item)?,
+                    Mode::Help | Mode::Outline(_) | Mode::Writing | Mode::Naming { .. } => {}
+                }
+                return Ok(false);
+            }
+        };
+        match &self.mode {
+            // Every row is a document now, so a tap on one opens it. There is
+            // no arithmetic past the end of the list to get wrong, because
+            // there is nothing past the end of it.
+            Mode::Files(files) => {
+                if let Some(listing) = files.get(row) {
+                    let path = listing.path.clone();
+                    self.open(path)?;
+                }
+            }
+            // Every row is a heading, and tapping one goes there. The list a
+            // tap dispatches against is the list that was drawn — the panel
+            // holds it rather than reading the document again, so a jump cannot
+            // land on a heading that has moved since.
+            Mode::Outline(sections) => {
+                if let Some(at) = sections.get(row).map(|s| s.at) {
+                    self.jump_to(at)?;
+                }
+            }
+            // Every line of Config is a chip, so a bare row tap is a heading or
+            // a label — nothing to run. Every line of Help is a fact, and a
+            // fact does nothing when you press it.
+            Mode::Config | Mode::Help | Mode::Writing | Mode::Naming { .. } => {}
+        }
+        Ok(false)
     }
 
     /// Break the line, carrying a list or quote marker onto the next one.
@@ -2451,6 +2881,18 @@ fn write_language(language: Language) {
     let _ = std::fs::write(language_file(), language.letter().to_string());
 }
 
+/// How far a finger may wander and still count as having stayed put.
+///
+/// At 300 ppi this is about 3.5 mm — generous, deliberately. It separates a
+/// drag from a tap and a double-tap from two taps, and the failure it guards
+/// against is a shaky finger selecting a span when it meant to place the
+/// cursor. Being too forgiving only means a very short drag places the cursor
+/// instead, which is the harmless direction.
+const TOUCH_SLOP: u16 = 40;
+
+/// How long the second tap of a double-tap may take to arrive.
+const DOUBLE_TAP: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// What a chip in Config's Keyboard section does.
 ///
 /// Built alongside the labels so the two cannot drift: working out what row 3
@@ -2467,6 +2909,15 @@ enum KeyAction {
     /// Pair with something the scan turned up.
     Pair(hid::Device),
     Scan,
+}
+
+/// Something a finger can be on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Strip(usize),
+    Row(usize),
+    /// A chip on a settings line: which line, and which of its values.
+    Option(usize, usize),
 }
 
 /// What Tab inserts. Two columns is what Markdown nesting expects.

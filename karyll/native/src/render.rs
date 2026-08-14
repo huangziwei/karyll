@@ -403,6 +403,16 @@ fn rule(window: &mut Window, top: i32, thickness: i32, from: f32, to: f32) {
     }
 }
 
+/// The part of `row` that `span` covers, as an offset into the row. Empty when
+/// there is no span or it lies elsewhere — the opposite default to
+/// [`focus_within`], where nothing means everything.
+fn span_within(
+    span: &Option<std::ops::Range<usize>>,
+    row: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    span.as_ref().map_or(0..0, |span| clip_to_row(span, row))
+}
+
 /// The visual line holding `cursor`.
 ///
 /// After a soft wrap the cursor sits at the end of one line and the start of
@@ -414,6 +424,74 @@ fn line_of(lines: &[VisualLine], cursor: usize) -> Option<usize> {
         .iter()
         .position(|l| l.range.contains(&cursor))
         .or_else(|| lines.iter().rposition(|l| l.range.end == cursor))
+}
+
+/// Horizontal position of `cursor` along `line`.
+fn pen_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, cursor: usize) -> Option<f32> {
+    let entry = page.markup.get(line.markup)?;
+    let roles = roles_for_line(entry, page.chars);
+    let mut x = page.origin(line.block);
+    for (i, ch) in page
+        .chars
+        .iter()
+        .enumerate()
+        .take(cursor)
+        .skip(line.range.start)
+    {
+        let role = roles
+            .get(i - entry.range.start)
+            .copied()
+            .unwrap_or(Role::Body);
+        x += fonts.advance(role, line.px, *ch);
+    }
+    Some(x)
+}
+
+/// The character index on `line` nearest horizontal position `x`.
+///
+/// Nearest, not the one containing `x`: clicking or arrowing into the right
+/// half of a glyph should land after it, which is what a caret between
+/// characters means.
+fn index_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, x: f32) -> usize {
+    let Some(entry) = page.markup.get(line.markup) else {
+        return line.range.start;
+    };
+    let roles = roles_for_line(entry, page.chars);
+    let mut pen = page.origin(line.block);
+    for i in line.range.clone() {
+        let role = roles
+            .get(i - entry.range.start)
+            .copied()
+            .unwrap_or(Role::Body);
+        let advance = fonts.advance(role, line.px, page.chars[i]);
+        if x < pen + advance / 2.0 {
+            return i;
+        }
+        pen += advance;
+    }
+    line.range.end
+}
+
+/// The character index nearest a point on the page.
+///
+/// In window coordinates, against the frame the reader is actually looking at.
+/// A point below the last line lands at the end of it and one above the first
+/// lands at its start: a finger aimed past the text still meant somewhere, and
+/// refusing to answer would make a tap in the margin do nothing at all.
+pub fn index_at_point(
+    page: &Page,
+    fonts: &mut impl Metrics,
+    frame: &Frame,
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    let index = frame
+        .lines
+        .iter()
+        .rposition(|line| (line.y as f32) <= y)
+        .unwrap_or(0);
+    let line = frame.lines.get(index)?;
+    Some(index_at(page, fonts, line, x))
 }
 
 /// Move `cursor` by `delta` visual lines, holding `goal` as its column.
@@ -568,6 +646,68 @@ fn caret(
         width: caret_width(line.px),
         height: height.max(1) as u16,
     })
+}
+
+/// The rectangles covering a selection, one per visual line it touches.
+///
+/// Per *visual* line, so a selection across a soft wrap is drawn as the runs it
+/// visually is rather than as one impossible box.
+///
+/// A line whose selection carries on to the next gets a short nub past its last
+/// glyph: the newline is inside the selection, and without it a multi-line
+/// selection reads as several unrelated runs. A nub rather than a fill out to
+/// the margin, because on this panel a full-width black band is a lot of ink to
+/// lay down and then lift again.
+fn selection_rects(
+    page: &Page,
+    fonts: &mut impl Metrics,
+    lines: &[VisualLine],
+    selection: &Option<std::ops::Range<usize>>,
+) -> Vec<Rect> {
+    let Some(selection) = selection else {
+        return Vec::new();
+    };
+    let mut rects = Vec::new();
+    for line in lines {
+        let start = selection.start.max(line.range.start);
+        let end = selection.end.min(line.range.end);
+        if start >= end {
+            continue;
+        }
+        let Some(left) = pen_at(page, fonts, line, start) else {
+            continue;
+        };
+        let Some(mut right) = pen_at(page, fonts, line, end) else {
+            continue;
+        };
+        if selection.end > line.range.end {
+            right += fonts.advance(Role::Body, line.px, ' ');
+        }
+        // A line scrolled half off the top keeps the half that is still on the
+        // page rather than being dropped or drawn above it.
+        let top = line.y.max(0);
+        let height = line.height - (top - line.y);
+        if height <= 0 {
+            continue;
+        }
+        rects.push(Rect {
+            x: left as u16,
+            y: top as u16,
+            width: (right - left).max(0.0) as u16,
+            height: height as u16,
+        });
+    }
+    rects
+}
+
+/// The vertical extent of a set of selection rectangles.
+///
+/// Only the vertical matters: the damage rectangle is always full width, so a
+/// y-span is exactly as much as it can express.
+fn selection_span(rects: &[Rect]) -> Option<(i32, i32)> {
+    let top = rects.iter().map(|r| r.y as i32).min()?;
+    let bottom = rects.iter().map(|r| r.y as i32 + r.height as i32).max()?;
+    Some((top, bottom))
 }
 
 /// What was last drawn, so the next paint can work out what actually changed.
@@ -1471,4 +1611,195 @@ mod tests {
         assert_eq!(styles[0], Style::Syntax);
     }
 
+    mod selection {
+        use super::*;
+
+        fn page_of<'a>(
+            chars: &'a [char],
+            markup: &'a [karyll_core::markdown::LineMarkup],
+            theme: &'a Theme,
+        ) -> Page<'a> {
+            Page::new(
+                chars,
+                markup,
+                theme,
+                (SURFACE.width, SURFACE.height),
+                SURFACE.height,
+            )
+        }
+
+        /// A selection across a soft wrap is the runs it visually is, not one
+        /// box spanning the gap between them.
+        #[test]
+        fn a_selection_gets_one_rectangle_per_visual_line() {
+            let (chars, markup) = navigable("one two");
+            let theme = Theme::default();
+            let page = page_of(&chars, &markup, &theme);
+            let lines = vec![para(0..3, 0, 100), para(4..7, 0, 140)];
+
+            let rects = selection_rects(&page, &mut Stub, &lines, &Some(0..7));
+            assert_eq!(rects.len(), 2);
+            assert_eq!((rects[0].y, rects[1].y), (100, 140));
+            // Ten units a character, so the second run is its three characters
+            // wide and the first carries a nub for the break as well.
+            assert_eq!(rects[1].width, 30);
+            assert!(
+                rects[0].width > rects[1].width,
+                "the line the selection continues past should show the break"
+            );
+        }
+
+        #[test]
+        fn a_selection_inside_one_line_is_one_rectangle_and_no_nub() {
+            let (chars, markup) = navigable("one two");
+            let theme = Theme::default();
+            let page = page_of(&chars, &markup, &theme);
+            let lines = vec![para(0..7, 0, 100)];
+
+            let rects = selection_rects(&page, &mut Stub, &lines, &Some(4..7));
+            assert_eq!(rects.len(), 1);
+            assert_eq!(rects[0].width, 30);
+            assert_eq!(rects[0].x, page.left + 40);
+        }
+
+        #[test]
+        fn nothing_selected_draws_nothing() {
+            let (chars, markup) = navigable("one two");
+            let theme = Theme::default();
+            let page = page_of(&chars, &markup, &theme);
+            let lines = vec![para(0..7, 0, 100)];
+
+            assert!(selection_rects(&page, &mut Stub, &lines, &None).is_empty());
+            // And a selection nowhere near the lines on screen.
+            assert!(selection_rects(&page, &mut Stub, &lines, &Some(90..99)).is_empty());
+        }
+
+        #[test]
+        fn a_line_scrolled_half_off_the_top_keeps_the_half_still_showing() {
+            let (chars, markup) = navigable("one two");
+            let theme = Theme::default();
+            let page = page_of(&chars, &markup, &theme);
+            let lines = vec![para(0..7, 0, -10)];
+
+            let rects = selection_rects(&page, &mut Stub, &lines, &Some(0..7));
+            assert_eq!(rects[0].y, 0);
+            assert_eq!(rects[0].height, 34 - 10, "clipped, not moved");
+        }
+
+        /// The failure this exists to stop: a selection is a filled black run,
+        /// so a dropped one that is not repainted leaves a band on the page
+        /// with nothing left to remove it.
+        #[test]
+        fn clearing_a_selection_repaints_where_it_was() {
+            let chars: Vec<char> = "abc".chars().collect();
+            let lines = vec![line(0..3, 100)];
+            let mut previous = frame("abc", vec![line(0..3, 100)], None);
+            previous.selection = Some((100, 140));
+
+            let dirty = damage(Some(&previous), &chars, &lines, None, None, None, SURFACE)
+                .expect("dropping a selection is damage");
+            assert!(dirty.y <= 100 && dirty.y + dirty.height >= 140, "{dirty:?}");
+        }
+
+        #[test]
+        fn making_a_selection_is_damage_though_no_line_changed() {
+            let chars: Vec<char> = "abc".chars().collect();
+            let lines = vec![line(0..3, 100)];
+            let previous = frame("abc", vec![line(0..3, 100)], None);
+
+            let dirty = damage(
+                Some(&previous),
+                &chars,
+                &lines,
+                None,
+                Some((100, 140)),
+                None,
+                SURFACE,
+            )
+            .expect("a new selection is damage");
+            assert!(dirty.y <= 100 && dirty.y + dirty.height >= 140, "{dirty:?}");
+        }
+
+        /// Touch selection rests on this: a point on the panel has to name a
+        /// character before anything can be selected with a finger.
+        #[test]
+        fn a_point_on_the_page_names_the_character_nearest_it() {
+            let (chars, markup) = navigable("one two");
+            let theme = Theme::default();
+            let page = page_of(&chars, &markup, &theme);
+            let frame = Frame {
+                chars: chars.clone(),
+                lines: vec![para(0..3, 0, 100), para(4..7, 0, 140)],
+                caret: None,
+                selection: None,
+                candidates: None,
+            };
+            let left = page.left as f32;
+
+            // Ten units a character, and the caret goes to the nearer side of
+            // the glyph the finger landed on.
+            assert_eq!(
+                index_at_point(&page, &mut Stub, &frame, left + 25.0, 110.0),
+                Some(3)
+            );
+            assert_eq!(
+                index_at_point(&page, &mut Stub, &frame, left, 110.0),
+                Some(0)
+            );
+            // The second visual line, by its y alone.
+            assert_eq!(
+                index_at_point(&page, &mut Stub, &frame, left, 150.0),
+                Some(4)
+            );
+        }
+
+        /// A finger in the margin still meant somewhere, so this answers rather
+        /// than declining — otherwise a tap below the last line does nothing at
+        /// all, which reads as the app having missed it.
+        #[test]
+        fn a_point_past_the_text_lands_at_the_near_end_of_it() {
+            let (chars, markup) = navigable("one two");
+            let theme = Theme::default();
+            let page = page_of(&chars, &markup, &theme);
+            let frame = Frame {
+                chars: chars.clone(),
+                lines: vec![para(0..3, 0, 100), para(4..7, 0, 140)],
+                caret: None,
+                selection: None,
+                candidates: None,
+            };
+            let left = page.left as f32;
+
+            assert_eq!(
+                index_at_point(&page, &mut Stub, &frame, left + 9000.0, 9000.0),
+                Some(7),
+                "below and right of everything is the end"
+            );
+            assert_eq!(
+                index_at_point(&page, &mut Stub, &frame, left, 0.0),
+                Some(0),
+                "above the first line is its start"
+            );
+        }
+
+        #[test]
+        fn the_span_covers_every_rectangle() {
+            let rects = [
+                Rect {
+                    x: 0,
+                    y: 100,
+                    width: 10,
+                    height: 34,
+                },
+                Rect {
+                    x: 0,
+                    y: 140,
+                    width: 10,
+                    height: 34,
+                },
+            ];
+            assert_eq!(selection_span(&rects), Some((100, 174)));
+            assert_eq!(selection_span(&[]), None);
+        }
+    }
 }
