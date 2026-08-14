@@ -6,6 +6,7 @@
 pub mod buffer;
 pub mod doc;
 
+pub mod markdown;
 pub mod script;
 pub mod sentence;
 pub mod undo;

@@ -1004,6 +1004,100 @@ impl Editor {
         }
     }
 
+    /// Break the line, carrying a list or quote marker onto the next one.
+    ///
+    /// The list the cursor is *in* is the line it sits on, so this reads the
+    /// text before the cursor rather than the whole line — breaking in the
+    /// middle of an item continues it from what is above, which is what every
+    /// editor does.
+    fn newline(&mut self) {
+        let chars = self.doc.chars();
+        let start = self.doc.line_start(self.doc.cursor());
+        let line = &chars[start..self.doc.cursor().min(chars.len())];
+        match karyll_core::continues(line) {
+            karyll_core::Continue::Break => self.doc.insert_char('\n'),
+            karyll_core::Continue::Marker(marker) => {
+                self.doc.insert(&format!("\n{marker}"));
+            }
+            // The empty marker goes with the break, so Enter on a bare bullet
+            // leaves a clean blank line rather than a stranded `- `.
+            karyll_core::Continue::End(back) => {
+                for _ in 0..back {
+                    self.doc.backspace();
+                }
+                self.doc.insert_char('\n');
+            }
+        }
+    }
+
+    /// Wrap the selection, or the word under the cursor, in `marker`.
+    ///
+    /// **With nothing selected it takes the word**, which is what makes the
+    /// shortcut worth having: reaching for the mouse to select one word before
+    /// emboldening it is most of the work the shortcut was meant to save.
+    ///
+    /// The wrapped text is left selected, so the same key is a round trip and
+    /// the writer can see what was affected.
+    /// Tick the task the cursor is on, or untick it.
+    ///
+    /// One character, in place, and **the cursor does not move**: this is a mark
+    /// against a line being read, not an edit being made. Nothing happens on a
+    /// line that is not a task.
+    fn toggle_task(&mut self) {
+        let chars = self.doc.chars();
+        let start = self.doc.line_start(self.doc.cursor());
+        let end = self.doc.line_end(self.doc.cursor());
+        let Some((at, done)) = karyll_core::markdown::task_box(&chars[start..end]) else {
+            return;
+        };
+        let was = self.doc.cursor();
+        self.doc
+            .replace_range(start + at..start + at + 1, if done { " " } else { "x" });
+        self.doc.set_cursor(was);
+    }
+
+    fn emphasise(&mut self, marker: &'static str) {
+        let chars = self.doc.chars();
+        let span = self
+            .doc
+            .selection()
+            .unwrap_or_else(|| karyll_core::word_at(&chars, self.doc.cursor()));
+        if span.is_empty() {
+            return;
+        }
+        let (range, text) = karyll_core::toggle_emphasis(&chars, span, marker);
+        let width = marker.chars().count();
+        // Where the text itself ends up, markers excluded — which is the same
+        // span the next press has to find in order to undo this one.
+        let inner = if text.starts_with(marker) {
+            range.start + width..range.start + text.chars().count() - width
+        } else {
+            range.start..range.start + text.chars().count()
+        };
+        self.doc.select(range);
+        self.doc.insert(&text);
+        self.doc.select(inner);
+    }
+
+    /// Set the line the cursor is on to a heading level, or back to prose.
+    fn set_heading(&mut self, level: u8) {
+        let chars = self.doc.chars();
+        let cursor = self.doc.cursor();
+        let start = self.doc.line_start(cursor);
+        let end = self.doc.line_end(cursor);
+        let line = &chars[start..end];
+        let replacement = karyll_core::toggle_heading(line, level);
+
+        // The cursor keeps its place *in the words*, not its offset in the
+        // line: adding `## ` should not leave it two characters further into
+        // the sentence than the writer left it.
+        let shift = replacement.chars().count() as i64 - line.len() as i64;
+        let moved = (cursor as i64 + shift).clamp(start as i64, i64::MAX) as usize;
+        self.doc.select(start..end);
+        self.doc.insert(&replacement);
+        self.doc.set_cursor(moved.min(self.doc.len()));
+    }
+
     /// The Keyboard section: a line per keyboard, and the scan that finds more.
     ///
     /// Remembered keyboards first — the daemon keeps them and their link keys
@@ -2374,6 +2468,9 @@ enum KeyAction {
     Pair(hid::Device),
     Scan,
 }
+
+/// What Tab inserts. Two columns is what Markdown nesting expects.
+const INDENT: &str = "  ";
 
 #[cfg(test)]
 mod tests {

@@ -93,6 +93,23 @@ fn ink(inverted: bool, quiet: bool) -> u8 {
     }
 }
 
+/// Type size for a block. Headings step down towards the body size, so a
+/// document of mostly `##` does not waste the page on chrome.
+///
+/// The steps are tight against a 46 px body: 1.6 / 1.35 / 1.15 would put an `#`
+/// at 74 px, a poster on a 1280 px measure. Source shown styled needs the
+/// hierarchy legible, not loud — the heading is marked by its `#` as well, so
+/// size is not carrying the distinction alone.
+pub fn block_px(theme: &Theme, block: Block) -> f32 {
+    match block {
+        Block::Heading(1) => theme.body_px * 1.45,
+        Block::Heading(2) => theme.body_px * 1.25,
+        Block::Heading(3) => theme.body_px * 1.10,
+        Block::Heading(_) => theme.body_px,
+        _ => theme.body_px,
+    }
+}
+
 /// How wide the caret is drawn, at a given type size.
 ///
 /// Scaled rather than fixed, so it stays the same weight against the text
@@ -117,6 +134,14 @@ fn caret_width(px: f32) -> u16 {
 pub fn column(theme: &Theme, width: u16) -> (u16, u16) {
     let measure = theme.measure.min(width.saturating_sub(SIDE_MARGIN * 2));
     (width.saturating_sub(measure) / 2, measure)
+}
+
+/// Left inset for a block, so lists and quotes hang.
+pub fn block_indent(theme: &Theme, block: Block) -> u16 {
+    match block {
+        Block::Quote | Block::ListItem { .. } | Block::Task { .. } => (theme.body_px * 0.9) as u16,
+        _ => 0,
+    }
 }
 
 /// Everything a layout or paint needs about the document and the page, so the
@@ -243,6 +268,47 @@ pub struct VisualLine {
     pub underline: std::ops::Range<usize>,
 }
 
+/// Every distinct role the document draws from, in one pass over its markup.
+///
+/// Used to size the row box, so it holds the tallest face on the page rather
+/// than only the Latin one.
+fn roles_in(chars: &[char], markup: &[LineMarkup]) -> Vec<Role> {
+    let mut seen = Vec::new();
+    for line in markup {
+        for span in &line.spans {
+            for i in span.range.clone() {
+                let Some(&ch) = chars.get(i) else { continue };
+                let role = role_for(line.block, span.style, script_of(ch));
+                if !seen.contains(&role) {
+                    seen.push(role);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// The style of each character of a logical line, so measuring and drawing
+/// agree on which face every character uses.
+fn roles_for_line(line: &LineMarkup, chars: &[char]) -> Vec<Role> {
+    let mut roles = Vec::with_capacity(line.range.len());
+    for span in &line.spans {
+        for i in span.range.clone() {
+            roles.push(role_for(line.block, span.style, script_of(chars[i])));
+        }
+    }
+    roles
+}
+
+/// The style of each character, for deciding what is dithered.
+fn styles_for_line(line: &LineMarkup) -> Vec<Style> {
+    let mut styles = Vec::with_capacity(line.range.len());
+    for span in &line.spans {
+        styles.extend(std::iter::repeat_n(span.style, span.range.len()));
+    }
+    styles
+}
+
 /// Lay the whole document out. `top` is the y of the first line, which the
 /// caller moves to scroll.
 pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine> {
@@ -294,6 +360,47 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
         }
     }
     out
+}
+
+/// Rule a line under composing text, from `from` to `to`.
+///
+/// Below the baseline rather than on it, by a fraction of the type size so it
+/// holds its distance as the size changes, and clamped inside the row so it
+/// cannot land in the leading of the line beneath — which the row's own damage
+/// rectangle would not repaint.
+fn underline(window: &mut Window, line: &VisualLine, from: f32, to: f32) {
+    let drop = (line.px / 9.0).round().max(2.0) as i32;
+    let thickness = (line.px / 20.0).round().max(1.0) as i32;
+    let top = (line.y + line.baseline + drop).min(line.y + line.height - thickness);
+    rule(window, top, thickness, from, to);
+}
+
+/// Rule a line through struck-out text, from `from` to `to`.
+///
+/// **Through the lowercase, not through the middle of the row.** A row is as
+/// tall as its leading and its tallest face, so its centre sits below the
+/// x-height of Latin prose. A third of the type size above the baseline lands
+/// on the middle of the lowercase.
+///
+/// Clamped inside the row at the top, the way [`underline`] is at the bottom:
+/// the row's own damage rectangle is what repaints this, and ink outside it is
+/// left behind by the next update.
+fn strikethrough(window: &mut Window, line: &VisualLine, from: f32, to: f32) {
+    let rise = (line.px / 3.5).round().max(2.0) as i32;
+    let thickness = (line.px / 20.0).round().max(1.0) as i32;
+    let top = (line.y + line.baseline - rise).max(line.y);
+    rule(window, top, thickness, from, to);
+}
+
+/// The pixels of a horizontal rule, shared by the two things that draw one.
+fn rule(window: &mut Window, top: i32, thickness: i32, from: f32, to: f32) {
+    for y in top..top + thickness {
+        for x in from as i32..to as i32 {
+            if x >= 0 && y >= 0 {
+                window.put_pixel(x as u16, y as u16, BLACK);
+            }
+        }
+    }
 }
 
 /// The visual line holding `cursor`.
@@ -823,6 +930,32 @@ mod tests {
     }
 
     #[test]
+    fn headings_step_down_towards_the_body_size() {
+        let theme = Theme::default();
+        let h1 = block_px(&theme, Block::Heading(1));
+        let h2 = block_px(&theme, Block::Heading(2));
+        let h3 = block_px(&theme, Block::Heading(3));
+        let body = block_px(&theme, Block::Paragraph);
+        assert!(h1 > h2 && h2 > h3 && h3 > body);
+        // Deep headings stop shrinking rather than going below body text.
+        assert_eq!(block_px(&theme, Block::Heading(6)), body);
+    }
+
+    #[test]
+    fn a_syntax_mark_is_grey_and_body_text_is_black() {
+        use crate::window::{QUIET, WHITE};
+        assert_eq!(ink(false, false), BLACK);
+        assert_eq!(ink(false, true), QUIET);
+        // Three distinct values, which is the whole claim: one extra ink level,
+        // not a ramp. If QUIET ever collapses onto BLACK the marks stop being
+        // recessive and nothing else in the app would say so.
+        assert_ne!(ink(false, true), ink(false, false));
+        // A selection inverts everything it covers, quiet marks included.
+        assert_eq!(ink(true, true), WHITE);
+        assert_eq!(ink(true, false), WHITE);
+    }
+
+    #[test]
     fn moving_the_cursor_to_the_next_sentence_makes_the_rows_it_touches_dirty() {
         // The trap this whole field exists for. A cursor moving between
         // sentences changes no text, no size and no position — so without
@@ -860,6 +993,15 @@ mod tests {
             (45.0..=75.0).contains(&chars_per_line),
             "{chars_per_line} characters per line"
         );
+    }
+
+    #[test]
+    fn lists_and_quotes_hang_but_paragraphs_do_not() {
+        let theme = Theme::default();
+        assert!(block_indent(&theme, Block::Quote) > 0);
+        assert!(block_indent(&theme, Block::ListItem { ordered: true }) > 0);
+        assert_eq!(block_indent(&theme, Block::Paragraph), 0);
+        assert_eq!(block_indent(&theme, Block::Heading(1)), 0);
     }
 
     #[test]
@@ -1067,6 +1209,19 @@ mod tests {
         // A heading's caret is proportionally the same weight as the body's.
         assert!(caret_width(block_px(&theme, Block::Heading(1))) > caret_width(theme.body_px));
         assert!(caret_width(8.0) >= 3, "never back to a hairline");
+    }
+
+    #[test]
+    fn the_roles_of_a_document_are_the_faces_it_will_need() {
+        let chars: Vec<char> = "hello".chars().collect();
+        let markup = karyll_core::markdown::analyze(&chars);
+        assert_eq!(roles_in(&chars, &markup), vec![Role::Body]);
+
+        let chars: Vec<char> = "hello 你好".chars().collect();
+        let markup = karyll_core::markdown::analyze(&chars);
+        let roles = roles_in(&chars, &markup);
+        assert!(roles.contains(&Role::Body) && roles.contains(&Role::Han));
+        assert_eq!(roles.len(), 2, "one entry per face, not per character");
     }
 
     #[test]
@@ -1300,6 +1455,20 @@ mod tests {
         // paging has to know, or it steps past a line every screen.
         let han: &[Role] = &[Role::Body, Role::Han];
         assert!(lines_per_page(&mut Stub, &theme, han, height) < fits - 1);
+    }
+
+    #[test]
+    fn per_character_roles_and_styles_line_up_with_the_text() {
+        let chars: Vec<char> = "## 第一章 and *more*".chars().collect();
+        let markup = karyll_core::markdown::analyze(&chars);
+        let line = &markup[0];
+        let roles = roles_for_line(line, &chars);
+        let styles = styles_for_line(line);
+        assert_eq!(roles.len(), chars.len());
+        assert_eq!(styles.len(), chars.len());
+        // A heading sets everything bold, Han included.
+        assert_eq!(roles[3], Role::HanBold);
+        assert_eq!(styles[0], Style::Syntax);
     }
 
 }
