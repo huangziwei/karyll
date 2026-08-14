@@ -11,7 +11,7 @@ mod pen;
 mod render;
 mod screenshot;
 mod touch;
-
+mod ui;
 mod window;
 
 use std::path::{Path, PathBuf};
@@ -992,6 +992,193 @@ impl Editor {
         Some(action)
     }
 
+    /// The strip cells for the current mode, left to right.
+    ///
+    /// `&mut self` for one reason: whether there is a `More` to offer depends
+    /// on how many rows fit, which is measured from the face in use.
+    fn strip(&mut self) -> Vec<Bar> {
+        // The find bar takes the strip rather than sitting above it, for the
+        // reason the candidate bar does: the strip's cells are already the
+        // right size for a finger, and a second band would push the page up
+        // and reflow it on every letter typed into the search.
+        if let Some(find) = &self.find {
+            // **Both fields at once while replacing.** Changing `colour` to
+            // `color` is a comparison of two nearly identical strings, and one
+            // field at a time cannot be compared.
+            return if find.replacing {
+                vec![
+                    Bar::Query,
+                    Bar::With,
+                    Bar::Count,
+                    Bar::Previous,
+                    Bar::Next,
+                    Bar::Change,
+                    Bar::All,
+                    Bar::Done,
+                ]
+            } else {
+                vec![
+                    Bar::Query,
+                    Bar::Count,
+                    Bar::Previous,
+                    Bar::Next,
+                    Bar::Replace,
+                    Bar::Done,
+                ]
+            };
+        }
+        let mut cells = match self.mode {
+            // **Three, in the left corner**, matching `sidle/native` and `steb`
+            // — a convention shared with the other apps on this device rather
+            // than an order invented here.
+            //
+            // Save came off with the status line that replaced it: a button
+            // that duplicates an autosave, next to nothing saying the autosave
+            // ran, was a redundant control paid for with an act of faith.
+            // `Ctrl`/`⌘`+`S` still works, because the habit costs nothing.
+            //
+            // The language button came off with UI-17's notice at the caret,
+            // which names the source you land in for one keystroke. Without a
+            // keyboard there is nothing to switch the language *of*.
+            //
+            // After the corner, the order is how often a writer reaches for it:
+            // Files is daily, Outline is per long document, Config is
+            // occasional, Help is read once. Outline sits beside Files because
+            // they are the same question at two scales — which document, and
+            // where in it. **Help has a button at all because it must** — it is
+            // the page that explains the shortcuts, and reaching it only by
+            // shortcut would be the same joke it exists to answer.
+            Mode::Writing => vec![Bar::Exit, Bar::Files, Bar::Outline, Bar::Config, Bar::Help],
+            Mode::Naming { .. } => vec![Bar::Cancel],
+            // The Files panel's own actions, on the strip rather than mixed
+            // into the list of documents they act on.
+            Mode::Files(_) => vec![Bar::Done, Bar::New, Bar::Rename],
+            Mode::Config | Mode::Help | Mode::Outline(_) => vec![Bar::Done],
+        };
+        // Only when there is somewhere to go. Both directions wrap, so neither
+        // is ever a button that does nothing — and because both are always
+        // there once they are there at all, the strip never changes width
+        // under a finger that is paging through a list.
+        if self.pages() > 1 {
+            cells.extend([Bar::PageBack, Bar::PageAt, Bar::PageOn]);
+        }
+        cells
+    }
+
+    /// The strip's labels, for drawing.
+    ///
+    /// Only the find bar's change: the two fields say what has been typed, the
+    /// count says what was found, and `All` says which tap it is on. Everything
+    /// else is a fixed word.
+    fn strip_labels(&mut self) -> Vec<String> {
+        // The two numbers, not a copy of the search. `hits` is one range per
+        // occurrence, so cloning it to read a length would copy thousands of
+        // them off a common word — on every paint, which is every keystroke.
+        // Composing *into the query*, which is the only field whose half-typed
+        // word puts the count out of step with what is beside it.
+        let composing =
+            self.composing() && self.find.as_ref().is_some_and(|f| f.field == Field::Query);
+        let count = self
+            .find
+            .as_ref()
+            .map(|f| (f.query.is_empty(), f.at, f.hits.len()));
+        let armed = self.find.as_ref().is_some_and(|f| f.arming_all);
+        let page = format!("{} of {}", self.panel_page + 1, self.pages());
+        let bars = self.strip();
+        let mut labels: Vec<String> = bars
+            .iter()
+            .map(|b| match b {
+                Bar::PageAt => page.clone(),
+                // Left blank and filled in below: a field is sized by what the
+                // other cells leave, so it cannot be built alongside them.
+                Bar::Query | Bar::With => String::new(),
+                Bar::Count => count.map_or_else(String::new, |(empty, at, total)| {
+                    find_count(empty, composing, at, total)
+                }),
+                Bar::All if armed => "All?".to_string(),
+                other => other.label().to_string(),
+            })
+            .collect();
+
+        let fields = stretch_cells(&bars);
+        if !fields.is_empty() {
+            let others: Vec<String> = labels
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !fields.contains(i))
+                .map(|(_, label)| bracket(label))
+                .collect();
+            let width = self.window.width();
+            let fonts = &mut self.fonts;
+            let room = ui::stretch_room(width, &others, fields.len(), |s| {
+                ui::measure(fonts, s, ui::TEXT_PX) as u16
+            });
+            // Against the cell's own `Bar`, so the field a label is written for
+            // is the field that cell *is* — a position would be a second
+            // statement of the bar's order.
+            for cell in fields {
+                if let Some(which) = Field::of(bars[cell]) {
+                    labels[cell] = self.find_field(which, room);
+                }
+            }
+        }
+        labels
+    }
+
+    /// Which strip cells take whatever width the others leave.
+    ///
+    /// Only the find bar has them, and it has to: a field grows as it is typed
+    /// into, so packing one like a label would shove `Previous`, `Next` and
+    /// `Done` along under the writer's finger and eventually push them off the
+    /// end of the strip. The replace bar has two, sharing the slack equally.
+    fn strip_stretch(&mut self) -> Vec<usize> {
+        stretch_cells(&self.strip())
+    }
+
+    /// The status line: what this document is, how long it is, and whether it
+    /// is on disk.
+    ///
+    /// **Because autosave is otherwise invisible.** It exists so a fault in
+    /// Amazon's predictor plugin cannot take unsaved prose with it, and until
+    /// this line the writer had to take that on trust — the same objection this
+    /// project already raised about an unnamed input mode.
+    ///
+    /// Empty for a panel and for the find bar: a panel says what it is in its
+    /// own title, and the find bar has taken the room.
+    fn status_line(&mut self) -> String {
+        if !matches!(self.mode, Mode::Writing) || self.find.is_some() {
+            return String::new();
+        }
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".to_string());
+        let words = karyll_core::words::describe(karyll_core::words::count(&self.doc.chars()));
+        // Said in the present tense either way, because "unsaved" reads as a
+        // warning and this is not one: a document is written out a couple of
+        // seconds after the writer stops, and the honest report in between is
+        // that there is something still to write rather than that anything is
+        // at risk.
+        let saved = if self.doc.is_dirty() {
+            "not yet saved"
+        } else {
+            "saved"
+        };
+        format!("{name}  ·  {words}  ·  {saved}")
+    }
+
+    /// What the bottom strip says right now.
+    ///
+    /// Drawing, hit-testing and press feedback all ask here. Two of them
+    /// disagreeing is how a tap lands on the wrong cell, which is the exact
+    /// shape of bug recorded under "One list, not two".
+    ///
+    fn strip_cells(&mut self) -> Vec<String> {
+        self.strip_labels().iter().map(|l| bracket(l)).collect()
+    }
+
     /// The panel's geometry, sized from the Latin face alone.
     ///
     /// Deliberately not from the document's faces: rows are already `lh * 2`
@@ -1096,6 +1283,23 @@ impl Editor {
         ui::cell_at(&cells, x)
     }
 
+    /// Whether the action strip is on screen.
+    ///
+    /// One thing overrides the hidden flag, and it is safety rather than taste:
+    /// **without a keyboard the strip is the only way out of the app**, and an
+    /// early device run that left it unreachable cost a hard reset.
+    ///
+    /// Composing does not override it: the candidate box is drawn against the
+    /// text being composed, so a Chinese word does not drag the chrome back.
+    fn strip_visible(&self) -> bool {
+        strip_visible(
+            self.chrome_hidden,
+            self.keyboard_present,
+            self.find.is_some(),
+            matches!(self.mode, Mode::Writing),
+        )
+    }
+
     /// Where the page ends: above the strip, or the foot of the panel when the
     /// strip is out of the way.
     fn page_bottom(&mut self) -> u16 {
@@ -1103,6 +1307,22 @@ impl Editor {
             self.layout().strip_top
         } else {
             self.window.height()
+        }
+    }
+
+    /// Put the chrome away, or bring it back, repainting if that changed
+    /// anything.
+    ///
+    /// The page grows and shrinks with it, so this cannot be a damage
+    /// rectangle — every row moves.
+    fn set_chrome_hidden(&mut self, hidden: bool) {
+        if self.chrome_hidden == hidden || !matches!(self.mode, Mode::Writing) {
+            return;
+        }
+        let was = self.strip_visible();
+        self.chrome_hidden = hidden;
+        if was != self.strip_visible() {
+            self.frame = None;
         }
     }
 
@@ -1434,6 +1654,49 @@ impl Editor {
         Ok(false)
     }
 
+    /// Show what the keys and the glass do.
+    fn open_help(&mut self) -> Result<()> {
+        self.mode = Mode::Help;
+        self.panel_page = 0;
+        self.paint()
+    }
+
+    /// Clear the panel of whatever it is holding onto, and draw the screen
+    /// again.
+    ///
+    /// **Deliberate only.** There is no counter forcing one every N updates and
+    /// no idle trigger, because neither is worth its cost until ghosting is
+    /// something a writer actually sees. A flash nobody asked for, arriving
+    /// whenever they paused to think, is worse than the residue it went looking
+    /// for. This is the key for the day that changes.
+    ///
+    /// Everything remembered about what is on screen goes with it, or the next
+    /// paint would compare against a frame describing a page that has just been
+    /// painted over in black and redraw almost none of it.
+    fn refresh_panel(&mut self) -> Result<()> {
+        self.window.flash()?;
+        self.frame = None;
+        self.strip_drawn.clear();
+        self.status_drawn.clear();
+        self.paint()
+    }
+
+    /// Back to the page, from whichever panel is over it.
+    ///
+    /// The same thing `[ Done ]` does, and it has to be the same thing: a scan
+    /// left running would go on drawing over whatever the writer went back to.
+    fn leave_panel(&mut self) -> Result<()> {
+        self.scanning = None;
+        // A half-tapped Delete does not survive leaving the list. Correctness
+        // does not need this — the second tap has to land on the same
+        // document's chip, so a stale arm cannot delete anything else — but a
+        // chip still reading `Delete?` on a list opened afresh would be the
+        // page remembering something the writer has moved on from.
+        self.arming = None;
+        self.mode = Mode::Writing;
+        self.paint()
+    }
+
     /// Break the line, carrying a list or quote marker onto the next one.
     ///
     /// The list the cursor is *in* is the line it sits on, so this reads the
@@ -1607,6 +1870,63 @@ impl Editor {
         items
     }
 
+    fn strip_action(&mut self, button: Bar) -> Result<bool> {
+        // Reaching for any other button takes the arm off `[ All ]`, and says
+        // so before the button does whatever it does — the chip going back to
+        // `All` is the writer being told the confirmation lapsed.
+        if button != Bar::All && self.disarm_all() {
+            self.paint()?;
+        }
+        match button {
+            Bar::Exit => return Ok(true),
+            // Tapping a field puts the keys in it. On the find bar there is
+            // only one and it already has them; on the replace bar this is how
+            // a hand on the glass gets from one to the other.
+            Bar::Query => self.focus_field(Field::Query)?,
+            Bar::With => self.focus_field(Field::With)?,
+            Bar::Count => {}
+            Bar::Replace => self.open_replace()?,
+            Bar::Change => self.change_one()?,
+            Bar::All => self.arm_or_change_all()?,
+            Bar::Previous => {
+                self.step_find(true);
+                self.paint()?;
+            }
+            Bar::Next => {
+                self.step_find(false);
+                self.paint()?;
+            }
+            // Done closes the find bar when that is what is on the strip. The
+            // cell says Done and means it; which Done depends on what is open.
+            Bar::Done if self.find.is_some() => self.close_find()?,
+            Bar::Done | Bar::Cancel => self.leave_panel()?,
+            Bar::Files => {
+                self.mode = Mode::Files(list_documents());
+                self.panel_page = 0;
+                self.arming = None;
+                self.paint()?;
+            }
+            Bar::Help => self.open_help()?,
+            Bar::Outline => self.open_outline()?,
+            Bar::New => self.start_naming(true)?,
+            Bar::Rename => self.start_naming(false)?,
+            Bar::PageBack => self.turn_page(true)?,
+            Bar::PageOn => self.turn_page(false)?,
+            Bar::PageAt => {}
+            Bar::Config => {
+                self.mode = Mode::Config;
+                // What the daemon remembers, read fresh — the Keyboard section
+                // is drawn from it. Last session's scan results are not: those
+                // keyboards were in the room then, not necessarily now.
+                self.refresh_paired();
+                self.found.clear();
+                self.panel_page = 0;
+                self.paint()?;
+            }
+        }
+        Ok(false)
+    }
+
     /// Switch to another document, saving the current one first.
     fn open(&mut self, path: PathBuf) -> Result<()> {
         self.load(path)?;
@@ -1642,6 +1962,145 @@ impl Editor {
         if !self.holding_awake {
             power::prevent_screensaver(true);
             self.holding_awake = true;
+        }
+    }
+
+    /// Which slice of the current panel's list is on screen.
+    ///
+    /// **The one place the page offset is turned into indices**, so drawing,
+    /// hit-testing and dispatch all take the same slice of the same list. Two
+    /// of them disagreeing about where page 2 starts would open the wrong
+    /// document — the "one list, not two" failure with an offset added.
+    /// **It clamps in place**, which is why it takes `&mut self`. A list can
+    /// shrink under the page you are on — a scan result that stops answering,
+    /// a keyboard forgotten — and stranding the writer on a blank page with a
+    /// `More` button that wraps oddly is worse than quietly moving them back.
+    fn page_window(&mut self) -> std::ops::Range<usize> {
+        let capacity = self.layout().capacity().max(1);
+        let pages = self.panel_len().div_ceil(capacity).max(1);
+        self.panel_page = self.panel_page.min(pages - 1);
+        let start = self.panel_page * capacity;
+        start..start + capacity
+    }
+
+    /// The lines of the current panel that are actually on screen.
+    ///
+    /// Everything that draws or hits the list comes through here rather than
+    /// through [`Editor::panel_items`], so nothing can see a line the writer
+    /// cannot.
+    fn visible_items(&mut self) -> Vec<ui::Item> {
+        let window = self.page_window();
+        self.panel_items()
+            .into_iter()
+            .skip(window.start)
+            .take(window.len())
+            .collect()
+    }
+
+    /// How many lines the current panel has in total, paged or not.
+    fn panel_len(&self) -> usize {
+        match &self.mode {
+            Mode::Files(files) => files.len(),
+            Mode::Config => self.config_items().len(),
+            Mode::Help => help_items().len(),
+            // A document with no headings still has the one line saying so.
+            Mode::Outline(sections) => sections.len().max(1),
+            Mode::Writing | Mode::Naming { .. } => 0,
+        }
+    }
+
+    /// How many pages the current panel takes.
+    fn pages(&mut self) -> usize {
+        let capacity = self.layout().capacity().max(1);
+        self.panel_len().div_ceil(capacity).max(1)
+    }
+
+    /// Turn a page, wrapping either way.
+    ///
+    /// Wrapping rather than stopping, because a button that does nothing at one
+    /// end is a button you press twice to find out — and because the pair then
+    /// never has to appear and disappear, which on fitted cells would move the
+    /// other buttons out from under a finger.
+    fn turn_page(&mut self, back: bool) -> Result<()> {
+        let pages = self.pages();
+        self.panel_page = if back {
+            (self.panel_page + pages - 1) % pages
+        } else {
+            (self.panel_page + 1) % pages
+        };
+        self.paint()
+    }
+
+    fn panel_items(&self) -> Vec<ui::Item> {
+        match &self.mode {
+            // **A list of documents, and nothing that is not one.** New and
+            // Rename are on the strip: they were rows here, in the same rules
+            // as the files, which is the category error the Keyboard row made
+            // on the Config page.
+            //
+            // Each line says what is worth knowing before opening it — how long
+            // it is and how lately it was written — because four identical
+            // filenames on a 10.2″ page answer neither question.
+            Mode::Files(files) => files
+                .iter()
+                .map(|listing| {
+                    let open = Some(&listing.path) == self.path.as_ref();
+                    // The open document's count comes from the buffer, not from
+                    // the file: what is on disk is a save behind whatever has
+                    // just been typed.
+                    let words = if open {
+                        karyll_core::words::count(&self.doc.chars())
+                    } else {
+                        listing.words
+                    };
+                    ui::Item::Row {
+                        label: listing
+                            .path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        detail: describe_listing(words, listing.modified, open),
+                        on: open,
+                        // **Two taps, and the chip says which one it is on.**
+                        // Deleting prose cannot be undone and there is no bin on
+                        // this device to fish it out of, so the first tap only
+                        // arms it. A confirmation panel would be the heavier
+                        // answer and would cover the list the writer is reading
+                        // the name off.
+                        action: Some(
+                            if self.arming.as_ref() == Some(&listing.path) {
+                                "Delete?"
+                            } else {
+                                "Delete"
+                            }
+                            .into(),
+                        ),
+                    }
+                })
+                .collect(),
+            // Derived from `keyboard_rows`, never rebuilt. A second listing
+            // agrees with it only while nothing is paired: each remembered
+            // keyboard adds two rows, so the panel would draw and hit-test one
+            // list while taps dispatched against another. "One list, not two."
+            Mode::Config => self
+                .config_items()
+                .into_iter()
+                .map(|(item, _)| item)
+                .collect(),
+            Mode::Help => help_items(),
+            // **Indented by level**, which is what makes it an outline rather
+            // than a list of headings: the shape of the draft is the thing
+            // being looked at, and a flat column of names does not have one.
+            //
+            // A document with no headings gets a heading item — not a row —
+            // because a row is something you tap and there is nothing here to
+            // go to. [`ui::hit`] guarantees the difference.
+            Mode::Outline(sections) if sections.is_empty() => {
+                vec![ui::Item::Heading("No headings in this document".into())]
+            }
+            Mode::Outline(sections) => outline_items(sections, self.doc.cursor()),
+            Mode::Writing | Mode::Naming { .. } => Vec::new(),
         }
     }
 
@@ -2841,6 +3300,30 @@ fn document_index(display: usize, cursor: usize, preedit: usize) -> usize {
     }
 }
 
+/// Whether the action strip is on screen. Free of the editor so the safety rule
+/// below can be tested.
+///
+/// **The hidden flag is about the writing screen and nothing else.** A panel
+/// draws its own strip unconditionally — that strip *is* the panel's controls,
+/// not chrome that gets out of the way — so `writing` is the first thing asked.
+/// Leaving it out was a real bug: opening Help or Files *from the keyboard* left
+/// the flag set by the keystroke that opened it, so the panel drew a strip that
+/// nothing would hit-test. Every tap on it was swallowed by the reveal guard in
+/// [`Editor::tapped`], and swallowed again on the next tap, because
+/// `set_chrome_hidden` declines to change anything outside `Mode::Writing` and
+/// so the flag could never clear. `Done`, `Previous` and `Next` were dead until
+/// the writer happened to go back, tap the page to reveal the chrome, and enter
+/// a panel by finger instead.
+///
+/// Two more things override the flag while writing. **Without a keyboard the
+/// strip is the only way out of the app**, which is safety rather than taste —
+/// an early device run that left it unreachable cost a hard reset. And a search
+/// puts the bar there: it is what is being typed into, and a field you cannot
+/// see is not a field.
+fn strip_visible(hidden: bool, keyboard_present: bool, finding: bool, writing: bool) -> bool {
+    !writing || finding || !hidden || !keyboard_present
+}
+
 fn languages_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/languages")
 }
@@ -2881,6 +3364,104 @@ fn write_language(language: Language) {
     let _ = std::fs::write(language_file(), language.letter().to_string());
 }
 
+/// What the keys and the glass do.
+///
+/// **Laid out to the same grid as Config and Files**: the thing on the left, and
+/// what is worth knowing about it in the detail column. Here that is the key,
+/// which puts every one of them in a single column a writer can run an eye down
+/// rather than reading each line to its end.
+///
+/// A list of actions rather than a list of keys, and that way round on purpose —
+/// a reference is looked at with a job in mind ("how do I find?"), not with a
+/// key in hand. Nothing here is tappable; it reports.
+///
+/// **Both chords are named `Ctrl`/`⌘` throughout** because both are bound, and
+/// naming only one would tell half the writers this app has the wrong thing.
+///
+/// The CJK keys sit in with the rest rather than in a section of their own:
+/// `Ctrl+Space` and `Shift+Enter` are shortcuts like any other, and a writer
+/// looking for "how do I switch to Chinese" is looking in the shortcut list.
+fn help_items() -> Vec<ui::Item> {
+    let row = |label: &str, key: &str| ui::Item::Row {
+        action: None,
+        label: label.to_string(),
+        detail: key.to_string(),
+        on: false,
+    };
+    let heading = |text: &str| ui::Item::Heading(text.to_string());
+
+    vec![
+        heading("Writing"),
+        row("Save now", "Ctrl/⌘ + S"),
+        row("Undo, redo", "Ctrl/⌘ + Z,  Shift + Z"),
+        row("Bold, italic", "Ctrl/⌘ + B,  I"),
+        row("Heading level", "Ctrl/⌘ + 1 … 6"),
+        row("Focus on this sentence", "Ctrl/⌘ + D"),
+        row("Larger, smaller type", "Ctrl/⌘ + +,  Ctrl/⌘ + -"),
+        heading("Getting around"),
+        row("Find, then step through", "Ctrl/⌘ + F,  Enter"),
+        row("Step back through matches", "Shift + Enter"),
+        row("Find and replace", "Ctrl/⌘ + Shift + F"),
+        row("Move between the two fields", "Tab"),
+        row("Change this match, change all", "Ctrl/⌘ + Enter,  + Shift"),
+        row("Sections of this document", "Ctrl/⌘ + Shift + O"),
+        row("Word, line, document", "Ctrl/⌘ + ← → ↑ ↓"),
+        row("Select as you go", "Shift + any move"),
+        row("Documents, new document", "Ctrl/⌘ + O,  Ctrl/⌘ + N"),
+        row("Settings", "Ctrl/⌘ + ,"),
+        row("Turn a page of a list", "← →"),
+        row("Clear the screen", "Ctrl/⌘ + R"),
+        row("Leave a page, leave karyll", "Esc,  Ctrl/⌘ + Q"),
+        heading("Writing in Chinese and Japanese"),
+        row("Switch input source", "Ctrl + Space"),
+        row("Take a candidate", "Space, or 1 … 0"),
+        row("Take the letters as typed", "Shift + Enter"),
+        row("Drop the half-typed word", "Esc"),
+        heading("Touch and pen"),
+        // First, because it is the only way through a long document with
+        // nothing paired, and the one thing here a reader needs before they
+        // need anything else.
+        row("Back a screen, on a screen", "Tap the left, right margin"),
+        row("Start, end of the document", "Tap the top, the foot"),
+        row("Bring the buttons back", "Tap the foot of the page"),
+        row("Select a word", "Tap it twice"),
+        row("Select a run", "Press at one end, lift at the other"),
+        row("Extend a selection", "Shift + tap"),
+        // Said plainly, because a Scribe owner will try it and should know
+        // what to expect before they do.
+        row("The pen", "Places the cursor. It does not write."),
+        row("Delete a document", "Its Delete chip, twice"),
+        row("Replace every match", "Its All chip, twice"),
+        heading("Markdown it understands"),
+        row("Headings", "# … ######"),
+        row("Bold, italic", "**bold**  *italic*"),
+        row("Struck out", "~~cut this~~"),
+        row("Lists", "-  *  1."),
+        row("Things to do", "- [ ]   done: - [x]"),
+        row("Tick the one you are on", "Ctrl/⌘ + Enter"),
+        row("Quote, rule", ">  ---"),
+        row("Link, code", "[text](url)  `code`"),
+        heading("Your writing"),
+        row("Documents are kept in", DOCUMENTS),
+        row("Saved by itself", "A few seconds after you stop typing"),
+        row("Version", env!("CARGO_PKG_VERSION")),
+    ]
+}
+
+/// A strip label as it is drawn.
+///
+/// Empty stays empty: a cell with nothing to say is blank rather than a pair of
+/// empty brackets, which reads as a button that has lost its label — and, when
+/// pressed, flashed a black block where there was no button. The find bar's
+/// count is blank until something has been typed.
+fn bracket(label: &str) -> String {
+    if label.is_empty() {
+        String::new()
+    } else {
+        format!("[ {label} ]")
+    }
+}
+
 /// How far a finger may wander and still count as having stayed put.
 ///
 /// At 300 ppi this is about 3.5 mm — generous, deliberately. It separates a
@@ -2892,6 +3473,111 @@ const TOUCH_SLOP: u16 = 40;
 
 /// How long the second tap of a double-tap may take to arrive.
 const DOUBLE_TAP: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long an inverted button stays inverted, however briefly it was touched.
+///
+/// Sized for the panel, not for the code: submitting an update takes about
+/// 10 ms, but the ink itself needs roughly a quarter of a second to settle. A
+/// shorter hold is drawn and undone before anything visibly moves, which looks
+/// exactly like no feedback at all.
+const FEEDBACK: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// A button on the action strip.
+///
+/// The label travels with the action rather than being matched as a string in a
+/// second place. Two lists that have to agree are a bug waiting to happen: the
+/// touch mapping was written twice and only ever fixed once at a time, and a
+/// strip keyed on labels fails the same way — rename one and the button quietly
+/// stops doing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bar {
+    Files,
+    /// Settings. Keyboard pairing is its first section: attaching a keyboard is
+    /// configuration, not a screen of its own.
+    Config,
+    /// Leave the app, from the left corner.
+    Exit,
+    /// What the keys and the glass do.
+    Help,
+    /// The headings of the open document. Beside Files, because the pair are
+    /// the same question at two scales: which document, and where in it.
+    Outline,
+    /// Leave a panel.
+    Done,
+    /// Abandon a name being typed.
+    Cancel,
+    /// Paging a list too long for the panel: back, where you are, and on.
+    ///
+    /// **All three or none.** This was one `More` that appeared only while
+    /// there was a next page — so on the last page there was no button at all
+    /// and no way back, which is a list you can read once and then have to
+    /// leave and re-open. The wrap it was documented as doing could never
+    /// happen, because the button was gone by the time it would have.
+    ///
+    /// Named apart from the find bar's `Previous`/`Next`/`Count` rather than
+    /// shared with them, though they read the same and mean the same kind of
+    /// thing: one `Bar` that dispatches two ways depending on the mode is the
+    /// shape of bug this project keeps writing down.
+    PageBack,
+    PageAt,
+    PageOn,
+    /// The find bar's own cells: the field, how many hits there are and which
+    /// one is showing, and the two steps between them. Their labels are what
+    /// has been typed and what was found, so [`Editor::strip_labels`] fills
+    /// them in rather than [`Bar::label`].
+    Query,
+    Count,
+    Previous,
+    Next,
+    /// Ask for the second field as well. On the find bar, because a writer who
+    /// has already typed what to look for should not have to type it again to
+    /// change it.
+    Replace,
+    /// The second field, and the two things that can be done with it: this
+    /// match, or every match.
+    With,
+    Change,
+    All,
+    /// Start a document. On the Files strip, where a list of documents is what
+    /// you are looking at when you want another.
+    New,
+    /// Rename the open document — the one the Files list marks `open`, which is
+    /// why it says so in words as well as in bold.
+    Rename,
+}
+
+impl Bar {
+    fn label(self) -> &'static str {
+        match self {
+            Bar::Files => "Files",
+            Bar::Config => "Config",
+            Bar::Exit => "Exit",
+            Bar::Help => "Help",
+            Bar::Outline => "Outline",
+            Bar::Done => "Done",
+            Bar::Cancel => "Cancel",
+            // The find bar's words, because it is the same gesture — step
+            // through a sequence, with a readout saying where you are.
+            Bar::PageBack => "Previous",
+            Bar::PageOn => "Next",
+            // Filled in by `strip_labels`, which knows how many pages there are.
+            Bar::PageAt => "",
+            Bar::New => "New document",
+            Bar::Rename => "Rename",
+            // Filled in by `strip_labels`, which knows what was typed.
+            Bar::Query => "Find:",
+            Bar::Count => "",
+            Bar::Previous => "Previous",
+            Bar::Next => "Next",
+            Bar::Replace => "Replace",
+            // Filled in by `strip_labels`, like the query it sits beside.
+            Bar::With => "With:",
+            Bar::Change => "Change",
+            // Filled in by `strip_labels`, which knows whether it is armed.
+            Bar::All => "All",
+        }
+    }
+}
 
 /// What a chip in Config's Keyboard section does.
 ///
@@ -2927,6 +3613,15 @@ const INDENT: &str = "  ";
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_strip_never_hides_while_there_is_no_keyboard() {
+        // The rule that matters, and the only one here that is safety rather
+        // than taste. With nothing paired the strip is the only way out of the
+        // app; an early device run that left it unreachable cost a hard reset,
+        // and hiding it on a keystroke that cannot arrive would rebuild that.
+        assert!(strip_visible(true, false, false, true));
+    }
 
     #[test]
     fn text_before_the_preedit_is_at_the_same_index_in_both_spaces() {
@@ -3008,6 +3703,28 @@ mod tests {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
         }
+    }
+
+    #[test]
+    fn typing_with_a_keyboard_is_the_one_case_that_hides_it() {
+        assert!(!strip_visible(true, true, false, true));
+        // And it comes straight back when the flag is cleared.
+        assert!(strip_visible(false, true, false, true));
+        // A search puts the bar on the strip, and a field you cannot see is
+        // not a field — so it stays whatever the chrome flag says.
+        assert!(strip_visible(true, true, true, true));
+    }
+
+    #[test]
+    fn a_panel_always_has_its_strip_whatever_the_writing_screen_was_doing() {
+        // Opening a panel *from the keyboard* leaves the hidden flag set by the
+        // keystroke that opened it, so the panel draws a strip nothing will
+        // hit-test — and `set_chrome_hidden` declines to touch the flag outside
+        // `Mode::Writing`, so it cannot clear. Reaching a panel by finger
+        // reveals the chrome first, which hides the fault.
+        //
+        // A panel's strip is its controls, not chrome that gets out of the way.
+        assert!(strip_visible(true, true, false, false));
     }
 
     #[test]
