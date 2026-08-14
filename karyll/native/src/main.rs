@@ -1179,6 +1179,63 @@ impl Editor {
         self.strip_labels().iter().map(|l| bracket(l)).collect()
     }
 
+    /// What one of the find bar's fields says, trimmed to what its cell can
+    /// hold.
+    ///
+    /// **The bar is the field**: what has been typed is on it, with a rule for
+    /// a caret so it reads as somewhere text goes rather than as a label that
+    /// happens to say a word.
+    ///
+    /// **The caret is on the field the keys are going into, and only that one.**
+    /// With two fields on the strip it is the whole of what says which is
+    /// listening.
+    ///
+    /// The composition is on the end of it, ahead of the caret, exactly where
+    /// it sits when the same word is typed into the page. It is shown but not
+    /// searched — see [`Editor::research`].
+    ///
+    /// Trimmed from the *left* into `room`, and measured rather than counted.
+    /// A character count cannot say when a query has outgrown its cell, because
+    /// 二十四文字 is twice the width of 24 letters. The tail is what is kept:
+    /// that is where the writer is typing.
+    fn find_field(&mut self, which: Field, room: u16) -> String {
+        let Some(find) = &self.find else {
+            return String::new();
+        };
+        let focused = find.field == which;
+        let (name, typed) = match which {
+            Field::Query => ("Find", &find.query),
+            Field::With => ("With", &find.with),
+        };
+        // The composition belongs to whichever field is taking keys.
+        let query = if focused {
+            format!("{typed}{}", self.preedit)
+        } else {
+            typed.clone()
+        };
+        let caret = if focused { "_" } else { "" };
+        let name = name.to_string();
+        let mut chars: Vec<char> = query.chars().collect();
+        let mut trimmed = false;
+        loop {
+            let shown: String = chars.iter().collect();
+            let text = if trimmed {
+                format!("{name}: …{shown}{caret}")
+            } else {
+                format!("{name}: {shown}{caret}")
+            };
+            // Measured as it will be drawn, brackets included — they are part
+            // of what has to fit.
+            if chars.is_empty()
+                || ui::measure(&mut self.fonts, &bracket(&text), ui::TEXT_PX) as u16 <= room
+            {
+                return text;
+            }
+            chars.remove(0);
+            trimmed = true;
+        }
+    }
+
     /// The panel's geometry, sized from the Latin face alone.
     ///
     /// Deliberately not from the document's faces: rows are already `lh * 2`
@@ -1757,6 +1814,340 @@ impl Editor {
         self.arming = None;
         self.mode = Mode::Writing;
         self.paint()
+    }
+
+    /// Open the find bar, seeded from the selection if there is one.
+    ///
+    /// Seeded because every editor does it and the habit is worth serving:
+    /// select a word you suspect you have overused, `Ctrl+F`, and the count is
+    /// already on screen.
+    fn open_find(&mut self) -> Result<()> {
+        self.open_bar(false)
+    }
+
+    /// Open the bar's second field, or open the whole bar with it already
+    /// showing.
+    ///
+    /// Reached from `Ctrl`/`⌘`+`Shift`+`F` on the page and from `[ Replace ]` on
+    /// the find bar. It does not reopen: a query already typed must survive the
+    /// second field appearing.
+    ///
+    /// The keys go to the new field, because asking for it is asking to type
+    /// into it.
+    fn open_replace(&mut self) -> Result<()> {
+        if self.find.is_none() {
+            return self.open_bar(true);
+        }
+        // The word being composed belongs to the field it was started in.
+        self.abandon_composition();
+        if let Some(find) = &mut self.find {
+            find.replacing = true;
+            find.field = Field::With;
+            find.arming_all = false;
+        }
+        self.frame = None;
+        self.paint()
+    }
+
+    /// Put the bar on the strip, in one state or the other, and go to the
+    /// nearest match.
+    fn open_bar(&mut self, replacing: bool) -> Result<()> {
+        let query = self.doc.selected_text().unwrap_or_default();
+        // A selection spanning a line break is not a phrase anybody meant to
+        // search for, and it would never match anything anyway.
+        let query = if query.contains('\n') {
+            String::new()
+        } else {
+            query
+        };
+        self.find = Some(Find {
+            query,
+            replacing,
+            // Whichever field the writer just asked for.
+            field: if replacing { Field::With } else { Field::Query },
+            ..Find::default()
+        });
+        // The chrome is almost certainly away — the writer has been typing —
+        // and the bar is chrome.
+        self.chrome_hidden = false;
+        self.frame = None;
+        self.research();
+        self.paint()
+    }
+
+    /// Put the keys in one of the bar's two fields.
+    fn focus_field(&mut self, which: Field) -> Result<()> {
+        let already = self.find.as_ref().is_some_and(|f| f.field == which);
+        if already {
+            return Ok(());
+        }
+        // A composition belongs to the field it was started in, and moving with
+        // one held would splice half a word into the other.
+        self.abandon_composition();
+        if let Some(find) = &mut self.find {
+            find.field = which;
+        }
+        self.paint()
+    }
+
+    /// Swap between the two fields, which is what Tab does in every find bar
+    /// that has two. Nothing while only one is showing.
+    fn swap_field(&mut self) -> Result<()> {
+        let Some(find) = &self.find else {
+            return Ok(());
+        };
+        if !find.replacing {
+            return Ok(());
+        }
+        let other = match find.field {
+            Field::Query => Field::With,
+            Field::With => Field::Query,
+        };
+        self.focus_field(other)
+    }
+
+    /// Change the match on screen, and step to the next.
+    ///
+    /// **Stepping on is the point.** Staying put would need a second gesture
+    /// between every pair of changes, and the hit just changed no longer
+    /// matches the query.
+    fn change_one(&mut self) -> Result<()> {
+        let Some(find) = &self.find else {
+            return Ok(());
+        };
+        let (Some(hit), with) = (find.hits.get(find.at).cloned(), find.with.clone()) else {
+            return Ok(());
+        };
+        if find.query.is_empty() {
+            return Ok(());
+        }
+        self.doc.replace_range(hit, &with);
+        self.note_edit();
+        // The hits are stale the moment the document changes — every one after
+        // this has moved. Searching again is what puts the writer on the next
+        // one, and it is the same call the bar makes on every keystroke.
+        self.research();
+        self.frame = None;
+        self.paint()
+    }
+
+    /// Take the arm off `[ All ]`, reporting whether it was on.
+    ///
+    /// **The confirming tap has to be the very next thing the writer does.**
+    /// There is one `[ All ]` chip rather than one per row, so an arm left
+    /// standing could be finished by a single tap meant for something else, on
+    /// a replacement that is no longer the text that was armed.
+    fn disarm_all(&mut self) -> bool {
+        match &mut self.find {
+            Some(find) if find.arming_all => {
+                find.arming_all = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A tap on `[ All ]`: arm it, or carry it out.
+    ///
+    /// Two taps, the rule the Delete chip already follows. Replacing everything
+    /// changes places the writer cannot see, and by touch alone there is no undo
+    /// to reach for.
+    fn arm_or_change_all(&mut self) -> Result<()> {
+        let armed = self.find.as_ref().is_some_and(|f| f.arming_all);
+        if !armed {
+            if let Some(find) = &mut self.find {
+                find.arming_all = true;
+            }
+            return self.paint();
+        }
+        self.change_all()
+    }
+
+    /// Change every match, as one undo step.
+    fn change_all(&mut self) -> Result<()> {
+        let Some(find) = &mut self.find else {
+            return Ok(());
+        };
+        find.arming_all = false;
+        if find.query.is_empty() {
+            return self.paint();
+        }
+        let hits = std::mem::take(&mut find.hits);
+        let with = find.with.clone();
+        let changed = self.doc.replace_all(&hits, &with);
+        eprintln!("replace: {changed} changed");
+        self.note_edit();
+        self.research();
+        self.frame = None;
+        self.paint()
+    }
+
+    /// Stamp the document as just touched, the way [`Editor::apply`] does for
+    /// every keystroke — autosave reads it, and a replace is an edit.
+    fn note_edit(&mut self) {
+        self.last_edit = Some(std::time::Instant::now());
+    }
+
+    /// Recompute the hits and go to the one nearest the cursor.
+    ///
+    /// Run on every keystroke in the bar: a search that only answers on Enter
+    /// makes the writer type blind, and this document is small enough that
+    /// answering as they type costs nothing.
+    fn research(&mut self) {
+        let Some(find) = &self.find else { return };
+        let needle: Vec<char> = find.query.chars().collect();
+        let chars = self.doc.chars();
+        let hits = karyll_core::find::matches(&chars, &needle);
+        // From the *start* of the selection, not the cursor: arriving at a hit
+        // leaves the cursor at its end, and searching on from there for a
+        // longer word would skip the hit the writer is looking at.
+        let from = self
+            .doc
+            .selection()
+            .map_or_else(|| self.doc.cursor(), |s| s.start);
+        let at = karyll_core::find::from(&hits, from).unwrap_or(0);
+        if let Some(find) = &mut self.find {
+            find.hits = hits;
+            find.at = at;
+        }
+        self.show_hit();
+    }
+
+    /// Select the current hit, which is what scrolls the page to it and inverts
+    /// it — the selection was already drawn that way.
+    fn show_hit(&mut self) {
+        let Some(find) = &self.find else { return };
+        let Some(hit) = find.hits.get(find.at).cloned() else {
+            // Nothing matches, so nothing is highlighted. Leaving the last hit
+            // inverted while the bar says "not found" shows the writer a match
+            // for a search that has none.
+            self.doc.clear_selection();
+            return;
+        };
+        self.doc.select(hit);
+    }
+
+    /// Step to the next hit, or the previous one going back. Wraps either way.
+    fn step_find(&mut self, back: bool) {
+        // From the selection's *start*. `select` leaves the cursor at the end
+        // of the range, so stepping from the cursor would measure forwards from
+        // one edge of the hit and backwards from the other.
+        let cursor = self
+            .doc
+            .selection()
+            .map_or_else(|| self.doc.cursor(), |s| s.start);
+        let Some(find) = &self.find else { return };
+        let at = if back {
+            karyll_core::find::previous(&find.hits, cursor)
+        } else {
+            karyll_core::find::next(&find.hits, cursor)
+        };
+        if let (Some(at), Some(find)) = (at, &mut self.find) {
+            find.at = at;
+        }
+        self.show_hit();
+    }
+
+    /// Close the find bar, leaving the cursor on the hit it found.
+    ///
+    /// **Leaving it there is the point.** Esc in a find bar means "stop
+    /// searching", not "forget where I got to" — every editor lands the writer
+    /// at the match, and the match is still selected, so the next keystroke can
+    /// replace it.
+    fn close_find(&mut self) -> Result<()> {
+        if self.find.take().is_none() {
+            return Ok(());
+        }
+        self.frame = None;
+        self.paint()
+    }
+
+    /// A keystroke the IME did not want, while the find bar is open. True once
+    /// the bar has closed.
+    ///
+    /// Reached only after [`Editor::compose_key`] has passed, so every arm here
+    /// is the "nothing is being composed" case: `Esc` closes the bar because
+    /// there is no composition left to abandon, and `Enter` steps to the next
+    /// hit because there is nothing left to commit.
+    fn typed_query(&mut self, action: &Action) -> Result<bool> {
+        // The same rule the strip follows: the tap or key confirming `[ All ]`
+        // has to be the next thing the writer does. `ChangeAll` is the chord
+        // that carries it out and clears the arm itself.
+        if !matches!(action, Action::ChangeAll) && self.disarm_all() {
+            self.paint()?;
+        }
+        match action {
+            Action::Escape => {
+                self.close_find()?;
+                return Ok(true);
+            }
+            // Enter steps on, Shift+Enter steps back. Shift+Enter reaches here
+            // as `CommitTyped` — mid-composition it means "the letters, not the
+            // conversion" — and out of one it is only ever Enter with Shift
+            // held. Matching `Newline` alone and reading the modifier lost the
+            // backwards step entirely, because with Shift down it is not a
+            // `Newline` to begin with.
+            Action::Newline | Action::CommitTyped => self.step_find(self.mods.shift),
+            // **Enter keeps one meaning in both fields.** Stepping is what it
+            // does in a find bar; a key that edited the document in one field
+            // and only moved in the other could not be trusted. Changing is its
+            // own chord.
+            Action::Change => return self.change_one().map(|()| false),
+            Action::ChangeAll => return self.change_all().map(|()| false),
+            // Tab moves between the two fields, as it does in every find bar
+            // that has two. It cannot mean an indent here: this is a one-line
+            // field, not the page.
+            Action::Indent => return self.swap_field().map(|()| false),
+            Action::Replace => return self.open_replace().map(|()| false),
+            Action::Backspace => {
+                if self.edit_field(|text| {
+                    text.pop();
+                }) {
+                    self.research();
+                }
+            }
+            // The way back to Latin with a CJK engine switched on, and the
+            // reason it is here rather than left to fall through: every letter
+            // goes to the engine while the mode is on, so a bar with no way to
+            // switch is a bar that cannot search an English word in a Chinese
+            // document. Ctrl+Space is the binding everywhere else in the app.
+            Action::CycleLanguage => self.cycle_language(),
+            // The panel is the panel whatever is being typed into it.
+            Action::Refresh => return self.refresh_panel().map(|()| false),
+            Action::Insert(c) => {
+                let c = *c;
+                if self.edit_field(|text| text.push(c)) {
+                    self.research();
+                }
+            }
+            // Chords, arrows and page keys mean nothing to a one-line field,
+            // and must not repaint over the hit the writer is looking at.
+            _ => return Ok(false),
+        }
+        self.paint()?;
+        Ok(false)
+    }
+
+    /// Change whichever of the bar's fields is taking keys, reporting whether
+    /// it was the query.
+    ///
+    /// One place, so a keystroke cannot land in the query while the caret is
+    /// drawn on the replacement. The answer says whether the document has to be
+    /// searched again: a replacement does not move the matches.
+    fn edit_field(&mut self, change: impl FnOnce(&mut String)) -> bool {
+        let Some(find) = &mut self.find else {
+            return false;
+        };
+        match find.field {
+            Field::Query => {
+                change(&mut find.query);
+                true
+            }
+            Field::With => {
+                change(&mut find.with);
+                false
+            }
+        }
     }
 
     /// Open the name prompt, for a new document or to rename the open one.
@@ -3452,6 +3843,18 @@ fn overlay(candidates: &[String], announcing: bool, language: Language) -> ui::O
     }
 }
 
+/// Which field a keystroke goes to. Free of the editor so the precedence can be
+/// stated once and checked without a window.
+fn sink_for(naming: bool, finding: bool) -> Sink {
+    if naming {
+        Sink::Name
+    } else if finding {
+        Sink::Find
+    } else {
+        Sink::Page
+    }
+}
+
 /// The composition as far as the document is concerned.
 ///
 /// The engine holds one composition wherever it is being typed, and only the
@@ -3459,6 +3862,27 @@ fn overlay(candidates: &[String], announcing: bool, language: Language) -> ui::O
 /// composition bound anywhere else is not the page's to show or to count.
 fn page_composition(preedit: &str, sink: Sink) -> &str {
     if sink == Sink::Page { preedit } else { "" }
+}
+
+/// What the find bar's count cell says.
+///
+/// Nothing at all until there is something to count, and nothing while a word
+/// is being composed **into the query**: that field is then showing the query
+/// *and* the half-typed word, while the count is only ever about the query. A
+/// number beside text it does not describe is worse than no number.
+///
+/// A word composed into the *replacement* leaves the query alone, so the count
+/// still describes exactly what is on the field beside it and stays up.
+fn find_count(query_empty: bool, composing_query: bool, at: usize, total: usize) -> String {
+    if query_empty || composing_query {
+        return String::new();
+    }
+    if total == 0 {
+        return "not found".to_string();
+    }
+    // How many, not just where — half of what a search bar is for is telling a
+    // writer that the word they think they overuse appears eleven times.
+    format!("{} of {total}", at + 1)
 }
 
 /// A display index as a document one, given where the preedit sits and how long
@@ -3746,6 +4170,78 @@ fn in_filename(c: char) -> bool {
     !matches!(c, '/' | '\\' | '\0')
 }
 
+/// A search in progress.
+///
+/// **Not a `Mode`.** Every mode in this editor is a full-screen panel over the
+/// document, and a find that covers the document is a find you cannot use: the
+/// whole point is watching the page move to the match. So it is a field, the
+/// bar takes over the strip, and the writing screen goes on being the writing
+/// screen underneath it.
+#[derive(Debug, Default)]
+struct Find {
+    /// What has been typed into the bar.
+    query: String,
+    /// Every place it occurs, recomputed on each keystroke — see
+    /// [`karyll_core::find::matches`] on why all of them and not one.
+    hits: Vec<std::ops::Range<usize>>,
+    /// Which hit the page is showing, an index into `hits`.
+    at: usize,
+    /// What to put in place of a match, and whether the bar is asking for it.
+    ///
+    /// **A state of the find bar rather than a bar of its own**: replacing is
+    /// searching with one more thing to say, and the query, the hits and the
+    /// stepping are all the same.
+    replacing: bool,
+    with: String,
+    /// Which of the two fields the keys are going into.
+    field: Field,
+    /// Whether `[ All ]` has been tapped once.
+    ///
+    /// Two taps, the rule the Delete chip already follows: replacing all changes
+    /// places the writer cannot see, and by touch alone there is no undo. The
+    /// chip says which tap it is on.
+    arming_all: bool,
+}
+
+/// Which of the replace bar's two fields is being typed into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Field {
+    #[default]
+    Query,
+    With,
+}
+
+impl Field {
+    /// The strip cell a field is drawn in, and the reverse.
+    ///
+    /// One statement of the correspondence, so nothing has to know *where* on
+    /// the strip either field sits — [`Editor::strip`] alone decides that.
+    fn cell(self) -> Bar {
+        match self {
+            Field::Query => Bar::Query,
+            Field::With => Bar::With,
+        }
+    }
+
+    fn of(cell: Bar) -> Option<Field> {
+        match cell {
+            Bar::Query => Some(Field::Query),
+            Bar::With => Some(Field::With),
+            _ => None,
+        }
+    }
+}
+
+/// The cells of a bar that absorb whatever width the rest leave: its fields,
+/// wherever [`Editor::strip`] has put them.
+fn stretch_cells(bars: &[Bar]) -> Vec<usize> {
+    bars.iter()
+        .enumerate()
+        .filter(|(_, bar)| Field::of(**bar).is_some())
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// A document as the Files panel knows it.
 ///
 /// **Read once, when the panel opens.** `panel_items` is asked four times for a
@@ -4003,6 +4499,70 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    mod replacing {
+        use super::*;
+
+        /// The bar's two states, as [`Editor::strip`] builds them. Written out
+        /// here rather than reached through an `Editor`, which needs a window.
+        const FINDING: [Bar; 6] = [
+            Bar::Query,
+            Bar::Count,
+            Bar::Previous,
+            Bar::Next,
+            Bar::Replace,
+            Bar::Done,
+        ];
+        const REPLACING: [Bar; 8] = [
+            Bar::Query,
+            Bar::With,
+            Bar::Count,
+            Bar::Previous,
+            Bar::Next,
+            Bar::Change,
+            Bar::All,
+            Bar::Done,
+        ];
+
+        /// The elastic cells are the fields, found by what they are. Nothing
+        /// else may state the bar's order.
+        #[test]
+        fn the_fields_are_the_cells_that_stretch() {
+            assert_eq!(stretch_cells(&FINDING), vec![0]);
+            assert_eq!(stretch_cells(&REPLACING), vec![0, 1]);
+            // And a bar with no field on it has nothing elastic, so the
+            // remainder falls to the status line.
+            assert_eq!(
+                stretch_cells(&[Bar::Exit, Bar::Files, Bar::Config]),
+                Vec::<usize>::new()
+            );
+        }
+
+        /// Every elastic cell resolves back to the field it draws, whatever
+        /// order the bar puts them in.
+        #[test]
+        fn each_field_finds_its_own_cell_and_no_other() {
+            for bars in [&REPLACING[..], &FINDING[..]] {
+                for cell in stretch_cells(bars) {
+                    let field = Field::of(bars[cell]).expect("an elastic cell is a field");
+                    assert_eq!(bars.iter().position(|b| *b == field.cell()), Some(cell));
+                }
+            }
+            // Reordering the bar moves the answer with it rather than leaving
+            // a stale index behind.
+            let reversed: Vec<Bar> = REPLACING.iter().rev().copied().collect();
+            assert_eq!(stretch_cells(&reversed), vec![6, 7]);
+        }
+
+        /// A cell that is not a field is not one, so nothing else on the strip
+        /// can be typed into by accident.
+        #[test]
+        fn no_button_is_mistaken_for_a_field() {
+            for bar in [Bar::Count, Bar::Change, Bar::All, Bar::Done, Bar::Replace] {
+                assert_eq!(Field::of(bar), None, "{bar:?}");
+            }
+        }
+    }
+
     #[test]
     fn the_strip_never_hides_while_there_is_no_keyboard() {
         // The rule that matters, and the only one here that is safety rather
@@ -4081,6 +4641,18 @@ mod tests {
     }
 
     #[test]
+    fn a_field_over_the_page_takes_the_keystrokes() {
+        assert_eq!(sink_for(false, false), Sink::Page);
+        assert_eq!(sink_for(false, true), Sink::Find);
+        assert_eq!(sink_for(true, false), Sink::Name);
+        // A panel covers the page, and a bar under a panel is not reachable.
+        // They cannot both be open — the find bar takes the strip, so there is
+        // no New button on it — but the precedence is stated rather than left
+        // to whichever branch happens to be written first.
+        assert_eq!(sink_for(true, true), Sink::Name);
+    }
+
+    #[test]
     fn a_composition_bound_elsewhere_is_not_in_the_document() {
         // The page splices its composition into the text, which moves every
         // index after the cursor. A word being typed into the find bar must
@@ -4094,6 +4666,21 @@ mod tests {
         for display in 0..12 {
             assert_eq!(document_index(display, 5, composing), display);
         }
+    }
+
+    #[test]
+    fn the_count_says_nothing_it_cannot_stand_behind() {
+        assert_eq!(find_count(false, false, 2, 12), "3 of 12");
+        assert_eq!(find_count(false, false, 0, 0), "not found");
+        // Nothing typed yet: "not found" for an empty search would be an
+        // answer to a question nobody asked.
+        assert_eq!(find_count(true, false, 0, 0), "");
+        // And nothing while a word is being composed into the query, because
+        // that field is then showing the query plus a half-typed word while the
+        // count is still only about the query. A word composed into the
+        // replacement leaves the query alone, and the caller says so by passing
+        // false — the count stays up.
+        assert_eq!(find_count(false, true, 2, 12), "");
     }
 
     #[test]

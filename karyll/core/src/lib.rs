@@ -5,7 +5,7 @@
 
 pub mod buffer;
 pub mod doc;
-
+pub mod find;
 pub mod markdown;
 pub mod script;
 pub mod sentence;

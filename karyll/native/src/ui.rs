@@ -1107,6 +1107,81 @@ mod tests {
         assert_eq!(cell_at(&bounds, WIDTH - 1), None);
     }
 
+    /// The find bar's field grows as it is typed into. Packing it like a label
+    /// would shove `Previous`, `Next` and `Done` along under the writer's
+    /// finger and eventually push them off the strip; giving it the slack
+    /// instead holds every button still.
+    #[test]
+    fn the_stretch_cell_takes_the_slack_and_the_buttons_hold_still() {
+        let short = strings(&["[ Find: a_ ]", "[ 1 of 3 ]", "[ Next ]", "[ Done ]"]);
+        let long = strings(&[
+            "[ Find: a much longer query indeed_ ]",
+            "[ 1 of 3 ]",
+            "[ Next ]",
+            "[ Done ]",
+        ]);
+        let a = cell_bounds(WIDTH, &short, &[0], stub);
+        let b = cell_bounds(WIDTH, &long, &[0], stub);
+        assert_eq!(a.len(), 4);
+        assert_eq!(a, b, "a longer query moves nothing");
+        assert_eq!(
+            cells_end(&a),
+            WIDTH,
+            "and the bar fills the strip, because the field absorbed the rest"
+        );
+        // The field is what the others left.
+        let others: Vec<String> = short[1..].to_vec();
+        assert_eq!(
+            a[0].1,
+            WIDTH - others.iter().map(|s| stub(s) + CELL_PAD * 2).sum::<u16>()
+        );
+    }
+
+    /// What the field may hold is the same subtraction the layout does, or the
+    /// text is trimmed against one width and drawn into another.
+    #[test]
+    fn the_room_offered_matches_the_cell_given() {
+        let others = strings(&["[ 1 of 3 ]", "[ Previous ]", "[ Next ]", "[ Done ]"]);
+        let room = stretch_room(WIDTH, &others, 1, stub);
+        let mut cells = vec![String::new()];
+        cells.extend(others);
+        let bounds = cell_bounds(WIDTH, &cells, &[0], stub);
+        assert_eq!(
+            room,
+            bounds[0].1 - CELL_PAD * 2,
+            "the cell, less its padding"
+        );
+    }
+
+    /// Two fields, equal shares: typing into one does not move the other.
+    #[test]
+    fn two_fields_split_the_slack_between_them() {
+        let cells = strings(&[
+            "[ Find: colour_ ]",
+            "[ With: color ]",
+            "[ 1 of 3 ]",
+            "[ Change ]",
+            "[ All ]",
+            "[ Done ]",
+        ]);
+        let bounds = cell_bounds(WIDTH, &cells, &[0, 1], stub);
+        assert_eq!(bounds.len(), 6, "every button survives");
+        assert_eq!(bounds[0].1, bounds[1].1, "and the two fields are one size");
+        let fixed: u16 = cells[2..].iter().map(|s| stub(s) + CELL_PAD * 2).sum();
+        assert_eq!(bounds[0].1, (WIDTH - fixed) / 2);
+        // Typing into either one moves nothing: the width is the slack, not the
+        // text.
+        let mut typed = cells.clone();
+        typed[1] = "[ With: color and then some_ ]".into();
+        assert_eq!(cell_bounds(WIDTH, &typed, &[0, 1], stub), bounds);
+        // And the room offered agrees with the cell given, for each of them.
+        let others: Vec<String> = cells[2..].to_vec();
+        assert_eq!(
+            stretch_room(WIDTH, &others, 2, stub),
+            bounds[0].1 - CELL_PAD * 2
+        );
+    }
+
     /// Better clipped than blank: a field long enough to fill the strip still
     /// has to show, because what has been typed is nowhere else on screen.
     #[test]
@@ -1368,6 +1443,31 @@ mod tests {
             rect.y + rect.height <= low.y,
             "above the caret: {rect:?} against a caret at {}",
             low.y
+        );
+    }
+
+    #[test]
+    fn a_box_anchored_to_the_find_bar_goes_above_it() {
+        // The find bar is the strip, so there is never room below it. This is
+        // the same fallback as composing on the last line of a page, and the
+        // reason the box takes an anchor rather than reading the caret: while
+        // finding, the caret is at the last match and the typing is down here.
+        let px = TEXT_PX;
+        let list = vec!["你好".to_string(), "尼豪".to_string()];
+        let field = Rect {
+            x: 0,
+            y: BOX_BOTTOM + 3,
+            width: 372,
+            height: 117,
+        };
+        let rect = overlay_rect(1860, &mut Stub, field, px, BOX_BOTTOM, &list).unwrap();
+        assert!(
+            rect.y + rect.height <= field.y,
+            "clear of the bar it belongs to: {rect:?}"
+        );
+        assert!(
+            rect.y + rect.height <= BOX_BOTTOM,
+            "and on the page rather than over the strip"
         );
     }
 
