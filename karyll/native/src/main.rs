@@ -399,6 +399,19 @@ enum Mode {
     Outline(Vec<Section>),
 }
 
+/// One heading, as the outline lists it.
+#[derive(Debug, Clone)]
+struct Section {
+    /// `#` through `######`, for the indent.
+    level: u8,
+    /// The heading with its markup taken out — see [`karyll_core::markdown::plain`].
+    text: String,
+    /// Where its line starts, in document characters. The jump lands here.
+    at: usize,
+    /// How many words are under it, up to the next heading of any level.
+    words: usize,
+}
+
 /// Where typed text lands.
 ///
 /// There is one IME, one composition and one candidate box. The only thing that
@@ -1469,6 +1482,28 @@ impl Editor {
         self.paint()
     }
 
+    /// Which margin a point is in, if any.
+    fn page_edge(&mut self, x: u16, y: u16) -> Option<render::Edge> {
+        let bottom = self.page_bottom();
+        render::edge_at(&self.theme, self.window.width(), bottom, x, y)
+    }
+
+    /// Move the page, the way a tap on a margin asks.
+    ///
+    /// **The four keys the margins stand in for**, and not a second set of
+    /// movements beside them: a finger and `PageUp` have to leave the document
+    /// in the same place, or the two would drift the first time either was
+    /// adjusted.
+    fn go(&mut self, edge: render::Edge) -> Result<()> {
+        self.apply(match edge {
+            render::Edge::Back => Action::PageUp,
+            render::Edge::On => Action::PageDown,
+            render::Edge::Start => Action::DocStart,
+            render::Edge::End => Action::DocEnd,
+        })?;
+        self.paint()
+    }
+
     /// Run a batch of contacts through the editor, reporting whether one of
     /// them asked to leave.
     ///
@@ -1778,6 +1813,37 @@ impl Editor {
         self.mode = Mode::Help;
         self.panel_page = 0;
         self.paint()
+    }
+
+    /// Show the document's headings, on the page holding the one the cursor is
+    /// in.
+    ///
+    /// **Not page 1.** The outline is opened to get somewhere; forty sections
+    /// into a draft, the top of the list is the part already written.
+    fn open_outline(&mut self) -> Result<()> {
+        let sections = self.sections();
+        let cursor = self.doc.cursor();
+        let here = sections.iter().rposition(|s| s.at <= cursor).unwrap_or(0);
+        self.mode = Mode::Outline(sections);
+        let capacity = self.layout().capacity().max(1);
+        self.panel_page = here / capacity;
+        self.paint()
+    }
+
+    /// Go to a heading, and put it at the top of the page.
+    ///
+    /// [`render::Scroll::Follow`] moves the page as little as it can, which is
+    /// right while writing and wrong for a jump: the destination would land on
+    /// the last line, with the whole section above the fold. `landing` is what
+    /// says this paint is an arrival.
+    ///
+    /// Out through [`Editor::leave_panel`], so a jump tidies up after whatever
+    /// panel was open exactly as `[ Done ]` does — a scan left running would go
+    /// on drawing over the page arrived at.
+    fn jump_to(&mut self, at: usize) -> Result<()> {
+        self.doc.set_cursor(at);
+        self.landing = true;
+        self.leave_panel()
     }
 
     /// Clear the panel of whatever it is holding onto, and draw the screen
@@ -2581,6 +2647,11 @@ impl Editor {
             Mode::Outline(sections) => outline_items(sections, self.doc.cursor()),
             Mode::Writing | Mode::Naming { .. } => Vec::new(),
         }
+    }
+
+    /// Every heading in the open document, in order.
+    fn sections(&self) -> Vec<Section> {
+        sections_of(&self.doc.chars())
     }
 
     /// Start a scan. Results are collected by [`Editor::poll_scan`] on the
@@ -4147,6 +4218,76 @@ fn help_items() -> Vec<ui::Item> {
     ]
 }
 
+/// Every heading in `chars`, in order.
+///
+/// Read from [`karyll_core::markdown::analyze`], which is the same pass the
+/// renderer labels the page with — so a line the outline calls a heading is a
+/// line drawn as one.
+///
+/// The word count is the prose **under** the heading, running to the next
+/// heading of any level: the heading's own words are not in it, and a section
+/// and its subsections do not count the same prose twice.
+fn sections_of(chars: &[char]) -> Vec<Section> {
+    let heads: Vec<(std::ops::Range<usize>, u8, String)> = karyll_core::markdown::analyze(chars)
+        .iter()
+        .filter_map(|line| match line.block {
+            karyll_core::markdown::Block::Heading(level) => Some((
+                line.range.clone(),
+                level,
+                karyll_core::markdown::plain(chars, line),
+            )),
+            _ => None,
+        })
+        .collect();
+    heads
+        .iter()
+        .enumerate()
+        .map(|(i, (range, level, text))| {
+            let until = heads
+                .get(i + 1)
+                .map_or(chars.len(), |(next, _, _)| next.start);
+            Section {
+                level: *level,
+                text: text.clone(),
+                at: range.start,
+                words: karyll_core::words::count(&chars[range.end.min(until)..until]),
+            }
+        })
+        .collect()
+}
+
+/// The outline as rows, with the section holding `cursor` marked.
+///
+/// **Indented by level**, which is what makes it an outline rather than a list
+/// of headings: the shape of the draft is the thing being looked at, and a flat
+/// column of names does not have one.
+fn outline_items(sections: &[Section], cursor: usize) -> Vec<ui::Item> {
+    // The one the cursor is in: the last heading at or before it. Marked so
+    // that opening the outline says where the writer already is before they
+    // choose where to go.
+    let here = sections.iter().rposition(|s| s.at <= cursor);
+    sections
+        .iter()
+        .enumerate()
+        .map(|(i, section)| ui::Item::Row {
+            label: format!(
+                "{}{}",
+                OUTLINE_STEP.repeat(section.level.saturating_sub(1) as usize),
+                // A heading with nothing after the hashes has no name, and a
+                // blank row is a row that looks broken.
+                if section.text.is_empty() {
+                    "(untitled)"
+                } else {
+                    &section.text
+                }
+            ),
+            detail: karyll_core::words::describe(section.words),
+            on: here == Some(i),
+            action: None,
+        })
+        .collect()
+}
+
 /// A strip label as it is drawn.
 ///
 /// Empty stays empty: a cell with nothing to say is blank rather than a pair of
@@ -4494,10 +4635,136 @@ enum Target {
 /// What Tab inserts. Two columns is what Markdown nesting expects.
 const INDENT: &str = "  ";
 
+/// One level of the outline's indent.
+///
+/// Spaces, in the label column, because the rows are already laid out to the
+/// panel's one grid. Four reads as a step at the panel's text size without
+/// pushing a sixth-level heading off the page.
+const OUTLINE_STEP: &str = "    ";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    mod outline {
+        use super::*;
+
+        const DRAFT: &str = "\
+# The whole thing
+
+An opening line of five words.
+
+## First **part**
+
+Three words here.
+
+### A detail
+
+nine words in this one under the third level
+
+## Second part
+
+";
+
+        fn of(src: &str) -> Vec<Section> {
+            sections_of(&src.chars().collect::<Vec<_>>())
+        }
+
+        #[test]
+        fn every_heading_is_listed_with_its_level_and_its_name() {
+            let found = of(DRAFT);
+            let named: Vec<(u8, &str)> = found.iter().map(|s| (s.level, s.text.as_str())).collect();
+            assert_eq!(
+                named,
+                vec![
+                    (1, "The whole thing"),
+                    (2, "First part"),
+                    (3, "A detail"),
+                    (2, "Second part"),
+                ]
+            );
+        }
+
+        /// The count is the prose under the heading, not the heading's own
+        /// words, and it stops at the next heading of **any** level — so a
+        /// section and its subsections do not count the same prose twice.
+        #[test]
+        fn each_section_counts_only_the_prose_below_it() {
+            let counts: Vec<usize> = of(DRAFT).iter().map(|s| s.words).collect();
+            assert_eq!(counts, vec![6, 3, 9, 0]);
+        }
+
+        #[test]
+        fn a_jump_lands_on_the_heading_line_itself() {
+            let chars: Vec<char> = DRAFT.chars().collect();
+            for section in of(DRAFT) {
+                assert_eq!(chars[section.at], '#', "{:?}", section.text);
+            }
+        }
+
+        /// Only real headings. A `#` inside a fence is code, and a line that
+        /// merely starts with one is prose.
+        #[test]
+        fn hashes_that_are_not_headings_are_not_sections() {
+            assert!(of("```\n# not a heading\n```\n").is_empty());
+            assert!(of("#nospace\n").is_empty());
+            assert!(of("Ordinary prose.\n").is_empty());
+        }
+
+        #[test]
+        fn a_document_with_no_headings_has_no_outline() {
+            assert!(of("").is_empty());
+        }
+
+        #[test]
+        fn the_rows_step_in_by_level() {
+            let rows = outline_items(&of(DRAFT), 0);
+            let labels: Vec<&str> = rows
+                .iter()
+                .map(|item| match item {
+                    ui::Item::Row { label, .. } => label.as_str(),
+                    _ => panic!("every outline line is a row"),
+                })
+                .collect();
+            assert_eq!(labels[0], "The whole thing");
+            assert_eq!(labels[1], format!("{OUTLINE_STEP}First part"));
+            assert_eq!(labels[2], format!("{OUTLINE_STEP}{OUTLINE_STEP}A detail"));
+        }
+
+        /// Opening the outline says where the writer already is, before they
+        /// choose where to go.
+        #[test]
+        fn the_section_the_cursor_is_in_is_the_marked_one() {
+            let found = of(DRAFT);
+            let marked = |cursor: usize| -> Option<usize> {
+                outline_items(&found, cursor)
+                    .iter()
+                    .position(|item| matches!(item, ui::Item::Row { on: true, .. }))
+            };
+            assert_eq!(marked(0), Some(0), "on the first heading itself");
+            assert_eq!(marked(found[1].at + 1), Some(1), "inside the second");
+            // Just before a heading belongs to the section above it, not to the
+            // one about to start.
+            assert_eq!(marked(found[2].at - 1), Some(1));
+            assert_eq!(marked(usize::MAX), Some(3), "past the end is the last");
+        }
+
+        /// A heading with nothing after the hashes still gets a row, because a
+        /// blank one reads as a fault.
+        #[test]
+        fn a_nameless_heading_is_still_somewhere_to_go() {
+            let found = of("## \n\nsome words here\n");
+            assert_eq!(found.len(), 1);
+            let rows = outline_items(&found, 0);
+            match &rows[0] {
+                ui::Item::Row { label, .. } => {
+                    assert!(label.trim_start().starts_with('('), "{label:?}")
+                }
+                _ => panic!("a row"),
+            }
+        }
+    }
 
     mod replacing {
         use super::*;

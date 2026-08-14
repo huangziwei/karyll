@@ -136,6 +136,58 @@ pub fn column(theme: &Theme, width: u16) -> (u16, u16) {
     (width.saturating_sub(measure) / 2, measure)
 }
 
+/// Which edge of the page a tap fell on.
+///
+/// **The margins are the page's own controls**, which is what makes a document
+/// readable with nothing paired: a tap places the cursor, a drag selects, and
+/// neither moves the page — so without these there is one way through a long
+/// draft and it is the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// The left margin: back a screen.
+    Back,
+    /// The right margin: on a screen. The way round a Kindle already reads.
+    On,
+    /// The band along the top: the start of the document.
+    Start,
+    /// The band above the strip: the end of it.
+    End,
+}
+
+/// How much of an edge answers a tap.
+///
+/// The strip's own height, which is the target size this app already settled on
+/// for a finger: 120 px is 10 mm on a 300 ppi panel.
+const EDGE: u16 = 120;
+
+/// Which edge a tap at `(x, y)` fell on, or `None` for the page itself.
+///
+/// **The sides run the full height and the bands sit between them**, so a
+/// corner turns a page rather than jumping to an end — the corner is where a
+/// thumb strays, and a page turn is the cheaper mistake.
+///
+/// The sides are the real margins, widened to [`EDGE`] when the type is large
+/// enough to leave less. The cost of that widening is a character or two at
+/// each end of a line that a tap can no longer put the cursor in; the cost of
+/// not widening it is a control too narrow to hit.
+pub fn edge_at(theme: &Theme, width: u16, bottom: u16, x: u16, y: u16) -> Option<Edge> {
+    let (left, _) = column(theme, width);
+    let side = left.max(EDGE);
+    if x < side {
+        return Some(Edge::Back);
+    }
+    if x >= width.saturating_sub(side) {
+        return Some(Edge::On);
+    }
+    if y < EDGE {
+        return Some(Edge::Start);
+    }
+    if y >= bottom.saturating_sub(EDGE) {
+        return Some(Edge::End);
+    }
+    None
+}
+
 /// Left inset for a block, so lists and quotes hang.
 pub fn block_indent(theme: &Theme, block: Block) -> u16 {
     match block {
@@ -567,6 +619,57 @@ pub enum Scroll {
     ///
     /// `top` is the text column's top margin, as `Follow`'s is.
     Top { top: i32 },
+}
+
+/// Which way the page follows the cursor.
+///
+/// **The two modes measure different boxes, and that is the whole reason this
+/// is a function.**
+///
+/// Following is about the text column as it currently is: it starts at the top
+/// margin, because the caret should not be dragged above where text begins, and
+/// ends at `page_bottom`, because the caret must stay off the chrome.
+///
+/// Centring is about the **panel**, top to bottom, and neither the margin nor
+/// the chrome moves it:
+///
+/// - The margin is where text starts, not where the page does. Using it as the
+///   top put the focused sentence half a margin low.
+/// - The strip comes and goes while writing. Measuring to it moved the focused
+///   sentence by half the strip's height every time the chrome appeared, so the
+///   page shifted under the reader for a reason that had nothing to do with
+///   what they were writing.
+///
+/// **A jump centres too**, for a reason that is not focus mode's. Following
+/// only moves the page as far as it must, so a cursor that arrived from off
+/// screen lands flush against whichever edge it came in by — and a search hit
+/// pinned to the last line of the page shows the writer everything before their
+/// match and nothing after it. Every editor centres what it found; this is that,
+/// and it reuses the machinery focus mode already needed.
+/// **Landing on a section is the third case, and it outranks focus mode**: it is
+/// the one paint where the writer has said where they want to be. The sentence
+/// they land on is centred again by the next keystroke.
+pub fn scroll_mode(
+    focus: bool,
+    jumped: bool,
+    landing: bool,
+    margin_y: i32,
+    page_bottom: i32,
+    panel: i32,
+) -> Scroll {
+    if landing {
+        Scroll::Top { top: margin_y }
+    } else if focus || jumped {
+        Scroll::Centre {
+            top: 0,
+            bottom: panel,
+        }
+    } else {
+        Scroll::Follow {
+            top: margin_y,
+            bottom: page_bottom,
+        }
+    }
 }
 
 /// Where the page should sit, given where it sat before.
@@ -1069,6 +1172,86 @@ mod tests {
         }
     }
 
+    mod margins {
+        use super::*;
+
+        /// A portrait panel with the strip on it, which is what a reader with
+        /// no keyboard is looking at.
+        const W: u16 = 1860;
+        const BOTTOM: u16 = 2480 - crate::ui::STRIP_H;
+
+        fn at(theme: &Theme, x: u16, y: u16) -> Option<Edge> {
+            edge_at(theme, W, BOTTOM, x, y)
+        }
+
+        #[test]
+        fn each_margin_moves_the_page_its_own_way() {
+            let theme = Theme::default();
+            let middle = BOTTOM / 2;
+            assert_eq!(at(&theme, 20, middle), Some(Edge::Back));
+            assert_eq!(at(&theme, W - 20, middle), Some(Edge::On));
+            assert_eq!(at(&theme, W / 2, 20), Some(Edge::Start));
+            assert_eq!(at(&theme, W / 2, BOTTOM - 20), Some(Edge::End));
+        }
+
+        /// The page itself is the largest part of the page, and a tap there
+        /// still places the cursor.
+        #[test]
+        fn the_column_between_them_is_not_an_edge() {
+            let theme = Theme::default();
+            assert_eq!(at(&theme, W / 2, BOTTOM / 2), None);
+            let (left, measure) = column(&theme, W);
+            assert_eq!(at(&theme, left, BOTTOM / 2), None, "the first character");
+            assert_eq!(
+                at(&theme, left + measure - 1, BOTTOM / 2),
+                None,
+                "and the last"
+            );
+        }
+
+        /// A corner turns a page rather than jumping to an end: it is where a
+        /// thumb strays, and a page turn is the cheaper mistake.
+        #[test]
+        fn the_corners_belong_to_the_sides() {
+            let theme = Theme::default();
+            assert_eq!(at(&theme, 20, 20), Some(Edge::Back));
+            assert_eq!(at(&theme, 20, BOTTOM - 20), Some(Edge::Back));
+            assert_eq!(at(&theme, W - 20, 20), Some(Edge::On));
+            assert_eq!(at(&theme, W - 20, BOTTOM - 20), Some(Edge::On));
+        }
+
+        /// The margins narrow as the type grows, and a control narrower than a
+        /// fingertip is not one. Every size has to leave a reachable edge.
+        #[test]
+        fn every_type_size_leaves_an_edge_worth_aiming_at() {
+            for px in SIZES {
+                let theme = Theme::at(px);
+                let middle = BOTTOM / 2;
+                assert_eq!(at(&theme, EDGE - 1, middle), Some(Edge::Back), "{px} px");
+                assert_eq!(
+                    at(&theme, W - EDGE, middle),
+                    Some(Edge::On),
+                    "{px} px on the right"
+                );
+                // And the two sides are the same width, whichever it is.
+                let (left, _) = column(&theme, W);
+                let side = left.max(EDGE);
+                assert_eq!(at(&theme, side, middle), None);
+                assert_eq!(at(&theme, W - side - 1, middle), None);
+            }
+        }
+
+        /// The band is above the strip, not on it: the strip is hit-tested
+        /// first and its buttons are not page turns.
+        #[test]
+        fn the_bottom_band_stops_where_the_page_does() {
+            let theme = Theme::default();
+            assert_eq!(at(&theme, W / 2, BOTTOM - 1), Some(Edge::End));
+            assert_eq!(at(&theme, W / 2, BOTTOM - EDGE), Some(Edge::End));
+            assert_eq!(at(&theme, W / 2, BOTTOM - EDGE - 1), None);
+        }
+    }
+
     #[test]
     fn headings_step_down_towards_the_body_size() {
         let theme = Theme::default();
@@ -1566,6 +1749,66 @@ mod tests {
         assert_eq!(scroll_for(&lines, 9, 700, FOLLOW), 700);
         // Back to the first row, which sits above the scrolled window.
         assert_eq!(scroll_for(&lines, 2, 700, FOLLOW), 0);
+    }
+
+    /// Landing outranks both, because it is the one paint where the writer has
+    /// said where they want to be.
+    #[test]
+    fn landing_on_a_section_beats_focus_and_beats_a_search_hit() {
+        let panel = 1860;
+        let strip_top = panel - crate::ui::STRIP_H as i32;
+        assert_eq!(
+            scroll_mode(true, true, true, 160, strip_top, panel),
+            Scroll::Top { top: 160 }
+        );
+    }
+
+    /// `Follow` moves the page as little as it can, so a jump forwards lands
+    /// the destination on the **last** line, with the whole section the writer
+    /// asked for above the fold.
+    #[test]
+    fn a_section_chosen_from_the_outline_arrives_at_the_top() {
+        // A page of rows, and a jump to one far down it from a page still at
+        // the top of the document.
+        let rows = || -> Vec<VisualLine> {
+            (0..40)
+                .map(|i| para(i * 10..i * 10 + 6, i, 160 + i as i32 * 60))
+                .collect()
+        };
+        let lines = rows();
+        let heading = 30 * 10;
+        let top = Scroll::Top { top: 160 };
+        let landed = scroll_for(&lines, heading, 0, top);
+        // The heading's row is exactly at the top margin afterwards.
+        assert_eq!(landed, 160 + 30 * 60 - 160);
+        let mut shifted = rows();
+        shift(&mut shifted, landed);
+        assert_eq!(shifted[30].y, 160);
+        // Following would have put it at the foot of the page instead, with
+        // every word of the section below the fold.
+        let followed = scroll_for(
+            &lines,
+            heading,
+            0,
+            Scroll::Follow {
+                top: 160,
+                bottom: 1740,
+            },
+        );
+        let mut under_follow = rows();
+        shift(&mut under_follow, followed);
+        assert!(
+            under_follow[30].y > 1740 - 100,
+            "which is the whole point of the mode"
+        );
+    }
+
+    #[test]
+    fn landing_on_the_first_heading_does_not_push_blank_paper_above_it() {
+        let lines = vec![para(0..6, 0, 160), para(7..13, 1, 220)];
+        assert_eq!(scroll_for(&lines, 0, 0, Scroll::Top { top: 160 }), 0);
+        // And from further down the document, it still comes back to zero.
+        assert_eq!(scroll_for(&lines, 0, 900, Scroll::Top { top: 160 }), 0);
     }
 
     #[test]
