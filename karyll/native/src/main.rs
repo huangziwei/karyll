@@ -189,6 +189,7 @@ fn main() -> Result<()> {
         typed: String::new(),
         preedit: String::new(),
         candidates: Vec::new(),
+        page: 0,
         punctuation: ime::Punctuation::default(),
         // The remembered one is applied below rather than assigned here.
         language: Language::English,
@@ -622,11 +623,18 @@ struct Editor {
     ///
     /// `typed` and `preedit` are the same string for Chinese, where pinyin *is*
     /// what was typed, and differ for Japanese, where `nihon` is typed and
-    /// にほん is composed. `typed` is what decides whether a word is under way;
-    /// `preedit` is what the bar shows and what Enter commits.
+    /// にほん is composed. `preedit` is what the bar shows and what Enter
+    /// commits; `typed` is what F10 gives back.
+    ///
+    /// A candidate that converts only the front of a word rebases both onto
+    /// what is left of the reading, and there the letters as struck are gone —
+    /// the engine holds a remainder, not a history of how it was spelled.
     typed: String,
     preedit: String,
     candidates: Vec<String>,
+    /// Which ten of them are on the bar. The word wanted is often not among the
+    /// first ten, which is what the arrows are for while composing.
+    page: usize,
     /// Which way the next quotation mark faces. Chinese quotes are directional
     /// and share one key, so the same keystroke has to alternate.
     punctuation: ime::Punctuation,
@@ -1413,7 +1421,7 @@ impl Editor {
         // The cells the box was drawn from, by the same function that drew
         // them. Measuring something other than what is on screen is how a tap
         // lands on the wrong one.
-        let labels = ui::Overlay::Candidates(&self.candidates).labels();
+        let labels = ui::Overlay::Candidates(candidate_page(&self.candidates, self.page)).labels();
         let cells = ui::overlay_cells(&mut self.fonts, rect, self.theme.body_px, &labels);
         // `None` past the last cell: inside the box but beyond the choices
         // belongs to nothing.
@@ -3378,7 +3386,11 @@ impl Editor {
             status,
             items: &items,
             strip: &strip,
-            overlay: overlay(&self.candidates, self.announcing, self.language),
+            overlay: overlay(
+                candidate_page(&self.candidates, self.page),
+                self.announcing,
+                self.language,
+            ),
         }
         .paint(&mut self.window, &mut self.fonts, layout)
     }
@@ -3640,6 +3652,22 @@ impl Editor {
                 self.feed(c);
             }
             ime::Compose::Select(n) => self.select_candidate(n),
+            // With no bar on screen there is nothing to page, and an arrow
+            // means there what it means everywhere else: leave the half-typed
+            // word behind. Japanese passes through this at the start of every
+            // syllable, where the letters are not yet kana.
+            ime::Compose::NextPage | ime::Compose::PreviousPage if self.candidates.is_empty() => {
+                self.abandon_composition()
+            }
+            // Consumed at either end of the list whether or not the page moves.
+            // Letting the arrow through from the last page would move the
+            // cursor out from under a word that is still being written.
+            ime::Compose::NextPage => {
+                if (self.page + 1) * ime::WANTED < self.candidates.len() {
+                    self.page += 1;
+                }
+            }
+            ime::Compose::PreviousPage => self.page = self.page.saturating_sub(1),
             // A capital ends the word being composed and then lands on the
             // page itself, the same shape as punctuation: typing `中国NASA`
             // should not need the mode switched off and back.
@@ -3691,23 +3719,39 @@ impl Editor {
         let composed = engine.preedit();
         self.candidates = candidates;
         self.preedit = composed.unwrap_or_else(|| self.typed.clone());
+        // A new list is read from its first page. Holding the old page would
+        // leave the bar empty on the keystroke that shortened the list.
+        self.page = 0;
     }
 
-    /// Accept a candidate by position, from the number row or a tap on the bar.
+    /// Accept a candidate by its place on the bar, from the number row or a tap.
     ///
     /// Out of range does nothing rather than committing something else: the
     /// engine offers fewer than ten candidates often, and pressing 7 for a list
     /// of three should not insert the third.
     fn select_candidate(&mut self, n: usize) {
-        let Some(text) = self.candidates.get(n).cloned() else {
+        let at = self.page * ime::WANTED + n;
+        let Some(text) = self.candidates.get(at).cloned() else {
             return;
         };
-        if let Some(engine) = self.engine() {
-            engine.commit(n);
+        match self.engine().and_then(|engine| engine.commit(at)) {
+            // **The word is not over.** The candidate converted the front of
+            // the reading and the engine is composing the rest, so the bar goes
+            // on carrying it and the next keystroke belongs to it. Ending here
+            // would strand that reading in the engine, where it would splice
+            // itself onto the front of the next word typed.
+            Some(rest) => {
+                self.typed.clone_from(&rest.reading);
+                self.preedit = rest.reading;
+                self.candidates = rest.candidates;
+            }
+            None => {
+                self.typed.clear();
+                self.preedit.clear();
+                self.candidates.clear();
+            }
         }
-        self.typed.clear();
-        self.preedit.clear();
-        self.candidates.clear();
+        self.page = 0;
         self.insert_committed(&text);
     }
 
@@ -3716,9 +3760,11 @@ impl Editor {
     /// The two differ, and it is a difference in the languages rather than in
     /// the plugins:
     ///
-    /// * **Chinese takes the best candidate.** Pinyin predicts as it goes, so
-    ///   the top candidate is what the writer has been watching the whole time
-    ///   and is what they mean by typing on.
+    /// * **Chinese takes the best candidate**, and takes it again for as long
+    ///   as one covers only the front of the reading. Pinyin predicts as it
+    ///   goes, so the top candidate is what the writer has been watching the
+    ///   whole time and is what they mean by typing on — but a word is finished
+    ///   only when the whole reading is converted.
     /// * **Japanese takes the composition itself**, because that is already the
     ///   answer either way: the engine's composition getter returns the raw
     ///   kana while nothing is selected, and the selected candidate once space
@@ -3729,10 +3775,22 @@ impl Editor {
         if !self.composing() {
             return;
         }
-        if script == ime::Script::Chinese && !self.candidates.is_empty() {
-            self.select_candidate(0);
-            return;
+        if script == ime::Script::Chinese {
+            // Bounded by the reading, which every pass shortens by at least a
+            // syllable. An engine that handed back what it was given would
+            // otherwise spin here.
+            for _ in 0..=self.typed.chars().count() {
+                if self.candidates.is_empty() {
+                    break;
+                }
+                self.select_candidate(0);
+            }
+            if !self.composing() {
+                return;
+            }
         }
+        // Whatever is left when there is nothing to convert it with: pinyin the
+        // dictionary does not have, or kana that is meant to stay kana.
         let text = std::mem::take(&mut self.preedit);
         self.abandon_composition();
         self.insert_committed(&text);
@@ -3778,6 +3836,7 @@ impl Editor {
         self.typed.clear();
         self.preedit.clear();
         self.candidates.clear();
+        self.page = 0;
     }
 
     /// Whether a word is being composed, which is what swaps the action strip
@@ -3968,7 +4027,11 @@ impl Editor {
         let editing = render::Editing {
             cursor,
             selection,
-            overlay: overlay(&self.candidates, self.announcing, self.language),
+            overlay: overlay(
+                candidate_page(&self.candidates, self.page),
+                self.announcing,
+                self.language,
+            ),
             anchor,
         };
         self.frame = Some(render::paint(
@@ -4272,6 +4335,16 @@ fn write_orientation(orientation: orientation::Orientation) {
 /// writer who left in Chinese comes back to Chinese.
 fn language_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/language")
+}
+
+/// The ten candidates on the bar: the page the writer has paged to, and fewer
+/// than ten on the last one.
+///
+/// Free of the editor for the same reason [`overlay`] is.
+fn candidate_page(candidates: &[String], page: usize) -> &[String] {
+    let from = (page * ime::WANTED).min(candidates.len());
+    let to = (from + ime::WANTED).min(candidates.len());
+    &candidates[from..to]
 }
 
 /// What floats beside the caret right now.

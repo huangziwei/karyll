@@ -63,6 +63,16 @@
 //! the index of that same table, so the caller always already holds the text it
 //! committed: the host callback that reports it is confirmation, not delivery.
 //!
+//! **A commit does not have to consume the whole reading**, and the two engines
+//! part company over what becomes of the rest. Chinese's commit slot handles it
+//! itself: `ET9CPGetSelection` reports how many symbols the chosen phrase
+//! covered, and the slot re-feeds every key past that one back through
+//! `prv_key_handler`, so it returns already composing the remainder. Japanese's
+//! ends by zeroing its composition buffer, so what the candidate did not cover
+//! is gone. Either way the caller has to ask what is left rather than assume a
+//! commit ended the word — assuming it strands the remainder inside the engine,
+//! where it joins the front of the next word typed.
+//!
 //! The key is a **Unicode codepoint** — ASCII for pinyin and romaji, not a
 //! keycode and not an index. Each engine handles a couple of keys itself, which
 //! is why they are forwarded rather than special-cased here.
@@ -90,13 +100,19 @@ pub trait Ime {
     /// Feed one key and return the candidates now available, best first.
     fn key(&mut self, key: char) -> Vec<String>;
 
-    /// Accept candidate `index`: the engine records the choice, updates its
-    /// context and clears itself for the next word.
+    /// Accept candidate `index`, and hand back whatever reading it left
+    /// unconverted.
     ///
-    /// It returns nothing, because the caller already has the text — it is the
-    /// candidate it just selected. The plugin does hand the committed string
-    /// back through a host callback, but that is confirmation, not delivery.
-    fn commit(&mut self, index: usize);
+    /// It returns no committed text, because the caller already has that — it
+    /// is the candidate it just selected. The plugin does hand the committed
+    /// string back through a host callback, but that is confirmation, not
+    /// delivery.
+    ///
+    /// What it does return is the other half of the answer. A candidate can
+    /// cover the front of the reading and leave the rest, and then the word is
+    /// not over: it carries on with a shorter reading and a new list of
+    /// candidates. `None` is a word that is finished.
+    fn commit(&mut self, index: usize) -> Option<Rest>;
 
     /// Abandon whatever is being composed.
     fn clear(&mut self);
@@ -122,9 +138,29 @@ pub trait Ime {
     }
 }
 
-/// How many candidates to ask for. Ten fits a bar across the page and matches
-/// the number row, which is how they are chosen.
+/// What an engine is still composing after a candidate covered only the front
+/// of the reading.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rest {
+    /// The part that was not converted: pinyin in Chinese, kana in Japanese.
+    pub reading: String,
+    /// What that reading offers now, best first.
+    pub candidates: Vec<String>,
+}
+
+/// How many candidates are on screen at once. Ten fits a bar across the page
+/// and matches the number row, which is how they are chosen.
 pub const WANTED: usize = 10;
+
+/// How many to keep behind them, for the writer to page through.
+///
+/// A word whose candidate is not in the first ten is exactly the word that
+/// needs the rest of the list, and without this there is no way to reach it.
+/// Five pages rather than everything the engine has: **Chinese clamps its
+/// answer to the count it is asked for**, and each candidate past that count
+/// costs an `ET9CPGetPhrase` on every keystroke, while the pages past the fifth
+/// are ones no writer pages to.
+pub const KEPT: usize = 5 * WANTED;
 
 /// CJK punctuation for the ASCII key that produces it.
 ///
@@ -249,8 +285,11 @@ impl Punctuation {
 pub enum Compose {
     /// Send this to the engine.
     Feed(char),
-    /// Take candidate `n`, counting from zero.
+    /// Take candidate `n` of the ten on screen, counting from zero.
     Select(usize),
+    /// Show the ten candidates after the ones on screen, or the ten before.
+    NextPage,
+    PreviousPage,
     /// Insert the Chinese form of this ASCII punctuation key.
     Punctuate(char),
     /// Insert the pinyin exactly as typed and stop composing. Enter does this,
@@ -348,6 +387,15 @@ pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) 
         // could do on its behalf.
         Action::Backspace => Compose::Feed('\u{8}'),
 
+        // **The arrows page the candidates rather than the document.** The
+        // word wanted is often not in the first ten — that is the whole reason
+        // there are more than ten — and while a bar is on screen the arrows are
+        // the only keys a writer reaches for to see the rest of it. Both axes
+        // do it: the bar is one row, so up and down have nothing else to mean,
+        // and neither does a page key while a word is being composed.
+        Action::Right | Action::Down | Action::PageDown => Compose::NextPage,
+        Action::Left | Action::Up | Action::PageUp => Compose::PreviousPage,
+
         Action::Newline => Compose::CommitRaw,
         Action::Escape => Compose::Cancel,
 
@@ -358,8 +406,8 @@ pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) 
         // gets it too, where it does the same thing Enter already does.
         Action::CommitTyped => Compose::CommitTyped,
 
-        // Anything else — an arrow, a page key, a Ctrl chord — abandons the
-        // composition and is consumed. Moving the cursor out from under a
+        // Anything else — a Ctrl chord, the ends of a line, a jump — abandons
+        // the composition and is consumed. Moving the cursor out from under a
         // half-typed word and leaving it pending would be worse than costing
         // one keystroke.
         _ => Compose::Cancel,
@@ -405,6 +453,27 @@ const CP_CONTEXT: usize = 0x31c14;
 /// of the engine's own state.
 const CP_MAGIC_OFFSET: usize = 0x88;
 const CP_MAGIC: u32 = 0x1428_1428;
+
+/// Where the Chinese plugin keeps the keys it has been given and not yet
+/// converted, as an offset from the load base: a count, and then that many
+/// Unicode code points.
+///
+/// **It is the only record of what a partial commit left behind.** Chinese's
+/// composition getter is a stub — `+0x10` writes one NUL and returns — so there
+/// is nowhere else to ask, and the alternative is re-deriving which syllables a
+/// phrase covered, which is the linguistics this file exists to avoid.
+///
+/// `prv_key_handler` appends to it, backspace shortens it, `prv_open` empties
+/// it, and the commit slot rewrites it with whatever the chosen phrase did not
+/// cover. Recovered from the `+0x7d0`/`+0x7d4` loads through all four, against
+/// a `.bss` base of `0x40f0`; the 500 candidate pointers `load()` preallocates
+/// are what fill the `0x7d0` bytes in front of it, which is the check that the
+/// arithmetic lands where it should.
+const ZH_PENDING: usize = 0x48c0;
+
+/// The key handler stops recording at 512, so a longer count is a record that
+/// is not this one.
+const ZH_PENDING_MAX: u32 = 512;
 
 /// `+0x10`'s address inside each plugin, which is how the load base is
 /// recovered: the slot pointer minus its known address. Any slot would do; this
@@ -557,18 +626,19 @@ impl Plugin {
     /// it produced and fills that many array slots regardless — its inner loop
     /// bounds itself on the engine's own total and never looks at the request.
     /// So the array is sized to the plugin's whole preallocation rather than to
-    /// what is wanted, and the result is truncated here instead.
+    /// what is asked for, and the result is cut to [`KEPT`] here instead.
     ///
     /// Getting that wrong is what put a black smear across the bottom of the
     /// screen the first time Japanese ran: iWnn answers a two-letter reading
     /// with dozens of conversions and width variants, every one of them drawn
-    /// as an equal share of the strip.
+    /// as an equal share of the strip. What bounds the drawing now is the page,
+    /// not the list, so the list is free to be longer than the bar.
     ///
     /// The strings are borrowed from the plugin's own fixed-stride table and
     /// are only valid until the next call, so they are copied here.
     fn call_candidates(&self) -> Vec<String> {
         let mut slots: Vec<*mut c_char> = vec![std::ptr::null_mut(); MAX_CANDIDATES];
-        let mut count: u32 = WANTED as u32;
+        let mut count: u32 = KEPT as u32;
         let f: unsafe extern "C" fn(*mut *mut c_char, *mut u32, u32) =
             unsafe { std::mem::transmute(self.slot(SLOT_CANDIDATES)) };
         unsafe { f(slots.as_mut_ptr(), &mut count, USER_DATA) };
@@ -577,7 +647,7 @@ impl Plugin {
         slots[..produced]
             .iter()
             .filter_map(|p| unsafe { c_string(*p) })
-            .take(WANTED)
+            .take(KEPT)
             .collect()
     }
 
@@ -633,6 +703,10 @@ pub struct Chinese {
     converter: Option<(ToTraditional, *mut c_void)>,
     /// Whether to convert what the engine offers.
     want_traditional: bool,
+    /// The plugin's record of the keys it is still holding, once the plugin has
+    /// confirmed it is where [`ZH_PENDING`] says. `None` costs partial commits,
+    /// not Chinese input.
+    pending: Option<*const u32>,
 }
 
 impl Chinese {
@@ -643,6 +717,7 @@ impl Chinese {
             plugin,
             converter: None,
             want_traditional: false,
+            pending: None,
         };
         zh.find_converter();
         // Begin a session. Skipping this produced identical candidates on
@@ -652,7 +727,71 @@ impl Chinese {
         if st != 0 {
             eprintln!("ime: zh prv_open returned {st}, continuing");
         }
+        zh.find_pending();
         Ok(zh)
+    }
+
+    /// Find the plugin's record of the keys it has not converted yet, by
+    /// watching it keep one.
+    ///
+    /// An offset read out of a disassembly is a guess until the plugin agrees
+    /// with it, and this one can be *asked*: an open session holds no keys, a
+    /// key makes it hold that key, and reopening puts it back. A record that
+    /// does all three is the record, and the probe costs three calls at startup
+    /// and leaves the session exactly as it found it.
+    fn find_pending(&mut self) {
+        let Some(base) = self.plugin.base() else {
+            eprintln!("ime: cannot recover the zh plugin's load base");
+            return;
+        };
+        let at = (base + ZH_PENDING) as *const u32;
+        let empty = unsafe { *at };
+        self.plugin.call_key('a');
+        let (one, first) = unsafe { (*at, *at.add(1)) };
+        self.plugin.call_open();
+        if (empty, one, first) != (0, 1, 'a' as u32) {
+            eprintln!(
+                "ime: the zh pending-key record at {at:p} reads {empty}, then {one}/{first:#x} \
+                 — a candidate covering part of a word will end it"
+            );
+            return;
+        }
+        self.pending = Some(at);
+    }
+
+    /// The reading the plugin is still holding, as the letters it was sent.
+    ///
+    /// `Some("")` is a word the engine has finished with and `None` is not
+    /// knowing, which are different things to the caller: one ends a word, the
+    /// other means the engine has to be told to let go of it. Anything that is
+    /// not pinyin says the record is not the one this was written against, and
+    /// is `None` for the same reason.
+    fn pending(&self) -> Option<String> {
+        let at = self.pending?;
+        let count = unsafe { *at };
+        if count > ZH_PENDING_MAX {
+            return None;
+        }
+        (0..count as usize)
+            .map(|i| {
+                char::from_u32(unsafe { *at.add(1 + i) })
+                    .filter(|c| c.is_ascii_alphabetic() || *c == '\'')
+            })
+            .collect()
+    }
+
+    /// What the engine offers, in the script asked for.
+    ///
+    /// Converted here rather than on commit, so the bar shows what will
+    /// actually be inserted. Offering Simplified and inserting Traditional
+    /// would be worse than not offering Traditional at all.
+    fn candidates(&self) -> Vec<String> {
+        let candidates = self.plugin.call_candidates();
+        if self.want_traditional {
+            candidates.iter().map(|c| self.to_traditional(c)).collect()
+        } else {
+            candidates
+        }
     }
 
     /// Find the engine's own Simplified-to-Traditional converter, and the
@@ -715,23 +854,34 @@ impl Chinese {
 impl Ime for Chinese {
     fn key(&mut self, key: char) -> Vec<String> {
         self.plugin.call_key(key);
-        let candidates = self.plugin.call_candidates();
-        // Converted here rather than on commit, so the bar shows what will
-        // actually be inserted. Offering Simplified and inserting Traditional
-        // would be worse than not offering Traditional at all.
-        if self.want_traditional {
-            candidates.iter().map(|c| self.to_traditional(c)).collect()
-        } else {
-            candidates
-        }
+        self.candidates()
     }
 
     fn set_traditional(&mut self, traditional: bool) {
         self.want_traditional = traditional && self.converter.is_some();
     }
 
-    fn commit(&mut self, index: usize) {
+    /// The commit slot re-feeds the keys the phrase did not cover, so the
+    /// engine comes back from a commit already composing the rest of the
+    /// reading and there is nothing here to restart — only to notice.
+    ///
+    /// Without the pending record a finished word and a half-converted one look
+    /// the same, and then the engine is cleared: it costs the context the commit
+    /// just set for the next prediction, and it is the only way to be sure a
+    /// stranded reading does not arrive on the front of the next word typed.
+    fn commit(&mut self, index: usize) -> Option<Rest> {
         self.plugin.call_commit(index);
+        match self.pending() {
+            Some(reading) if reading.is_empty() => None,
+            Some(reading) => Some(Rest {
+                reading,
+                candidates: self.candidates(),
+            }),
+            None => {
+                self.plugin.call_open();
+                None
+            }
+        }
     }
 
     fn clear(&mut self) {
@@ -791,8 +941,17 @@ impl Ime for Japanese {
     /// for this to switch.
     fn set_traditional(&mut self, _traditional: bool) {}
 
-    fn commit(&mut self, index: usize) {
+    /// The commit slot ends by zeroing the composition buffer, so a candidate
+    /// that covered part of the reading takes the rest with it and this reports
+    /// a finished word. The plugin is asked rather than assumed: it is one
+    /// call, and the answer is the plugin's to give.
+    fn commit(&mut self, index: usize) -> Option<Rest> {
         self.plugin.call_commit(index);
+        let reading = self.plugin.call_preedit()?;
+        Some(Rest {
+            reading,
+            candidates: self.plugin.call_candidates(),
+        })
     }
 
     fn clear(&mut self) {
@@ -888,12 +1047,25 @@ impl Stub {
             ("h", &["和", "很", "会"]),
             ("ha", &["哈", "还"]),
             ("hao", &["好", "号", "毫"]),
+            ("shijie", &["世界", "时节", "使节", "十"]),
+            ("jie", &["界", "节", "结", "接"]),
         ];
         canned
             .iter()
             .find(|(k, _)| *k == self.typed)
             .map(|(_, v)| v.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default()
+    }
+
+    /// What a candidate leaves unconverted, for the ones that cover only the
+    /// front of a reading. The engines do it whenever a shorter phrase is the
+    /// better guess, and it is the case the editor has to carry.
+    fn rest(&self, candidate: &str) -> Option<&'static str> {
+        let partial: &[(&str, &str, &str)] = &[("shijie", "十", "jie")];
+        partial
+            .iter()
+            .find(|(reading, taken, _)| *reading == self.typed && *taken == candidate)
+            .map(|(_, _, rest)| *rest)
     }
 }
 
@@ -912,8 +1084,17 @@ impl Ime for Stub {
         self.lookup()
     }
 
-    fn commit(&mut self, _index: usize) {
-        self.typed.clear();
+    fn commit(&mut self, index: usize) -> Option<Rest> {
+        let offered = self.lookup();
+        let rest = offered
+            .get(index)
+            .and_then(|taken| self.rest(taken))
+            .unwrap_or_default();
+        self.typed = rest.to_string();
+        (!rest.is_empty()).then(|| Rest {
+            reading: rest.to_string(),
+            candidates: self.lookup(),
+        })
     }
 
     fn clear(&mut self) {
@@ -996,8 +1177,11 @@ impl Ime for KanaStub {
         }
     }
 
-    fn commit(&mut self, _index: usize) {
+    /// iWnn's plugin drops whatever a candidate did not cover, so a commit
+    /// always ends the word.
+    fn commit(&mut self, _index: usize) -> Option<Rest> {
         self.typed.clear();
+        None
     }
 
     fn clear(&mut self) {
@@ -1047,7 +1231,38 @@ mod tests {
     fn committing_clears_the_composition() {
         let mut ime = Stub::new();
         ime.key('n');
-        ime.commit(0);
+        assert_eq!(ime.commit(0), None);
+        assert_eq!(ime.key('h').first().map(String::as_str), Some("和"));
+    }
+
+    /// **A candidate does not have to cover the whole reading**, and the word
+    /// is not over when one that does not is taken: it carries on with what is
+    /// left, and the next keystroke belongs to that rather than to a new word.
+    ///
+    /// Ending it there is what strands a reading inside the engine, where it
+    /// arrives on the front of whatever is typed next.
+    #[test]
+    fn a_candidate_covering_part_of_the_reading_leaves_the_rest() {
+        let mut ime = Stub::new();
+        for c in "shijie".chars() {
+            ime.key(c);
+        }
+        let rest = ime
+            .commit(3)
+            .expect("the fourth covers one syllable of two");
+        assert_eq!(rest.reading, "jie");
+        assert_eq!(rest.candidates.first().map(String::as_str), Some("界"));
+    }
+
+    /// And one that covers all of it finishes the word, which is every other
+    /// time a candidate is taken.
+    #[test]
+    fn a_candidate_covering_the_reading_finishes_the_word() {
+        let mut ime = Stub::new();
+        for c in "shijie".chars() {
+            ime.key(c);
+        }
+        assert_eq!(ime.commit(0), None);
         assert_eq!(ime.key('h').first().map(String::as_str), Some("和"));
     }
 
@@ -1226,8 +1441,32 @@ mod tests {
         fn escape_and_anything_unexpected_abandon_the_word() {
             for script in BOTH {
                 assert_eq!(compose(&Action::Escape, true, script), Compose::Cancel);
-                assert_eq!(compose(&Action::Left, true, script), Compose::Cancel);
-                assert_eq!(compose(&Action::PageDown, true, script), Compose::Cancel);
+                assert_eq!(compose(&Action::LineStart, true, script), Compose::Cancel);
+                assert_eq!(compose(&Action::Undo, true, script), Compose::Cancel);
+            }
+        }
+
+        /// **The arrows are the only way to the rest of the list**, and there
+        /// is a rest precisely because the word wanted is so often not among
+        /// the first ten. Abandoning the word on an arrow put those candidates
+        /// out of reach altogether.
+        #[test]
+        fn the_arrows_page_the_candidates_rather_than_abandoning_the_word() {
+            for script in BOTH {
+                for action in [Action::Right, Action::Down, Action::PageDown] {
+                    assert_eq!(
+                        compose(&action, true, script),
+                        Compose::NextPage,
+                        "{action:?} {script:?}"
+                    );
+                }
+                for action in [Action::Left, Action::Up, Action::PageUp] {
+                    assert_eq!(
+                        compose(&action, true, script),
+                        Compose::PreviousPage,
+                        "{action:?} {script:?}"
+                    );
+                }
             }
         }
 
