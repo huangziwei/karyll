@@ -121,11 +121,13 @@ fn main() -> Result<()> {
         Err(err) => eprintln!("udev: {err:#} — the keyboard will reach karyll only"),
     }
 
+    // Spawned and left to come up on its own — see [`hid::Hid::poll_up`]. The
+    // window is what a tap on the tile is waiting for, and it must not wait for
+    // a radio.
     let mut bluetooth = hid::Hid::beside_executable()?;
     bluetooth.set_keep_alive(read_keep_bluetooth());
-    match bluetooth.start() {
-        Ok(()) => eprintln!("bluetooth: daemon up"),
-        Err(err) => eprintln!("bluetooth: {err:#}"),
+    if let Err(err) = bluetooth.start() {
+        eprintln!("bluetooth: {err:#}");
     }
 
     // A keyboard is not required to open. Bluetooth takes seconds to connect
@@ -208,6 +210,7 @@ fn main() -> Result<()> {
         polled: None,
         holding: None,
         touch_orientation: orientation,
+        turns_itself: accel.is_some(),
         orientation_checked: std::time::Instant::now(),
         focus: read_focus(),
         enabled: read_languages(),
@@ -592,6 +595,10 @@ struct Editor {
     /// responds. So this follows what the manager reports, while the request
     /// lives on the window.
     touch_orientation: orientation::Orientation,
+    /// Whether this Kindle turns its own page over, which is to say whether it
+    /// has an accelerometer. The one that does not needs [`SCREENS`] on the
+    /// settings page instead, and the one that does must not have it.
+    turns_itself: bool,
     /// When that was last checked, since asking costs a subprocess.
     orientation_checked: std::time::Instant,
     /// Whether the page is set back around the sentence being written.
@@ -861,6 +868,7 @@ impl Editor {
             // sleep, so the panel keeps repainting and taps are not queued
             // behind it.
             self.poll_scan()?;
+            self.poll_bluetooth()?;
             self.poll_orientation();
             self.poll_autosave();
             self.poll_sleep();
@@ -2448,6 +2456,12 @@ impl Editor {
             // It paints itself: the status line carries the cost, which the chip
             // has no room for.
             Some(ConfigRow::KeepBluetooth) => return self.set_keep_bluetooth(option == 1),
+            Some(ConfigRow::Screen) => {
+                return match SCREENS.get(option) {
+                    Some((_, way)) => self.turn_to(*way),
+                    None => Ok(()),
+                };
+            }
             Some(ConfigRow::None) | None => return Ok(()),
         }
         self.paint()
@@ -2621,6 +2635,21 @@ impl Editor {
             ConfigRow::Size,
         ));
         items.extend(type_rows);
+
+        // Last, and only where it is the only way: a Kindle that turns its own
+        // page over has the better control already, and it is the device.
+        if !self.turns_itself {
+            let now = self.window.orientation();
+            items.push((ui::Item::Heading("Screen".into()), ConfigRow::None));
+            items.push((
+                ui::Item::Choice {
+                    label: "Hold it".into(),
+                    options: SCREENS.iter().map(|(name, _)| (*name).into()).collect(),
+                    on: SCREENS.iter().map(|(_, way)| *way == now).collect(),
+                },
+                ConfigRow::Screen,
+            ));
+        }
         items
     }
 
@@ -3098,20 +3127,55 @@ impl Editor {
         let Some(want) = orientation::Orientation::from_tilt(tilt) else {
             return Ok(());
         };
+        if want != self.window.orientation() {
+            eprintln!("orientation: device turned, asking for {want:?}");
+        }
+        self.turn_to(want)
+    }
+
+    /// Turn the page, whatever asked for it — the accelerometer, or the writer
+    /// on a Kindle that has none.
+    ///
+    /// One place, because the window manager has to be told the same way each
+    /// time: the request goes in the window's name, the answer comes back as a
+    /// resize, and the touch mapping has to move with it or every tap lands
+    /// ninety degrees from the finger.
+    fn turn_to(&mut self, want: orientation::Orientation) -> Result<()> {
         if want == self.window.orientation() {
             return Ok(());
         }
-        eprintln!("orientation: device turned, asking for {want:?}");
         self.window.set_orientation(want)?;
         self.touch_orientation = want;
         self.orientation_checked = std::time::Instant::now();
-        // Kept only as the starting point for the next session's first paint,
-        // before the sensor has said anything. It is no longer a setting.
+        // The starting point for the next session's first paint, before the
+        // sensor has said anything — and on a Kindle with no sensor, the whole
+        // of what is remembered.
         write_orientation(want);
         // The window manager answers with a resize, which the loop picks up.
         // Repaint anyway: if it declines, nothing else would.
         self.frame = None;
         self.paint()
+    }
+
+    /// Notice when the Bluetooth stack finished coming up, or that it did not.
+    ///
+    /// **The Keyboard section has to be told.** Config reads what the daemon
+    /// remembers when it opens, and a writer who opens it in the seconds before
+    /// the daemon answers would otherwise be looking at a page that says they
+    /// have never paired anything.
+    fn poll_bluetooth(&mut self) -> Result<()> {
+        match self.bluetooth.poll_up() {
+            Some(Ok(())) => {
+                eprintln!("bluetooth: daemon up");
+                self.refresh_paired();
+                if matches!(self.mode, Mode::Config) {
+                    self.paint()?;
+                }
+            }
+            Some(Err(err)) => eprintln!("bluetooth: {err:#}"),
+            None => {}
+        }
+        Ok(())
     }
 
     fn poll_orientation(&mut self) {
@@ -4454,6 +4518,24 @@ fn write_orientation(orientation: orientation::Orientation) {
     let _ = std::fs::write(orientation_file(), orientation.letter().to_string());
 }
 
+/// The two ways up a writer asks for, and which way that is to the window
+/// manager.
+///
+/// **Only on a Kindle with no accelerometer**, which is where they are the only
+/// way to turn the page over: the Colorsoft reports no tilt from any node in
+/// `/proc/bus/input/devices`, so nothing there would ever rotate on its own and
+/// a landscape page would be unreachable. Where there is a sensor, turning the
+/// device is the control and a settings row would be a second one that argues
+/// with it.
+///
+/// Two rather than four: upside-down portrait and the other landscape are what
+/// a sensor gives for free, and neither is a thing a writer sets down a Kindle
+/// to go and choose.
+const SCREENS: [(&str, orientation::Orientation); 2] = [
+    ("Portrait", orientation::Orientation::Up),
+    ("Landscape", orientation::Orientation::Right),
+];
+
 /// The selected input source, remembered for the same reason as the layout: a
 /// writer who left in Chinese comes back to Chinese.
 fn language_file() -> PathBuf {
@@ -5458,6 +5540,8 @@ enum ConfigRow {
     Keyboard(Vec<KeyAction>),
     /// Whether the Bluetooth stack outlives the editor. Option 1 keeps it.
     KeepBluetooth,
+    /// Which way up to hold the Kindle, on the ones that cannot tell.
+    Screen,
 }
 
 /// Something a finger can be on.

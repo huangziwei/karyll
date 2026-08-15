@@ -75,6 +75,12 @@ pub struct Hid {
     child: Option<Child>,
     /// Leave the radio up when the editor goes away. Off by default.
     keep_alive: bool,
+    /// When the daemon was spawned, which is what [`Hid::poll_up`] measures its
+    /// patience from.
+    spawned: Instant,
+    /// Whether the question "is it up yet" has been settled, so it is asked
+    /// once rather than on every tick of the editor's loop.
+    answered: bool,
 }
 
 impl Hid {
@@ -84,6 +90,8 @@ impl Hid {
             base: base.into(),
             child: None,
             keep_alive: false,
+            spawned: Instant::now(),
+            answered: true,
         }
     }
 
@@ -256,15 +264,37 @@ impl Hid {
         // recognise what it finds.
         let _ = std::fs::write(self.pid_path(), format!("{}\n", child.id()));
         self.child = Some(child);
+        self.answered = false;
+        self.spawned = Instant::now();
+        Ok(())
+    }
 
-        let deadline = Instant::now() + START_TIMEOUT;
-        while Instant::now() < deadline {
-            if self.is_up() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(250));
+    /// Whether the daemon has come up yet, asked once and then remembered.
+    ///
+    /// **Nothing waits for it.** Bringing the stack up is a bundled Python
+    /// runtime, a kernel module and a chip handoff, which on the slowest Kindle
+    /// measured is thirteen seconds. Waiting for that before opening the window
+    /// makes a tap on the tile do nothing visible for long enough to look like
+    /// a failure, and none of it is needed to open a document: a keyboard is
+    /// found by the same poll that finds one paired mid-session, and everything
+    /// else that needs the daemon asks for it when it is asked for.
+    ///
+    /// So it is polled while the writer reads, and says so once, either way.
+    pub fn poll_up(&mut self) -> Option<Result<()>> {
+        if self.answered || self.child.is_none() {
+            return None;
         }
-        bail!("the Bluetooth daemon did not answer within {START_TIMEOUT:?}")
+        if self.is_up() {
+            self.answered = true;
+            return Some(Ok(()));
+        }
+        if self.spawned.elapsed() > START_TIMEOUT {
+            self.answered = true;
+            return Some(Err(anyhow!(
+                "the Bluetooth daemon did not answer within {START_TIMEOUT:?}"
+            )));
+        }
+        None
     }
 
     /// Stop the daemon, releasing the radio — unless [`Hid::set_keep_alive`]
