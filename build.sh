@@ -33,19 +33,24 @@ fi
 # machine. Debian's armhf glibc is the same glibc, public, immutable at these
 # URLs, and checksummed below.
 #
-# **The pin must be glibc 2.34 or newer.** At 2.34 `pthread_*` and `dlopen`
-# moved into libc; against anything older the link succeeds but leaves
-# `libpthread.so.0` and `libdl.so.2` in NEEDED, which then depends on the
-# device's compatibility stubs. Bookworm's 2.36 references nothing above 2.34,
-# which is the binary's floor. The NEEDED check further down is what enforces
-# that, and both facts together are the whole contract.
+# **The pin must be no newer than the oldest device's glibc**, because a binary
+# records the symbol versions it linked against and a device that has never
+# heard of one refuses to start. The Kindles this targets run 2.20 and 2.35.
+# glibc keeps its old versions forever, so linking against the oldest produces
+# one binary that runs on all of them; linking against the newest produces one
+# that runs on exactly one.
 #
-# snapshot.debian.org, not deb.debian.org: a pool URL stops resolving the
-# moment Debian ships a point release. Snapshot keeps every version at a fixed
-# timestamp forever.
-SNAPSHOT=https://snapshot.debian.org/archive/debian/20260801T000000Z/pool/main
-GLIBC=2.36-9+deb12u14
-LIBGCC=12.2.0-14+deb12u1
+# Jessie's 2.19 is that pin. Below 2.34 `dlopen` and `pthread_*` still live in
+# `libdl.so.2` and `libpthread.so.0`, so both appear in NEEDED — allowed by the
+# check further down, because every device ships them and 2.34 and later keep
+# them as stubs for exactly this.
+#
+# archive.debian.org, not deb.debian.org: a pool URL stops resolving the moment
+# Debian ships a point release. Jessie is end of life and frozen, so its pool
+# will not move again.
+ARCHIVE=http://archive.debian.org/debian/pool/main
+GLIBC=2.19-18+deb8u10
+LIBGCC=4.9.2-10+deb8u1
 # The stamp is the whole pin, so bumping any part of it rebuilds the sysroot
 # instead of leaving a stale one in place.
 #
@@ -54,17 +59,17 @@ LIBGCC=12.2.0-14+deb12u1
 # its sysroot with it and leaves the script naming a directory that is gone: the
 # link then fails on a missing `libc.so.6` that is present at the new path.
 # Rebuilding is a relink — the .debs stay in `cache/`, which this never removes.
-SYSROOT_STAMP="bookworm $GLIBC $LIBGCC $SYSROOT"
+SYSROOT_STAMP="jessie $GLIBC $LIBGCC $SYSROOT"
 
 # name url sha256, one per line.
 PACKAGES="\
-libc6_${GLIBC}_armhf.deb $SNAPSHOT/g/glibc/libc6_${GLIBC}_armhf.deb 758c68b92654747025b48476a45c315bf16df1321224abdd9be672bfd120be45
-libc6-dev_${GLIBC}_armhf.deb $SNAPSHOT/g/glibc/libc6-dev_${GLIBC}_armhf.deb ca9486dc7f2dfb25c61c0c93d561c01f8abdf9866bd4c157f0ccd518295bbbb7
-libgcc-s1_${LIBGCC}_armhf.deb $SNAPSHOT/g/gcc-12/libgcc-s1_${LIBGCC}_armhf.deb f58562bf01efd6112b914182147ee149e0d4c90869046e31844da8803669eeb3"
+libc6_${GLIBC}_armhf.deb $ARCHIVE/g/glibc/libc6_${GLIBC}_armhf.deb ccfc4a10a1654454ad07ac381d55dc1bfe0787ebbcd87b42ac05402777ce41b5
+libc6-dev_${GLIBC}_armhf.deb $ARCHIVE/g/glibc/libc6-dev_${GLIBC}_armhf.deb b5af7102716127343a82dfdb42e5b9cd9dc28e28fc14653e0db8f9efdd1fe0a9
+libgcc1_${LIBGCC}_armhf.deb $ARCHIVE/g/gcc-4.9/libgcc1_${LIBGCC}_armhf.deb a456c21c4805a3003586a492af1ddd68083de81f75f3da0807732ad44306541c"
 
 build_sysroot() {
     cache="$SYSROOT/cache"
-    echo "==> Fetching the armhf link sysroot (Debian bookworm glibc $GLIBC)"
+    echo "==> Fetching the armhf link sysroot (Debian jessie glibc $GLIBC)"
     mkdir -p "$cache"
 
     echo "$PACKAGES" | while read -r name url want; do
@@ -93,10 +98,12 @@ build_sysroot() {
     mkdir -p "$work" "$SYSROOT/lib" "$SYSROOT/usr-lib"
 
     # `ar` then `tar`, both of which macOS ships: a .deb is an ar archive
-    # holding a compressed tar, and nothing here needs dpkg.
+    # holding a compressed tar, and nothing here needs dpkg. The member is
+    # matched by glob rather than named — jessie's libc6 is gzipped and its
+    # libc6-dev is xz, in the same set.
     for name in $(echo "$PACKAGES" | cut -d" " -f1); do
-        (cd "$work" && ar x "$cache/$name" && tar xf data.tar.xz &&
-            rm -f data.tar.xz control.tar.xz debian-binary)
+        (cd "$work" && ar x "$cache/$name" && tar xf data.tar.* &&
+            rm -f data.tar.* control.tar.* debian-binary)
     done
 
     # **Flattened, and every symlink repointed.** Debian is multiarch, so the
@@ -122,15 +129,28 @@ build_sysroot() {
     fi
     [ -e "$SYSROOT/lib/libgcc_s.so" ] || ln -sf libgcc_s.so.1 "$SYSROOT/lib/libgcc_s.so"
 
-    # **`libc.so` is a GNU ld script, and Debian's names absolute paths.**
-    # Rewritten to name this sysroot's own, which is what makes a plain `-lc`
-    # work: the script is how `libc_nonshared.a` is pulled in for
-    # `__aeabi_read_tp`, and how the loader is reached for `__tls_get_addr`.
-    # Without it both are missing symbols at the very end of a link.
-    printf 'OUTPUT_FORMAT(elf32-littlearm)\nGROUP ( %s %s AS_NEEDED ( %s ) )\n' \
-        "$SYSROOT/lib/libc.so.6" \
-        "$SYSROOT/usr-lib/libc_nonshared.a" \
-        "$SYSROOT/lib/ld-linux-armhf.so.3" > "$SYSROOT/usr-lib/libc.so"
+    # **Some `.so` files here are GNU ld scripts, and Debian's name absolute
+    # paths into a root that does not exist on this machine.** Every one is
+    # repointed at this sysroot, keeping whatever the script actually said.
+    #
+    # `libc.so` is the one that makes a plain `-lc` work at all: it is how
+    # `libc_nonshared.a` is pulled in for `__aeabi_read_tp` and how the loader
+    # is reached for `__tls_get_addr`, both missing symbols at the very end of a
+    # link without it. `libpthread.so` is a script too on a pin this old, and
+    # its absolute `GROUP` is what the link fails on first.
+    # `LC_ALL=C` throughout: a real shared object sits in this directory too and
+    # BSD's grep and sed both refuse its bytes as an illegal sequence in a UTF-8
+    # locale. **The `/usr/lib` rule has to come first**, because
+    # `/usr/lib/arm-linux-gnueabihf/` contains `/lib/arm-linux-gnueabihf/` and
+    # the shorter rewrite otherwise leaves a stray `/usr` in front of an
+    # absolute path.
+    for script in "$SYSROOT/usr-lib"/*.so; do
+        [ -f "$script" ] || continue
+        LC_ALL=C grep -q "OUTPUT_FORMAT" "$script" 2>/dev/null || continue
+        LC_ALL=C sed -e "s|/usr/lib/arm-linux-gnueabihf/|$SYSROOT/usr-lib/|g" \
+                     -e "s|/lib/arm-linux-gnueabihf/|$SYSROOT/lib/|g" \
+            "$script" > "$script.rewritten" && mv "$script.rewritten" "$script"
+    done
 
     rm -rf "$work"
 
@@ -199,14 +219,19 @@ file "$BIN" | grep -q "dynamically linked" || {
     exit 1
 }
 
-# **Everything it needs must already be on the device**, and these two are all
+# **Everything it needs must already be on the device**, and these four are all
 # it may need. Anything else would have to be shipped, and shipping Amazon's
 # libraries is not something this repo does.
 #
+# `libdl.so.2`, `libpthread.so.0` and `librt.so.1` are here because the pin is
+# below 2.34 and all three are therefore still separate libraries. Every device
+# carries them, older ones as the real thing and newer ones as the stubs glibc
+# kept for exactly this case, so naming them costs nothing and is what buys the
+# older devices. Checked against each device's own `/lib` before being allowed
+# here, which is the only reason any name belongs on this list.
+#
 # Fatal, not a warning: a binary naming a library the Kindle does not have never
-# starts, and the only symptom there is a tile that does nothing. This is also
-# what enforces the glibc floor above — an older one links perfectly well and
-# adds `libpthread.so.0` and `libdl.so.2`.
+# starts, and the only symptom there is a tile that does nothing.
 #
 # Read with whichever tool can parse a foreign ELF here. macOS has LLVM's
 # `objdump`, which reads any target; a Linux box has GNU `readelf`, which is
@@ -236,11 +261,12 @@ NEEDED=$(elf_needed "$BIN" | sort -u)
 
 for lib in $NEEDED; do
     case "$lib" in
-        libc.so.6|libgcc_s.so.1) ;;
+        libc.so.6|libgcc_s.so.1|libdl.so.2|libpthread.so.0|librt.so.1) ;;
         *)
             echo "error: karyll now needs $lib, which the device may not have" >&2
-            echo "       every NEEDED beyond libc.so.6 and libgcc_s.so.1 has to be" >&2
-            echo "       accounted for before this can ship" >&2
+            echo "       every NEEDED beyond libc.so.6, libgcc_s.so.1, libdl.so.2," >&2
+            echo "       libpthread.so.0 and librt.so.1 has to be accounted for" >&2
+            echo "       before this can ship" >&2
             exit 1
             ;;
     esac

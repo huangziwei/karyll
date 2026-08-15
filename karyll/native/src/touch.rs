@@ -237,74 +237,24 @@ pub fn read_extent(file: &File, axis: u16, fallback: i32) -> Extent {
     }
 }
 
-/// Fall back to naming the panel when the firmware alias is absent.
+/// Find the panel by capability when the firmware alias is absent.
+///
+/// Which node is [`crate::evdev::pick_touchscreen`]'s to say — one parse of
+/// `/proc/bus/input/devices` serves the keyboard, the accelerometer and this,
+/// and a second copy of it here is the duplication that has already cost this
+/// project twice.
 fn find_by_scan() -> Result<PathBuf> {
     let raw = std::fs::read_to_string("/proc/bus/input/devices")
         .context("read /proc/bus/input/devices")?;
-    match pick_touch(&raw) {
+    match crate::evdev::pick_touchscreen(&raw) {
         Some(node) => Ok(PathBuf::from(format!("/dev/input/{node}"))),
         None => bail!("no touchscreen in /proc/bus/input/devices"),
     }
 }
 
-/// The finger panel's `eventN`, by name.
-///
-/// `pt_mt` is the Scribe's, sitting next to a Wacom pen node that must not be
-/// picked instead — the pen reports the same axes but is not what a finger
-/// taps with.
-fn pick_touch(raw: &str) -> Option<String> {
-    const PANELS: [&str; 6] = ["pt_mt", "cyttsp", "zforce", "atmel", "focaltech", "goodix"];
-    let mut name = String::new();
-    for block in raw.split("\n\n") {
-        let mut handler = None;
-        for line in block.lines() {
-            if let Some(rest) = line.strip_prefix("N: Name=") {
-                name = rest.trim_matches('"').to_ascii_lowercase();
-            } else if let Some(rest) = line.strip_prefix("H: Handlers=") {
-                handler = rest.split_whitespace().find(|h| h.starts_with("event"));
-            }
-        }
-        if PANELS.iter().any(|p| name.contains(p))
-            && let Some(handler) = handler
-        {
-            return Some(handler.to_string());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const CAPTURE: &str = "\
-I: Bus=0000 Vendor=0000 Product=0000 Version=0000
-N: Name=\"WacomDigitizer\"
-H: Handlers=event2 perfmgr
-B: KEY=1c03 0 0 0 0 0 0 0 0 0 0
-
-I: Bus=0000 Vendor=0000 Product=0000 Version=0000
-N: Name=\"pt_mt\"
-H: Handlers=event3 perfmgr
-B: KEY=0
-
-I: Bus=0000 Vendor=0000 Product=0000 Version=0000
-N: Name=\"stylus-custom\"
-H: Handlers=event4 perfmgr
-B: KEY=1c03 0 0 0 0 0 0 0 0 0 0
-";
-
-    #[test]
-    fn the_finger_panel_is_picked_over_the_pen() {
-        // The Wacom node comes first and reports the same axes; taking it would
-        // mean taps never arriving.
-        assert_eq!(pick_touch(CAPTURE).as_deref(), Some("event3"));
-    }
-
-    #[test]
-    fn no_panel_is_not_a_panic() {
-        assert_eq!(pick_touch("I: Bus=0000\nN: Name=\"pwrkey\"\n"), None);
-    }
 
     /// Drive the state machine the way the kernel actually does: the tracking
     /// id comes **first**, then the coordinates, then `SYN_REPORT`.

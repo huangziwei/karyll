@@ -50,6 +50,10 @@ const ABS_Y: u16 = 0x01;
 const ABS_Z: u16 = 0x02;
 const ABS_TILT: u16 = 0x18;
 
+/// Multitouch protocol B's per-contact identifier, which only a device that
+/// tracks several contacts has any use for.
+const ABS_MT_TRACKING_ID: u16 = 0x39;
+
 /// `struct timeval` is two C longs, so its width follows the target. The device
 /// is 32-bit, which makes `struct input_event` 16 bytes there.
 const TIME_BYTES: usize = 2 * size_of::<libc::c_long>();
@@ -96,22 +100,25 @@ fn decode(buf: &[u8]) -> Option<KeyEvent> {
     })
 }
 
-/// Whether a `B: KEY=` bitmap advertises a key below 32.
+/// Whether a `B:` bitmap advertises a given code.
 ///
 /// The words are printed most significant first, so word 0 — the one holding
-/// the low keys — is last. That makes this independent of whether the kernel's
-/// bitmap words are 32 or 64 bits wide, which is why the caller is restricted
-/// to low key codes rather than this taking a width it would have to guess.
-fn advertises_low_key(bitmap: &str, key: u16) -> bool {
-    debug_assert!(
-        key < 32,
-        "only word 0 is read, so higher keys need the word width"
-    );
-    bitmap
-        .split_whitespace()
-        .next_back()
-        .and_then(|word| u32::from_str_radix(word, 16).ok())
-        .is_some_and(|word| word & (1 << key) != 0)
+/// codes 0..31 — is last, and the count runs from the right. A code the bitmap
+/// is too short to describe is absent rather than an error: that is how a
+/// single-word `ABS=f000003` answers a question about `ABS_MT_TRACKING_ID`, and
+/// answering `false` is exactly right.
+///
+/// Words are `BITS_PER_LONG` wide, so 32 here — every Kindle this runs on is
+/// `armv7l`. On a 64-bit kernel the same dump would pack two of these words
+/// into one and a code above 31 would be read from the wrong place.
+fn advertises(bitmap: &str, bit: u16) -> bool {
+    let words: Vec<&str> = bitmap.split_whitespace().collect();
+    let (word, shift) = (bit as usize / 32, bit % 32);
+    words
+        .len()
+        .checked_sub(1 + word)
+        .and_then(|at| u32::from_str_radix(words[at], 16).ok())
+        .is_some_and(|w| w & (1 << shift) != 0)
 }
 
 /// One device block from `/proc/bus/input/devices`.
@@ -122,6 +129,9 @@ struct Block {
     ev: u32,
     /// The `B: KEY=` bitmap, verbatim — its word width is not worth guessing.
     keys: String,
+    /// The `B: ABS=` bitmap, which is what separates a finger panel from a pen
+    /// and a real accelerometer from the other sensors on the bus.
+    abs: String,
 }
 
 /// Split a `/proc/bus/input/devices` dump into its device blocks.
@@ -140,6 +150,8 @@ fn blocks(raw: &str) -> Vec<Block> {
                 .map(String::from);
         } else if let Some(rest) = line.strip_prefix("B: KEY=") {
             current.keys = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("B: ABS=") {
+            current.abs = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("B: EV=") {
             current.ev = u32::from_str_radix(rest.trim(), 16).unwrap_or(0);
         } else if line.is_empty() {
@@ -162,23 +174,57 @@ fn blocks(raw: &str) -> Vec<Block> {
 fn pick_keyboard(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
-        .find(|b| advertises_low_key(&b.keys, code::Q))
+        .find(|b| advertises(&b.keys, code::Q))
+        .and_then(|b| b.handler)
+}
+
+/// Choose the touchscreen, returning its `eventN` handler.
+///
+/// **The finger panel is the one that tracks more than one finger.** Every
+/// Kindle's panel speaks multitouch protocol B and so advertises
+/// `ABS_MT_TRACKING_ID`; no pen node does, the Scribe's digitizer and its
+/// `stylus-custom` mirror both being single-touch `ABS=f000003`. One bit
+/// separates them on every device seen:
+///
+/// | device | `ABS=` | |
+/// |---|---|---|
+/// | `pt_mt` | `ee18000 0` | **picked** |
+/// | `fts_ts` | `2618000 0` | **picked** |
+/// | `cyttsp5_mt` | `6608000 0` | **picked** |
+/// | `WacomDigitizer`, `stylus-custom` | `f000003` | rejected |
+///
+/// This replaced a list of panel names — `pt_mt`, `cyttsp`, `zforce`, `atmel`,
+/// `focaltech`, `goodix` — which is the same mistake the accelerometer rule
+/// below already avoids: the controller varies across Kindles and the shape of
+/// the device does not. The list had no entry for `fts_ts`, so touch did not
+/// come up at all on the panel that ships it.
+pub fn pick_touchscreen(raw: &str) -> Option<String> {
+    blocks(raw)
+        .into_iter()
+        .find(|b| advertises(&b.abs, ABS_MT_TRACKING_ID))
         .and_then(|b| b.handler)
 }
 
 /// Choose the accelerometer, returning its `eventN` handler.
 ///
-/// The rule is **reports absolute axes and no keys**, which is what separates a
-/// sensor from a pointer. Against this device's five real devices it picks
-/// exactly one:
+/// The rule is **reports three spatial axes and no keys**, which is what
+/// separates an accelerometer from a pointer and from the other sensors sharing
+/// the bus:
 ///
-/// | device | `EV=` | has ABS | has KEY | |
+/// | device | `EV=` | `ABS=` | has KEY | |
 /// |---|---|---|---|---|
-/// | `bd71828-pwrkey` | `3` | no | yes | rejected |
-/// | `kx132-accel` | `9` | **yes** | **no** | **picked** |
-/// | `WacomDigitizer` | `b` | yes | yes | rejected |
-/// | `pt_mt` | `f` | yes | yes | rejected |
-/// | `stylus-custom` | `b` | yes | yes | rejected |
+/// | `bd71828-pwrkey` | `3` | — | yes | rejected |
+/// | `kx132-accel` | `9` | `1000007` | no | **picked** |
+/// | `bma2x2` | `9` | `100 7` | no | **picked** |
+/// | `max44009_als` | `9` | `100 0` | no | rejected |
+/// | `bma_interrupt` | `d` | `3000000` | no | rejected |
+/// | `WacomDigitizer`, `pt_mt`, `stylus-custom` | `b`/`f` | | yes | rejected |
+///
+/// Axes were added to the rule because "absolute axes and no keys" is also an
+/// ambient light sensor, and a device that has one lists it first: on that
+/// Kindle the editor opened `max44009_als` and read brightness as orientation.
+/// `bma_interrupt` is the same accelerometer as `bma2x2` reported through the
+/// interrupt path X uses, and reports neither X nor Y.
 ///
 /// Matching on the name would have been easier and wrong: the udev rules ship
 /// `60-kx132.rules`, `60-bma2x2.rules` and `60-bma4xy.rules`, so the part
@@ -186,7 +232,13 @@ fn pick_keyboard(raw: &str) -> Option<String> {
 fn pick_accelerometer(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
-        .find(|b| b.ev & EV_ABS_BIT != 0 && b.ev & EV_KEY_BIT == 0)
+        .find(|b| {
+            b.ev & EV_ABS_BIT != 0
+                && b.ev & EV_KEY_BIT == 0
+                && [ABS_X, ABS_Y, ABS_Z]
+                    .iter()
+                    .all(|&axis| advertises(&b.abs, axis))
+        })
         .and_then(|b| b.handler)
 }
 
@@ -457,12 +509,136 @@ B: KEY=3ffffff fffffffc
     #[test]
     fn key_q_decides_and_the_low_word_is_last() {
         // The uinput keyboard advertises keys 2..=57.
-        assert!(advertises_low_key("3ffffff fffffffc", code::Q));
+        assert!(advertises("3ffffff fffffffc", code::Q));
         // The power key advertises only KEY_POWER, three words up.
-        assert!(!advertises_low_key("100000 0 0 0", code::Q));
-        assert!(!advertises_low_key("1c03 0 0 0 0 0 0 0 0 0 0", code::Q));
-        assert!(!advertises_low_key("0", code::Q));
+        assert!(!advertises("100000 0 0 0", code::Q));
+        assert!(!advertises("1c03 0 0 0 0 0 0 0 0 0 0", code::Q));
+        assert!(!advertises("0", code::Q));
     }
+
+    #[test]
+    fn a_code_above_the_first_word_is_read_from_the_right() {
+        // ABS_MT_TRACKING_ID is 57, so word 1 — the first of two — and bit 25.
+        assert!(advertises("ee18000 0", ABS_MT_TRACKING_ID));
+        assert!(advertises("2618000 0", ABS_MT_TRACKING_ID));
+        assert!(advertises("6608000 0", ABS_MT_TRACKING_ID));
+        // A bitmap too short to describe code 57 answers no rather than panics.
+        assert!(!advertises("f000003", ABS_MT_TRACKING_ID));
+        assert!(!advertises("", ABS_MT_TRACKING_ID));
+        // `100 7` sets bit 40, not 57 — the two are eight apart in the same word.
+        assert!(!advertises("100 7", ABS_MT_TRACKING_ID));
+    }
+
+    /// The three panels, and the two pen nodes that report absolute axes beside
+    /// one of them.
+    #[test]
+    fn the_finger_panel_is_picked_over_the_pen_on_every_device() {
+        assert_eq!(pick_touchscreen(CAPTURE).as_deref(), Some("event3"));
+        assert_eq!(pick_touchscreen(COLORSOFT).as_deref(), Some("event1"));
+        assert_eq!(pick_touchscreen(OASIS2).as_deref(), Some("event9"));
+    }
+
+    #[test]
+    fn a_device_with_no_panel_is_not_a_panic() {
+        assert_eq!(pick_touchscreen("I: Bus=0000\nN: Name=\"pwrkey\"\n"), None);
+    }
+
+    #[test]
+    fn the_accelerometer_is_picked_over_the_other_sensors() {
+        assert_eq!(pick_accelerometer(CAPTURE).as_deref(), Some("event1"));
+        // Two light sensors and an interrupt mirror are listed before the real
+        // one; without the axes in the rule the first of them wins.
+        assert_eq!(pick_accelerometer(OASIS2).as_deref(), Some("event7"));
+    }
+
+    #[test]
+    fn a_device_with_no_accelerometer_reports_none() {
+        assert_eq!(pick_accelerometer(COLORSOFT), None);
+    }
+
+    #[test]
+    fn page_turn_buttons_are_not_a_keyboard() {
+        // KEY_PAGEUP and KEY_PAGEDOWN, three words up and nowhere near Q.
+        assert_eq!(pick_keyboard(OASIS2), None);
+    }
+
+    /// The Colorsoft's own `/proc/bus/input/devices`: a power key and a panel,
+    /// and nothing else at all.
+    const COLORSOFT: &str = "\
+I: Bus=0019 Vendor=0001 Product=0001 Version=0100
+N: Name=\"bd71828-pwrkey\"
+H: Handlers=event0 ktch
+B: PROP=0
+B: EV=3
+B: KEY=100000 0 0 0
+
+I: Bus=0018 Vendor=0000 Product=0000 Version=0000
+N: Name=\"fts_ts\"
+H: Handlers=event1 ktch
+B: PROP=2
+B: EV=b
+B: KEY=400 0 0 0 0 0 0 0 0 0 0
+B: ABS=2618000 0
+
+";
+
+    /// The Oasis 2's, trimmed to the blocks that decide something: two power
+    /// keys, the page-turn pair, two light sensors, the accelerometer in both
+    /// the forms it is published in, and the panel.
+    const OASIS2: &str = "\
+I: Bus=0019 Vendor=0000 Product=0000 Version=0000
+N: Name=\"30370000.snvs:snvs-powerkey\"
+H: Handlers=kbd event0
+B: PROP=0
+B: EV=3
+B: KEY=100000 0 0 0
+
+I: Bus=0019 Vendor=0001 Product=0001 Version=0100
+N: Name=\"gpio-keys\"
+H: Handlers=kbd event4
+B: PROP=0
+B: EV=3
+B: KEY=2100 0 0 0
+
+I: Bus=0000 Vendor=0000 Product=0000 Version=0000
+N: Name=\"max44009_als\"
+H: Handlers=event5
+B: PROP=0
+B: EV=9
+B: ABS=100 0
+
+I: Bus=0000 Vendor=0000 Product=0000 Version=0000
+N: Name=\"max44009_als1\"
+H: Handlers=event6
+B: PROP=0
+B: EV=9
+B: ABS=100 0
+
+I: Bus=0018 Vendor=0000 Product=0000 Version=0000
+N: Name=\"bma2x2\"
+H: Handlers=event7
+B: PROP=0
+B: EV=9
+B: ABS=100 7
+
+I: Bus=0018 Vendor=0000 Product=0000 Version=0000
+N: Name=\"bma_interrupt\"
+H: Handlers=event8
+B: PROP=0
+B: EV=d
+B: REL=3c6
+B: ABS=3000000
+
+I: Bus=0000 Vendor=0000 Product=0000 Version=0000
+N: Name=\"cyttsp5_mt\"
+H: Handlers=event9
+B: PROP=2
+B: EV=f
+B: KEY=6420 0 0 0 0 0 0 0 0 0 0
+B: REL=0
+B: ABS=6608000 0
+
+";
 
     /// Build one `struct input_event` the way the kernel lays it out.
     fn event(kind: u16, code: u16, value: i32) -> Vec<u8> {
