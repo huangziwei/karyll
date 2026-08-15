@@ -1231,13 +1231,17 @@ impl Editor {
             // keyboard there is nothing to switch the language *of*.
             //
             // After the corner, the order is how often a writer reaches for it:
-            // Files is daily, Outline is per long document, Config is
-            // occasional, Help is read once. Outline sits beside Files because
-            // they are the same question at two scales — which document, and
-            // where in it. **Help has a button at all because it must** — it is
-            // the page that explains the shortcuts, and reaching it only by
-            // shortcut would be the same joke it exists to answer.
-            Mode::Writing => vec![Bar::Exit, Bar::Files, Bar::Outline, Bar::Config, Bar::Help],
+            // Files is daily, Config is occasional, Help is read once.
+            //
+            // **Outline is a shortcut only.** karyll is keyboard-first — without
+            // one there is no way to enter text at all — so a control that earns
+            // its width on the strip has to be one a finger genuinely reaches
+            // for, and jumping between the headings of a long document is not
+            // that. `Ctrl`/`⌘`+`Shift`+`O` is the way to it, and the Help page
+            // says so. **Help has a button at all because it must** — it is the
+            // page that explains the shortcuts, and reaching it only by shortcut
+            // would be the same joke it exists to answer.
+            Mode::Writing => vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help],
             Mode::Naming { .. } => vec![Bar::Cancel],
             // The Files panel's own actions, on the strip rather than mixed
             // into the list of documents they act on.
@@ -2092,6 +2096,29 @@ impl Editor {
     ///
     /// The same thing `[ Done ]` does, and it has to be the same thing: a scan
     /// left running would go on drawing over whatever the writer went back to.
+    /// This editor's answer to [`reopens`].
+    ///
+    /// Naming is not in it because it never reaches [`Editor::apply`] — it takes
+    /// the keyboard itself, so `Ctrl`/`⌘`+`N` closing it lives in
+    /// [`Editor::typed_name`] alongside Esc.
+    fn reopens(&self, action: &Action) -> bool {
+        reopens(
+            &self.mode,
+            self.find.is_some(),
+            self.find.as_ref().is_some_and(|find| find.replacing),
+            action,
+        )
+    }
+
+    /// Close what [`Editor::reopens`] reported, by the door that surface's own
+    /// Done or Esc already uses.
+    fn close_reopened(&mut self, action: &Action) -> Result<()> {
+        match action {
+            Action::Find | Action::Replace => self.close_find(),
+            _ => self.leave_panel(),
+        }
+    }
+
     fn leave_panel(&mut self) -> Result<()> {
         self.scanning = None;
         // A half-tapped Delete does not survive leaving the list. Correctness
@@ -2366,6 +2393,18 @@ impl Editor {
         }
         match action {
             Action::Escape => {
+                self.close_find()?;
+                return Ok(true);
+            }
+            // The chord that opened the bar closes it, the same way it does
+            // from the page. `Ctrl`/`⌘`+`Shift`+`F` only closes a bar that is
+            // already showing the second field; on a plain one it reveals it,
+            // which is the arm below.
+            Action::Find => {
+                self.close_find()?;
+                return Ok(true);
+            }
+            Action::Replace if self.reopens(&Action::Replace) => {
                 self.close_find()?;
                 return Ok(true);
             }
@@ -3456,6 +3495,16 @@ impl Editor {
                 self.paint()?;
                 return Ok(true);
             }
+            // The chord that asked for the name abandons it, the rule every
+            // opening shortcut follows — see [`Editor::reopens`]. Only for a new
+            // document: a rename is opened from the Files strip, so `N` is not
+            // the key that opened it and closing on it would answer a shortcut
+            // the writer never pressed.
+            Action::NewDocument if for_new => {
+                self.mode = Mode::Writing;
+                self.paint()?;
+                return Ok(true);
+            }
             Action::Backspace => {
                 name.pop();
             }
@@ -3652,6 +3701,11 @@ impl Editor {
     }
 
     fn apply(&mut self, action: Action) -> Result<()> {
+        // Before anything else, because the arms below all *open* things: a
+        // shortcut aimed at the surface already on screen closes it instead.
+        if self.reopens(&action) {
+            return self.close_reopened(&action);
+        }
         // Every editing action comes through here, so this is the one place
         // that has to notice the document was touched. Cursor moves stamp it
         // too, which is harmless: autosave only fires when the document is
@@ -4839,6 +4893,32 @@ fn strip_visible(hidden: bool, keyboard_present: bool, finding: bool, writing: b
     !writing || finding || !hidden || !keyboard_present
 }
 
+/// Whether `action` asks for the surface that is already on screen.
+///
+/// **Every shortcut that opens something closes it.** The chord that took one
+/// keystroke to enter takes the same one to leave, so a hand that reached for
+/// `Ctrl`/`⌘`+`O` never has to go and find Esc to undo itself. Focus mode has
+/// always worked this way and is the shape the rest now follow.
+///
+/// The buttons are unaffected: `[ Files ]` opens the list and `[ Done ]` closes
+/// it, because a finger has both on screen and nothing to remember.
+///
+/// `replacing` is the find bar's second field. Revealing it is what
+/// `Ctrl`/`⌘`+`Shift`+`F` asks for, so carrying it is what being open means for
+/// that chord — pressed on a plain find bar it still opens, rather than closing
+/// a bar the writer did not ask to lose.
+fn reopens(mode: &Mode, finding: bool, replacing: bool, action: &Action) -> bool {
+    match action {
+        Action::Files => matches!(mode, Mode::Files(_)),
+        Action::Config => matches!(mode, Mode::Config),
+        Action::Help => matches!(mode, Mode::Help),
+        Action::Outline => matches!(mode, Mode::Outline(_)),
+        Action::Find => finding,
+        Action::Replace => replacing,
+        _ => false,
+    }
+}
+
 fn languages_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/languages")
 }
@@ -5160,7 +5240,9 @@ fn help_items() -> Vec<ui::Item> {
         row("Settings", "Ctrl/⌘ + ,"),
         row("Turn a page of a list", "← →"),
         row("Clear the screen", "Ctrl/⌘ + R"),
-        row("Leave a page, leave karyll", "Esc,  Ctrl/⌘ + Q"),
+        // The rule, said once rather than repeated on every row above.
+        row("Close it again", "The same shortcut, or Esc"),
+        row("Leave karyll", "Ctrl/⌘ + Q"),
         heading("Writing in Chinese and Japanese"),
         row("Switch input source", "Ctrl + Space"),
         row("Take a candidate", "Space, or 1 … 0"),
@@ -5593,7 +5675,7 @@ impl Bar {
     ///
     /// Only where there is a shorter word that means the same thing to the same
     /// reader. `Prev` for `Previous` is the one abbreviation an English writer
-    /// does not have to think about; `Config` and `Outline` have no such form,
+    /// does not have to think about; `Config` and `Replace` have no such form,
     /// and inventing one would cost more than the pixels it saved.
     fn short(self) -> &'static str {
         match self {
@@ -5745,6 +5827,94 @@ mod tests {
                     .any(|span| span.style == want),
                 "the specimen has no {want:?} in it"
             );
+        }
+    }
+
+    /// Every shortcut that opens a surface closes it. The list is easy to get
+    /// half-right — one new panel with a chord and no matching arm here and the
+    /// rule quietly stops being a rule.
+    mod toggling {
+        use super::*;
+
+        /// Each opening chord, paired with the mode it opens.
+        fn panels() -> Vec<(Action, Mode)> {
+            vec![
+                (Action::Files, Mode::Files(Vec::new())),
+                (Action::Config, Mode::Config),
+                (Action::Help, Mode::Help),
+                (Action::Outline, Mode::Outline(Vec::new())),
+            ]
+        }
+
+        #[test]
+        fn a_panels_own_shortcut_closes_it() {
+            for (action, mode) in panels() {
+                assert!(
+                    reopens(&mode, false, false, &action),
+                    "{action:?} on its own panel has to close it"
+                );
+            }
+        }
+
+        #[test]
+        fn from_the_page_every_shortcut_still_opens() {
+            for (action, _) in panels() {
+                assert!(
+                    !reopens(&Mode::Writing, false, false, &action),
+                    "{action:?} while writing has to open, not close"
+                );
+            }
+        }
+
+        #[test]
+        fn another_panels_shortcut_goes_straight_there() {
+            // Config from the Files list is still Config, not a way out. Only
+            // the chord that matches the surface closes it.
+            for (action, mode) in panels() {
+                for (other, _) in panels() {
+                    if std::mem::discriminant(&action) == std::mem::discriminant(&other) {
+                        continue;
+                    }
+                    assert!(
+                        !reopens(&mode, false, false, &other),
+                        "{other:?} from {action:?}'s panel should open it"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn find_closes_the_bar_whichever_field_it_carries() {
+            assert!(!reopens(&Mode::Writing, false, false, &Action::Find));
+            assert!(reopens(&Mode::Writing, true, false, &Action::Find));
+            assert!(reopens(&Mode::Writing, true, true, &Action::Find));
+        }
+
+        #[test]
+        fn replace_closes_only_a_bar_that_is_already_replacing() {
+            // On a plain find bar the chord reveals the second field, which is
+            // what it is for. Closing there would lose a query the writer
+            // typed.
+            assert!(!reopens(&Mode::Writing, false, false, &Action::Replace));
+            assert!(!reopens(&Mode::Writing, true, false, &Action::Replace));
+            assert!(reopens(&Mode::Writing, true, true, &Action::Replace));
+        }
+
+        #[test]
+        fn nothing_else_toggles() {
+            // Typing must never be read as a request to close something.
+            for action in [
+                Action::Newline,
+                Action::Save,
+                Action::Refresh,
+                Action::NewDocument,
+                Action::Insert('a'),
+                Action::Escape,
+            ] {
+                for mode in [Mode::Writing, Mode::Config, Mode::Help] {
+                    assert!(!reopens(&mode, true, true, &action), "{action:?}");
+                }
+            }
         }
     }
 
@@ -5948,7 +6118,7 @@ nine words in this one under the third level
             let mut out = vec![
                 (
                     "writing",
-                    vec![Bar::Exit, Bar::Files, Bar::Outline, Bar::Config, Bar::Help],
+                    vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help],
                 ),
                 ("naming", vec![Bar::Cancel]),
                 ("files", vec![Bar::Done, Bar::New, Bar::Rename]),
