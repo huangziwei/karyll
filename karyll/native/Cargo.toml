@@ -1,6 +1,6 @@
 [package]
 name = "karyll-native"
-description = "A Markdown writing app for the jailbroken Kindle Scribe."
+description = "A Markdown writing app for jailbroken Kindles."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

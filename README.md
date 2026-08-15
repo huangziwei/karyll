@@ -2,7 +2,8 @@
 
 Karyll is a minimalistic writing app with bluetooth keyboard for jailbroken Kindles.
 
-Tested on Kindle Scribe (2022; firmware 5.19.4.0.1).
+Tested on Kindle Scribe (2022; firmware 5.19.4.0.1), Kindle Colorsoft (firmware
+5.18.0.2) and Kindle Oasis 2 (firmware 5.16.2.1.1).
 
 ## Build
 
