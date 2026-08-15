@@ -2,16 +2,16 @@
   <!--
     Cover art for the home-screen tile. Rendered and embedded by ../make-tile.sh.
 
-    Three values only, and they are the editor's own: WHITE #ffffff, QUIET
-    #888888, BLACK #000000, from karyll/native/src/window.rs. An e-ink panel
-    dithers anything between them, so a fourth tone would come back as a stipple
-    at tile size.
+    The values are the editor's own, from karyll/native/src/window.rs: WHITE
+    #ffffff, QUIET #888888, BLACK #000000, and the caret's #00bfff. No greys
+    between them — an e-ink panel dithers an intermediate tone into a stipple at
+    tile size.
 
     The mark is the app's one rendering rule stated as a picture: a markdown
     syntax mark stays visible but quiet, and the text is ink. So the hash is
-    QUIET and the caret after it is BLACK — a page at the moment before a title
-    is typed. Mark and wordmark are one centred group, with equal air above and
-    below it.
+    QUIET and the caret after it is the caret's own colour — a page at the
+    moment before a title is typed. Mark and wordmark are one centred group,
+    with equal air above and below it.
   -->
   <rect width="1440" height="2200" fill="#ffffff"/>
 
@@ -20,7 +20,7 @@
   <rect x="3" y="3" width="1434" height="2194" fill="none" stroke="#888888" stroke-width="6"/>
 
   <text x="304" y="1386" font-family="Avenir Next" font-weight="500" font-size="1150" fill="#888888">#</text>
-  <rect x="1012" y="571" width="76" height="815" fill="#000000"/>
+  <rect x="1012" y="571" width="76" height="815" fill="#00bfff"/>
 
   <text x="715" y="1629" font-family="Avenir Next" font-weight="500" font-size="130" letter-spacing="54" fill="#000000" text-anchor="middle">KARYLL</text>
 </svg>

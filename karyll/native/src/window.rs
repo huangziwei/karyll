@@ -16,10 +16,13 @@
 //!   read raw from evdev, which is panel-fixed, so that side re-orients
 //!   instead.
 //!
-//! The backing store is one byte per pixel. This panel is grayscale, so unlike
-//! the colour-capable devices there is no reason to carry RGB and collapse it
-//! on the wire — 1860×2480 costs 4.6 MB here instead of 13.8 MB, against
-//! ~514 MB shared with the framework.
+//! The backing store is one byte per pixel **on every device, colour included**.
+//! Carrying RGB would cost 1860×2480 13.8 MB instead of 4.6 against ~514 MB
+//! shared with the framework, and it is not needed: the byte is a grey level
+//! everywhere except for the handful of [`ink`] indices, which [`Palette`] turns
+//! into colours as the band goes out on the wire. So a colour panel costs the
+//! same memory as a grey one, and the two grey Kindles run the same code paths
+//! they ran before there was a palette.
 
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -53,6 +56,118 @@ pub const BLACK: u8 = 0x00;
 /// the mark it deleted half of it. Han would have been worse.
 pub const QUIET: u8 = 0x88;
 
+/// A field behind text, on a panel with no colour to make one with.
+///
+/// Light enough that black prose on it is still black prose. This is what a
+/// `==highlight==` is drawn in on a grey Kindle; a colour one swaps the value
+/// for [`ink::FIELD`] and keeps everything else about it.
+pub const FIELD: u8 = 0xCC;
+
+/// The same field on a row focus mode has set back.
+pub const FIELD_QUIET: u8 = 0xE4;
+
+/// Palette indices — **never a grey level**.
+///
+/// These are only ever written on a panel that has colour, so their numeric
+/// values mean nothing except "not one of the greys above". Every other byte in
+/// the backing store is a luminance, and on an 8-bit visual reaches the panel
+/// as one without passing through a palette at all.
+///
+/// Kept low and contiguous so the match in `Palette::pixel` is a small jump
+/// table.
+pub mod ink {
+    /// The caret.
+    pub const CARET: u8 = 0x01;
+    /// A `==highlight==` field on the focused row.
+    pub const FIELD: u8 = 0x02;
+    /// The rule along the bottom of one.
+    pub const FIELD_RULE: u8 = 0x03;
+}
+
+/// How a backing-store byte becomes a pixel on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Palette {
+    /// Every byte is a luminance: memcpy'd to an 8-bit visual, replicated
+    /// across the channels of a deeper one.
+    Grey,
+    /// A panel with a colour filter array in front of it, on a visual deep
+    /// enough to address it.
+    ///
+    /// **The channel positions are read off the visual, not assumed.** A
+    /// TrueColor visual states its own masks, and two of them swapped turns the
+    /// caret orange on a panel nothing here can see.
+    Colour {
+        shifts: (u32, u32, u32),
+        /// Bits the visual does not use: the pad at depth 24, alpha at 32. Set,
+        /// so a 32-bit visual does not draw the page fully transparent.
+        pad: u32,
+        lsb_first: bool,
+    },
+}
+
+impl Palette {
+    /// The pixel an ink byte becomes.
+    ///
+    /// Only the handful of [`ink`] indices are colours; every other value is
+    /// still the luminance it always was, so prose, syntax marks and paper come
+    /// out of the same arm they would on a grey panel.
+    fn pixel(self, v: u8) -> [u8; 4] {
+        let Palette::Colour {
+            shifts,
+            pad,
+            lsb_first,
+        } = self
+        else {
+            return [v, v, v, 0xFF];
+        };
+        // Sampled from iA Writer rather than chosen: the caret is its own
+        // colour, and the highlighter is a **pale** field under a **saturated**
+        // rule. The pairing is the point — the field is a wash the prose stays
+        // readable through, and the rule is what gives the run an edge. A field
+        // dark enough to draw its own edge is a slab with text on it.
+        let (r, g, b) = match v {
+            ink::CARET => (0x00, 0xbf, 0xff),
+            ink::FIELD => (0xfb, 0xec, 0xa2),
+            ink::FIELD_RULE => (0xff, 0xd6, 0x04),
+            grey => (grey, grey, grey),
+        };
+        let (rs, gs, bs) = shifts;
+        let value = ((r as u32) << rs) | ((g as u32) << gs) | ((b as u32) << bs) | pad;
+        if lsb_first {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        }
+    }
+}
+
+/// Where the lowest bit of `mask` sits.
+fn shift_of(mask: u32) -> u32 {
+    if mask == 0 { 0 } else { mask.trailing_zeros() }
+}
+
+/// Whether the panel has a colour filter array in front of it.
+///
+/// **Asked of the panel, not of the visual.** A depth-24 TrueColor visual says
+/// the X server can represent a colour, not that the hardware can show one, and
+/// on this family those are different claims: the Colorsoft's device tree
+/// carries an `epd/cfa_panel` node and the Oasis 2's whole `/sys` has nothing
+/// matching `cfa` at all.
+///
+/// Unreadable means grey: a grey panel handed colour indices draws them as the
+/// near-black luminances they numerically are.
+fn has_cfa() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/firmware/devicetree/base") else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let mut path = entry.path();
+        path.push("epd");
+        path.push("cfa_panel");
+        path.exists()
+    })
+}
+
 /// What the server had to say about our window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
@@ -84,12 +199,70 @@ pub struct Window {
     win: XWindow,
     gc: Gcontext,
     depth: u8,
+    /// The palette in force. `Grey` whenever colour is switched off, so a byte
+    /// left in the backing store by the previous setting cannot come out as a
+    /// colour after it.
+    palette: Palette,
+    /// What the panel could do, kept across a switch-off so it can be switched
+    /// back on without asking `/sys` again.
+    capable: Palette,
     width: u16,
     height: u16,
     /// One byte per pixel, row-major, `WHITE` for paper.
     pixels: Vec<u8>,
     app_id: String,
     orientation: Orientation,
+}
+
+/// Decide the palette from the screen's own visual and the panel in front of it.
+///
+/// Logged either way. A Colorsoft that came up grey because `/sys` was not
+/// readable is a silent, puzzling loss of every colour on the device, and the
+/// one line that says so costs nothing.
+fn palette_for(conn: &RustConnection, screen: &x11rb::protocol::xproto::Screen) -> Palette {
+    let visual = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|d| d.visuals.iter())
+        .find(|v| v.visual_id == screen.root_visual);
+    let cfa = has_cfa();
+    match visual {
+        Some(v) if cfa && screen.root_depth > 8 && v.red_mask != 0 => {
+            let shifts = (
+                shift_of(v.red_mask),
+                shift_of(v.green_mask),
+                shift_of(v.blue_mask),
+            );
+            let used = v.red_mask | v.green_mask | v.blue_mask;
+            let pad = !used & mask_for(screen.root_depth.max(24));
+            eprintln!(
+                "window: colour panel, depth {} masks {:06x}/{:06x}/{:06x}",
+                screen.root_depth, v.red_mask, v.green_mask, v.blue_mask
+            );
+            Palette::Colour {
+                shifts,
+                pad,
+                lsb_first: conn.setup().image_byte_order
+                    == x11rb::protocol::xproto::ImageOrder::LSB_FIRST,
+            }
+        }
+        _ => {
+            eprintln!(
+                "window: grey panel, depth {} cfa {}",
+                screen.root_depth, cfa
+            );
+            Palette::Grey
+        }
+    }
+}
+
+/// All the bits a visual of this depth can address.
+fn mask_for(depth: u8) -> u32 {
+    if depth >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << depth) - 1
+    }
 }
 
 /// The lab126 window manager reads the window name as a layout spec rather than
@@ -123,6 +296,7 @@ impl Window {
         let screen = conn.setup().roots[screen_num].clone();
         let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
         let depth = screen.root_depth;
+        let palette = palette_for(&conn, &screen);
 
         let win = conn.generate_id().context("generate_id window")?;
         conn.create_window(
@@ -162,6 +336,8 @@ impl Window {
             win,
             gc,
             depth,
+            palette,
+            capable: palette,
             width,
             height,
             pixels,
@@ -213,6 +389,54 @@ impl Window {
             y: 0,
             width: self.width,
             height: self.height,
+        }
+    }
+
+    /// Whether this panel *can* show colour. Config asks, so that the setting
+    /// only appears on a Kindle where it means something — the same rule the
+    /// Screen section follows for a device that has no tilt sensor.
+    pub fn colour_capable(&self) -> bool {
+        matches!(self.capable, Palette::Colour { .. })
+    }
+
+    /// Whether colour is being drawn right now: the panel has it *and* the
+    /// writer has left it on.
+    pub fn colour(&self) -> bool {
+        matches!(self.palette, Palette::Colour { .. })
+    }
+
+    /// Switch colour on or off. Costs a full repaint at the call site, which is
+    /// what makes the backing store's old bytes irrelevant.
+    pub fn set_colour(&mut self, on: bool) {
+        self.palette = if on { self.capable } else { Palette::Grey };
+    }
+
+    /// The value a caret is drawn in: black on a grey panel, deep navy where
+    /// there is a panel to show one.
+    pub fn caret_ink(&self) -> u8 {
+        if self.colour() { ink::CARET } else { BLACK }
+    }
+
+    /// The value a `==highlight==` field is filled with.
+    ///
+    /// **`quiet` outranks colour.** Focus mode sets a row back whatever the
+    /// panel can do, so a field off the focused sentence is grey even where
+    /// there is colour to draw it in.
+    pub fn field_ink(&self, quiet: bool) -> u8 {
+        match (quiet, self.colour()) {
+            (true, _) => FIELD_QUIET,
+            (false, true) => ink::FIELD,
+            (false, false) => FIELD,
+        }
+    }
+
+    /// The value of the rule along the bottom of a field. One step down from
+    /// the field itself, so the run has an edge without having an outline.
+    pub fn field_rule_ink(&self, quiet: bool) -> u8 {
+        match (quiet, self.colour()) {
+            (true, _) => FIELD,
+            (false, true) => ink::FIELD_RULE,
+            (false, false) => QUIET,
         }
     }
 
@@ -268,7 +492,7 @@ impl Window {
                 width: rect.width,
                 height: rows,
             };
-            let data = encode_band(&self.pixels, self.width as usize, band, bpp);
+            let data = encode_band(&self.pixels, self.width as usize, band, bpp, self.palette);
             self.conn
                 .put_image(
                     ImageFormat::Z_PIXMAP,
@@ -417,17 +641,18 @@ fn band_rows(budget: usize, row_bytes: usize) -> usize {
 }
 
 /// Pack one band of the backing store into `Z_PIXMAP` wire format.
-fn encode_band(pixels: &[u8], stride: usize, band: Rect, bpp: usize) -> Vec<u8> {
+///
+/// The 8-bit case is still the memcpy it always was. Both grey devices take it,
+/// and neither pays anything for the colour path existing.
+fn encode_band(pixels: &[u8], stride: usize, band: Rect, bpp: usize, palette: Palette) -> Vec<u8> {
     let mut out = Vec::with_capacity(band.width as usize * band.height as usize * bpp);
     for y in band.y as usize..(band.y + band.height) as usize {
         let row = &pixels[y * stride + band.x as usize..][..band.width as usize];
         if bpp == 1 {
             out.extend_from_slice(row);
         } else {
-            // The pad byte is ignored by the server at depth 24 and is the
-            // alpha slot at depth 32.
             for &v in row {
-                out.extend_from_slice(&[v, v, v, 0xFF]);
+                out.extend_from_slice(&palette.pixel(v));
             }
         }
     }
@@ -533,7 +758,10 @@ mod tests {
             height: 2,
         };
         // 4x4 surface: rows 1 and 2, columns 1 and 2.
-        assert_eq!(encode_band(&pixels, 4, band, 1), vec![5, 6, 9, 10]);
+        assert_eq!(
+            encode_band(&pixels, 4, band, 1, Palette::Grey),
+            vec![5, 6, 9, 10]
+        );
     }
 
     #[test]
@@ -546,9 +774,99 @@ mod tests {
             height: 1,
         };
         assert_eq!(
-            encode_band(&pixels, 2, band, 4),
+            encode_band(&pixels, 2, band, 4, Palette::Grey),
             vec![0x40, 0x40, 0x40, 0xFF, 0x80, 0x80, 0x80, 0xFF]
         );
+    }
+
+    /// A depth-24 TrueColor visual as the Colorsoft's Xorg log describes it.
+    fn colorsoft() -> Palette {
+        Palette::Colour {
+            shifts: (16, 8, 0),
+            pad: 0xFF00_0000,
+            lsb_first: true,
+        }
+    }
+
+    #[test]
+    fn a_grey_is_still_a_grey_on_a_colour_panel() {
+        // Everything that is not one of the handful of colour indices is still
+        // a luminance, so prose and paper draw the same on either panel.
+        for v in [BLACK, QUIET, FIELD, FIELD_QUIET, WHITE, 0x37] {
+            assert_eq!(
+                colorsoft().pixel(v),
+                [v, v, v, 0xFF],
+                "{v:#04x} should still be grey"
+            );
+        }
+    }
+
+    #[test]
+    fn the_caret_is_the_blue_that_was_asked_for() {
+        // #00bfff, little-endian into an 0xRRGGBB visual: B, G, R, then pad.
+        assert_eq!(colorsoft().pixel(ink::CARET), [0xff, 0xbf, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn the_field_is_paler_than_the_rule_that_edges_it() {
+        // The highlighter is a wash under a line, not a slab. Inverted, the
+        // prose would be sitting on the saturated one.
+        //
+        // Read back through the palette rather than from the literals, so this
+        // fails if the colours move.
+        let light = |v: u8| {
+            let [b, g, r, _] = colorsoft().pixel(v);
+            r as u32 + g as u32 + b as u32
+        };
+        assert!(
+            light(ink::FIELD) > light(ink::FIELD_RULE),
+            "the field is the paler of the two"
+        );
+        // And the field stays well clear of the prose drawn on it.
+        assert!(light(ink::FIELD) > light(BLACK) + 500);
+    }
+
+    #[test]
+    fn the_channels_follow_the_visuals_masks_rather_than_a_guess() {
+        // The same ink on a BGR visual has to come out as the same *colour*,
+        // which means different bytes. Swapping these is how a blue caret
+        // becomes an orange one, and one visual's worth of test would not see
+        // it.
+        let bgr = Palette::Colour {
+            shifts: (0, 8, 16),
+            pad: 0,
+            lsb_first: true,
+        };
+        assert_eq!(bgr.pixel(ink::CARET), [0x00, 0xbf, 0xff, 0x00]);
+        let msb = Palette::Colour {
+            shifts: (16, 8, 0),
+            pad: 0,
+            lsb_first: false,
+        };
+        assert_eq!(msb.pixel(ink::CARET), [0x00, 0x00, 0xbf, 0xff]);
+    }
+
+    #[test]
+    fn a_colour_index_is_never_a_grey_karyll_draws() {
+        // The indices are only safe because nothing else writes those values.
+        for index in [ink::CARET, ink::FIELD, ink::FIELD_RULE] {
+            assert!(![BLACK, QUIET, FIELD, FIELD_QUIET, WHITE].contains(&index));
+        }
+    }
+
+    #[test]
+    fn a_grey_panel_leaves_every_index_alone() {
+        // On the Scribe and the Oasis 2 the byte is a luminance and nothing
+        // consults a palette, which is what keeps their present path a memcpy.
+        assert_eq!(Palette::Grey.pixel(ink::CARET), [1, 1, 1, 0xFF]);
+    }
+
+    #[test]
+    fn masks_report_where_their_channel_starts() {
+        assert_eq!(shift_of(0x00FF_0000), 16);
+        assert_eq!(shift_of(0x0000_FF00), 8);
+        assert_eq!(shift_of(0x0000_00FF), 0);
+        assert_eq!(shift_of(0), 0);
     }
 
     #[test]
@@ -557,5 +875,14 @@ mod tests {
         // 0xFF, and a rasterizer's coverage has to be inverted into it.
         assert_eq!(WHITE, 0xFF);
         assert_eq!(BLACK, 0x00);
+    }
+
+    #[test]
+    fn a_field_is_light_enough_to_read_black_prose_on() {
+        // Both grey fields sit nearer paper than ink, and the focused one is
+        // the darker of the two so that focus mode reads as a step back.
+        // Checked at compile time: these are the constants themselves.
+        const { assert!(FIELD > QUIET && FIELD < WHITE) };
+        const { assert!(FIELD_QUIET > FIELD && FIELD_QUIET < WHITE) };
     }
 }

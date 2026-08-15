@@ -186,7 +186,10 @@ fn main() -> Result<()> {
 
     // Remembered across sessions, so a landscape writer stays in landscape.
     let orientation = read_orientation();
-    let window = window::Window::open("karyll", orientation)?;
+    let mut window = window::Window::open("karyll", orientation)?;
+    // Only ever narrows what the panel offered: on the two grey Kindles the
+    // capability is absent and this is a no-op.
+    window.set_colour(read_colour());
     eprintln!("window: {}x{}", window.width(), window.height());
 
     Editor {
@@ -454,7 +457,8 @@ impl Language {
 ///
 /// * **`ABS_X`, `ABS_Y` and `ABS_Z` are never sent.** The driver advertises all
 ///   three and reports `0` for every one forever, so there is no gravity vector
-///   and [`evdev::Sample::dominant`] has nothing to work with on this firmware.
+///   and the axes on [`evdev::Sample`] have nothing to work with on this
+///   firmware.
 ///   The position code is the entire signal.
 /// * **The sensor reports transitions, not a stream.** It is quiet while the
 ///   device is still and emits one event when it is turned. An earlier version
@@ -2495,6 +2499,7 @@ impl Editor {
                     None => Ok(()),
                 };
             }
+            Some(ConfigRow::Colour) => return self.set_colour(option == 1),
             Some(ConfigRow::None) | None => return Ok(()),
         }
         self.paint()
@@ -2668,6 +2673,22 @@ impl Editor {
             ConfigRow::Size,
         ));
         items.extend(type_rows);
+
+        // Only on a Kindle that has a colour panel to switch off, the same rule
+        // the Screen section follows below. One row: whether the caret and the
+        // highlighter use the panel.
+        if self.window.colour_capable() {
+            let on = self.window.colour();
+            items.push((ui::Item::Heading("Colour".into()), ConfigRow::None));
+            items.push((
+                ui::Item::Choice {
+                    label: "Caret and highlights".into(),
+                    options: vec!["Grey".into(), "Colour".into()],
+                    on: vec![!on, on],
+                },
+                ConfigRow::Colour,
+            ));
+        }
 
         // Last, and only where it is the only way: a Kindle that turns its own
         // page over has the better control already, and it is the device.
@@ -3517,6 +3538,23 @@ impl Editor {
         } else {
             "Off with karyll — the keyboard goes too, and Audible and VoiceView get the radio."
         })
+    }
+
+    /// Switch the colour panel on or off.
+    ///
+    /// **A full refresh, not a repaint.** The backing store still holds the
+    /// bytes the old setting wrote, and a partial update over ink that is
+    /// changing hue leaves a ghost of it.
+    fn set_colour(&mut self, on: bool) -> Result<()> {
+        if self.window.colour() == on {
+            return Ok(());
+        }
+        self.window.set_colour(on);
+        write_colour(on);
+        eprintln!("window: colour {}", if on { "on" } else { "off" });
+        self.frame = None;
+        self.window.refresh()?;
+        self.paint()
     }
 
     /// Remove a paired keyboard, so it can be paired afresh.
@@ -4918,6 +4956,23 @@ fn write_keep_bluetooth(on: bool) {
     let _ = std::fs::write(bluetooth_file(), if on { "1" } else { "0" });
 }
 
+fn colour_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/colour")
+}
+
+/// Whether a colour panel is used as one.
+///
+/// **On unless the file says otherwise.** Colour costs the rest of the device
+/// nothing, so a colour Kindle shows colour before anyone has opened Config and
+/// the switch is there to turn it off.
+fn read_colour() -> bool {
+    std::fs::read_to_string(colour_file()).map_or(true, |s| s.trim() != "0")
+}
+
+fn write_colour(on: bool) {
+    let _ = std::fs::write(colour_file(), if on { "1" } else { "0" });
+}
+
 fn size_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/size")
 }
@@ -5088,6 +5143,7 @@ fn help_items() -> Vec<ui::Item> {
         row("Save now", "Ctrl/⌘ + S"),
         row("Undo, redo", "Ctrl/⌘ + Z,  Shift + Z"),
         row("Bold, italic", "Ctrl/⌘ + B,  I"),
+        row("Highlight", "Ctrl/⌘ + Shift + H"),
         row("Heading level", "Ctrl/⌘ + 1 … 6"),
         row("Focus on this sentence", "Ctrl/⌘ + D"),
         row("Larger, smaller type", "Ctrl/⌘ + +,  Ctrl/⌘ + -"),
@@ -5128,6 +5184,7 @@ fn help_items() -> Vec<ui::Item> {
         heading("Markdown it understands"),
         row("Headings", "# … ######"),
         row("Bold, italic", "**bold**  *italic*"),
+        row("Highlighted", "==mark this=="),
         row("Struck out", "~~cut this~~"),
         row("Lists", "-  *  1."),
         row("Things to do", "- [ ]   done: - [x]"),
@@ -5279,7 +5336,7 @@ impl Field {
     /// The strip cell a field is drawn in, and the reverse.
     ///
     /// One statement of the correspondence, so nothing has to know *where* on
-    /// the strip either field sits — [`Editor::strip`] alone decides that.
+    /// the strip either field sits — [`Editor::strip_wanted`] alone decides that.
     fn cell(self) -> Bar {
         match self {
             Field::Query => Bar::Query,
@@ -5297,7 +5354,7 @@ impl Field {
 }
 
 /// The cells of a bar that absorb whatever width the rest leave: its fields,
-/// wherever [`Editor::strip`] has put them.
+/// wherever [`Editor::strip_wanted`] has put them.
 fn stretch_cells(bars: &[Bar]) -> Vec<usize> {
     bars.iter()
         .enumerate()
@@ -5598,6 +5655,8 @@ enum ConfigRow {
     KeepBluetooth,
     /// Which way up to hold the Kindle, on the ones that cannot tell.
     Screen,
+    /// Whether the colour panel is used as one. Option 1 is colour.
+    Colour,
 }
 
 /// Something a finger can be on.
@@ -5868,7 +5927,7 @@ nine words in this one under the third level
         }
     }
 
-    /// Every strip [`Editor::strip`] can build, on every panel karyll targets.
+    /// Every strip [`Editor::strip_wanted`] can build, on every panel karyll targets.
     ///
     /// **A dropped cell is a control that is not there**, and the strip is what
     /// a writer with no keyboard has instead of shortcuts — an early device run
@@ -5882,7 +5941,7 @@ nine words in this one under the third level
         /// The panels karyll targets, narrowest first.
         const PANELS: [u16; 3] = [1264, 1272, 1860];
 
-        /// The strips, as [`Editor::strip`] builds them. Written out rather
+        /// The strips, as [`Editor::strip_wanted`] builds them. Written out rather
         /// than reached through an `Editor`, which needs a window.
         fn strips() -> Vec<(&'static str, Vec<Bar>)> {
             let paging = [Bar::PageBack, Bar::PageAt, Bar::PageOn];
@@ -6017,7 +6076,7 @@ nine words in this one under the third level
     mod replacing {
         use super::*;
 
-        /// The bar's two states, as [`Editor::strip`] builds them. Written out
+        /// The bar's two states, as [`Editor::strip_wanted`] builds them. Written out
         /// here rather than reached through an `Editor`, which needs a window.
         const FINDING: [Bar; 6] = [
             Bar::Query,

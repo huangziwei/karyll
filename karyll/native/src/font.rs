@@ -611,7 +611,8 @@ struct Measured {
 }
 
 pub struct Fonts {
-    /// Role faces first, in [`ROLES`] order, then [`FALLBACK`].
+    /// Role faces first, in [`LATIN_ROLES`] then [`HAN_ROLES`] order, then
+    /// [`FALLBACK`].
     slots: Vec<Slot>,
     /// Advances are re-measured on every wrap, and wrapping runs on a 1 GHz
     /// ARM, so this is worth its memory.

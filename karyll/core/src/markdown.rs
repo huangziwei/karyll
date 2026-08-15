@@ -85,6 +85,15 @@ pub struct LineMarkup {
     pub block: Block,
     /// Tiles `range` exactly, in order.
     pub spans: Vec<Span>,
+    /// What `==…==` covers, **markers included**, in order and never
+    /// overlapping.
+    ///
+    /// A highlight is a field behind the text rather than a face for it, and a
+    /// run can be bold *and* highlighted — which one [`Style`] per span cannot
+    /// say. So the field is carried here as a range and the body keeps its own
+    /// styles: `==a **b** c==` is bold in the middle of a highlight. The `==`
+    /// stay [`Style::Syntax`] and are drawn quiet on top of the field.
+    pub highlights: Vec<Range<usize>>,
 }
 
 /// Label every line of `chars`.
@@ -122,6 +131,7 @@ fn analyze_line(chars: &[char], range: Range<usize>, in_fence: &mut bool) -> Lin
                 range,
                 block,
                 spans,
+                highlights: Vec::new(),
             }
         };
     }
@@ -135,6 +145,7 @@ fn analyze_line(chars: &[char], range: Range<usize>, in_fence: &mut bool) -> Lin
             range: range.clone(),
             block: Block::Blank,
             spans: one_span(range, Style::Text),
+            highlights: Vec::new(),
         };
     }
     if is_rule(line) {
@@ -157,7 +168,8 @@ fn analyze_line(chars: &[char], range: Range<usize>, in_fence: &mut bool) -> Lin
             style: Style::Syntax,
         });
     }
-    spans.extend(inline(chars, base + marker..range.end));
+    let mut highlights = Vec::new();
+    spans.extend(inline(chars, base + marker..range.end, &mut highlights));
     // **A ticked task reads as struck-out prose.** `[x]` against `[ ]` is one
     // glyph of difference on a one-bit panel, which is not enough to pick a
     // done item out of a list at a glance.
@@ -172,6 +184,7 @@ fn analyze_line(chars: &[char], range: Range<usize>, in_fence: &mut bool) -> Lin
         range,
         block,
         spans,
+        highlights,
     }
 }
 
@@ -563,11 +576,17 @@ fn all_syntax(range: Range<usize>, block: Block) -> LineMarkup {
         range,
         block,
         spans,
+        highlights: Vec::new(),
     }
 }
 
 /// Label the inline markup inside `range`, which must lie on one line.
-fn inline(chars: &[char], range: Range<usize>) -> Vec<Span> {
+///
+/// `highlights` collects the `==…==` fields found anywhere inside `range`,
+/// including inside emphasis, which is why it is threaded through the recursion
+/// rather than returned: the ranges have to reach the line whole, and a field
+/// found inside `**…**` belongs to the same line as one found beside it.
+fn inline(chars: &[char], range: Range<usize>, highlights: &mut Vec<Range<usize>>) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     let mut text_from = range.start;
     let mut i = range.start;
@@ -636,6 +655,35 @@ fn inline(chars: &[char], range: Range<usize>) -> Vec<Span> {
             continue;
         }
 
+        // Highlighted text. The markers stay syntax and the body is parsed like
+        // any other, because the field this records is drawn *behind* the run
+        // and leaves the faces alone — so unlike `~~`, emphasis inside it still
+        // works.
+        if c == '='
+            && chars.get(i + 1) == Some(&'=')
+            && let Some(close) = find_run(chars, i + 2, range.end, '=', 2)
+        {
+            flush(&mut spans, text_from, i);
+            spans.push(Span {
+                range: i..i + 2,
+                style: Style::Syntax,
+            });
+            spans.extend(inline(chars, i + 2..close, highlights));
+            spans.push(Span {
+                range: close..close + 2,
+                style: Style::Syntax,
+            });
+            // Pushed after the recursion so that a field nested inside this one
+            // — `==a ==b== c==` closes at the first `==`, so this cannot
+            // actually nest, but the body may still contain one after an
+            // emphasis run — stays in document order.
+            highlights.push(i..close + 2);
+            highlights.sort_by_key(|h| h.start);
+            i = close + 2;
+            text_from = i;
+            continue;
+        }
+
         // Strong before emphasis: `**` must not be read as two `*`.
         if let Some((marker, style)) = emphasis_marker(chars, i, range.end)
             && let Some(close) = find_run(chars, i + marker, range.end, c, marker)
@@ -649,7 +697,7 @@ fn inline(chars: &[char], range: Range<usize>) -> Vec<Span> {
             // outer style, the `*` inside `**a *b* c**` are bold text rather
             // than markers and nothing between them is italic. The recursion is
             // bounded: the inner range is strictly smaller at both ends.
-            for span in inline(chars, i + marker..close) {
+            for span in inline(chars, i + marker..close, highlights) {
                 spans.push(Span {
                     style: nested(style, span.style),
                     ..span
@@ -828,6 +876,16 @@ mod tests {
         analyze(&chars(s)).into_iter().map(|l| l.block).collect()
     }
 
+    /// The highlighted runs of a one-line document, marker to marker.
+    fn highlighted(s: &str) -> Vec<String> {
+        let cs = chars(s);
+        analyze(&cs)
+            .into_iter()
+            .flat_map(|l| l.highlights)
+            .map(|h| cs[h].iter().collect::<String>())
+            .collect()
+    }
+
     /// The invariant the renderer depends on: spans tile their line exactly.
     fn assert_tiles(s: &str) {
         let cs = chars(s);
@@ -865,6 +923,100 @@ mod tests {
         // Seven hashes is not a heading, and a hash with no space is not either.
         assert_eq!(blocks("####### g"), [Block::Paragraph]);
         assert_eq!(blocks("#nohash"), [Block::Paragraph]);
+    }
+
+    #[test]
+    fn a_highlight_keeps_its_markers_as_syntax_and_its_body_as_prose() {
+        assert_eq!(
+            labelled("the ==highlighted== word"),
+            [
+                ("the ".into(), Style::Text),
+                ("==".into(), Style::Syntax),
+                ("highlighted".into(), Style::Text),
+                ("==".into(), Style::Syntax),
+                (" word".into(), Style::Text),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_field_covers_the_markers_too() {
+        // What the renderer fills: the markers sit inside the field, not
+        // beside it.
+        assert_eq!(highlighted("the ==highlighted== word"), ["==highlighted=="]);
+    }
+
+    #[test]
+    fn a_line_can_carry_more_than_one_field_and_they_come_in_order() {
+        assert_eq!(highlighted("==one== and ==two=="), ["==one==", "==two=="]);
+    }
+
+    #[test]
+    fn emphasis_inside_a_highlight_survives_it() {
+        // The whole reason the field is carried beside the spans rather than as
+        // one of them: `~~` cannot do this and does not claim to.
+        assert_eq!(
+            labelled("==a **b** c=="),
+            [
+                ("==".into(), Style::Syntax),
+                ("a ".into(), Style::Text),
+                ("**".into(), Style::Syntax),
+                ("b".into(), Style::Strong),
+                ("**".into(), Style::Syntax),
+                (" c".into(), Style::Text),
+                ("==".into(), Style::Syntax),
+            ]
+        );
+        assert_eq!(highlighted("==a **b** c=="), ["==a **b** c=="]);
+    }
+
+    #[test]
+    fn a_highlight_inside_emphasis_reaches_the_line() {
+        // Threaded through the recursion, which is what the out-parameter buys.
+        assert_eq!(
+            highlighted("**bold ==and marked== here**"),
+            ["==and marked=="]
+        );
+    }
+
+    #[test]
+    fn a_closing_marker_has_to_follow_a_word() {
+        // The same rule emphasis has, and it matters more here: `== a == b ==`
+        // in prose about arithmetic should not paint half the line yellow.
+        assert!(highlighted("==open ==").is_empty());
+        assert_eq!(highlighted("==closed=="), ["==closed=="]);
+    }
+
+    #[test]
+    fn a_lone_double_equals_is_just_characters() {
+        assert_eq!(labelled("a == b"), [("a == b".into(), Style::Text)]);
+        assert!(highlighted("a == b").is_empty());
+    }
+
+    #[test]
+    fn a_bare_run_of_equals_closes_on_itself_and_marks_nothing() {
+        // `is_rule` knows -, * and _ but not =, so a line of them reaches the
+        // inline parser and `====` is an opener that finds its closer with no
+        // body between. An empty field draws as its own two markers, which is
+        // what the characters are. Recorded because setext underlining looks
+        // like this and karyll does not read setext.
+        assert_eq!(highlighted("===="), ["===="]);
+        assert_eq!(
+            labelled("===="),
+            [("==".into(), Style::Syntax), ("==".into(), Style::Syntax)]
+        );
+        assert_tiles("====");
+        // Three is not two closers, so nothing opens and it stays prose.
+        assert!(highlighted("===").is_empty());
+    }
+
+    #[test]
+    fn highlights_tile_and_nest_without_breaking_the_span_invariant() {
+        assert_tiles("the ==highlighted== word");
+        assert_tiles("==a **b** c==");
+        assert_tiles("**bold ==and marked== here**");
+        assert_tiles("# a ==heading== too");
+        assert_tiles("- [ ] a ==task== item");
     }
 
     #[test]

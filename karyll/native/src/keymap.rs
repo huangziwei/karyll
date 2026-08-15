@@ -457,6 +457,10 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
             // to nothing. `h` is unshifted and in the same place on both
             // layouts. `F1` is out for the reason `F10` was: a Bluetooth
             // keyboard's function row may be media-first.
+            // Shifted first, or the plain arm would swallow it. `H` for
+            // highlight, beside Help rather than instead of it — the same
+            // shift-variant idiom `O` and `F` already use.
+            Some('h') if mods.shift => Some(Action::Emphasis("==")),
             Some('h') => Some(Action::Help),
             // **Every button on the strip has a key.** A strip that hides while
             // you write, reachable only by putting a hand on the glass, is a

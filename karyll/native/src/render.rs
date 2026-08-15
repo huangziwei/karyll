@@ -149,6 +149,11 @@ pub fn block_px(theme: &Theme, block: Block) -> f32 {
 ///
 /// A bar rather than a block: this editor is always inserting and the caret sits
 /// *between* two characters, so a block would sit on top of the one after it.
+///
+/// **One width, whatever the panel can show.** The bar is drawn on the 300 ppi
+/// ink layer and stays crisp; a colour panel resolves its hue at about half
+/// that, which is thin enough to be worth knowing about and not thin enough to
+/// widen the caret for.
 fn caret_width(px: f32) -> u16 {
     (px / 8.0).round().max(3.0) as u16
 }
@@ -488,6 +493,22 @@ fn strikethrough(window: &mut Window, line: &VisualLine, from: f32, to: f32) {
     let thickness = (line.px / 20.0).round().max(1.0) as i32;
     let top = (line.y + line.baseline - rise).max(line.y);
     rule(window, top, thickness, from, to);
+}
+
+/// Rule the bottom edge of a highlight field.
+///
+/// Inside the field rather than under it, so it cannot land in the leading of
+/// the row beneath — which this row's damage rectangle would not repaint. It is
+/// what gives the run an edge on a panel where the field itself is only a few
+/// levels away from paper.
+fn field_rule(window: &mut Window, rect: Rect, ink: u8) {
+    let thickness = (rect.height / 16).max(2).min(rect.height);
+    let top = rect.y + rect.height - thickness;
+    for y in top..top + thickness {
+        for x in rect.x..rect.x + rect.width {
+            window.put_pixel(x, y, ink);
+        }
+    }
 }
 
 /// The pixels of a horizontal rule, shared by the two things that draw one.
@@ -836,37 +857,78 @@ fn selection_rects(
     let Some(selection) = selection else {
         return Vec::new();
     };
-    let mut rects = Vec::new();
-    for line in lines {
-        let start = selection.start.max(line.range.start);
-        let end = selection.end.min(line.range.end);
-        if start >= end {
-            continue;
-        }
-        let Some(left) = pen_at(page, fonts, line, start) else {
-            continue;
-        };
-        let Some(mut right) = pen_at(page, fonts, line, end) else {
-            continue;
-        };
-        if selection.end > line.range.end {
-            right += fonts.advance(Role::Body, line.px, ' ');
-        }
-        // A line scrolled half off the top keeps the half that is still on the
-        // page rather than being dropped or drawn above it.
-        let top = line.y.max(0);
-        let height = line.height - (top - line.y);
-        if height <= 0 {
-            continue;
-        }
-        rects.push(Rect {
-            x: left as u16,
-            y: top as u16,
-            width: (right - left).max(0.0) as u16,
-            height: height as u16,
-        });
+    lines
+        .iter()
+        .filter_map(|line| run_rect(page, fonts, line, selection, true))
+        .collect()
+}
+
+/// The box `run` covers on one visual line, or `None` if it misses the line
+/// entirely.
+///
+/// `nub` adds a space's width when the run carries on past this line, which is
+/// what draws the newline a selection swallowed. A `==highlight==` passes
+/// `false`: it never crosses a newline, so a run that continues does so at a
+/// soft wrap, where there is no character between the two halves to stand for.
+fn run_rect(
+    page: &Page,
+    fonts: &mut impl Metrics,
+    line: &VisualLine,
+    run: &std::ops::Range<usize>,
+    nub: bool,
+) -> Option<Rect> {
+    let start = run.start.max(line.range.start);
+    let end = run.end.min(line.range.end);
+    if start >= end {
+        return None;
     }
-    rects
+    let left = pen_at(page, fonts, line, start)?;
+    let mut right = pen_at(page, fonts, line, end)?;
+    if nub && run.end > line.range.end {
+        right += fonts.advance(Role::Body, line.px, ' ');
+    }
+    // A line scrolled half off the top keeps the half that is still on the
+    // page rather than being dropped or drawn above it.
+    let top = line.y.max(0);
+    let height = line.height - (top - line.y);
+    if height <= 0 {
+        return None;
+    }
+    Some(Rect {
+        x: left as u16,
+        y: top as u16,
+        width: (right - left).max(0.0) as u16,
+        height: height as u16,
+    })
+}
+
+/// The fields behind every `==highlight==` on the page, each with whether focus
+/// mode has set its row back.
+///
+/// **A field that is partly in the focused sentence is drawn lit**, whole. One
+/// phrase is one box: a field split at the focus boundary would read as two
+/// phrases, one of them set back.
+fn highlight_fields(
+    page: &Page,
+    fonts: &mut impl Metrics,
+    lines: &[VisualLine],
+) -> Vec<(Rect, bool)> {
+    let mut fields = Vec::new();
+    for line in lines {
+        let Some(entry) = page.markup.get(line.markup) else {
+            continue;
+        };
+        for run in &entry.highlights {
+            let Some(rect) = run_rect(page, fonts, line, run, false) else {
+                continue;
+            };
+            let from = run.start.max(line.range.start) - line.range.start;
+            let to = run.end.min(line.range.end) - line.range.start;
+            let lit = (from..to).any(|at| line.focus.contains(&at));
+            fields.push((rect, !lit));
+        }
+    }
+    fields
 }
 
 /// The vertical extent of a set of selection rectangles.
@@ -1055,6 +1117,7 @@ pub fn paint(
     let caret = caret(page, fonts, &lines, *cursor);
     let selected = selection_rects(page, fonts, &lines, selection);
     let span = selection_span(&selected);
+    let fields = highlight_fields(page, fonts, &lines);
 
     // Damage is clipped to the page. A rewrap extends it to the foot of the
     // surface, and without this that clears the action strip — which is drawn
@@ -1087,6 +1150,23 @@ pub fn paint(
     window.fill(dirty, crate::window::WHITE);
     let top = dirty.y as i32;
     let bottom = top + dirty.height as i32;
+
+    // Highlight fields first of all: they are the only thing on the page that
+    // is genuinely *behind* the text, and a selection drawn over one has to
+    // win, which it cannot do from underneath.
+    //
+    // Skipped outside the damage on the same test the line loop uses below —
+    // a field filled where its line is not being redrawn would leave a band
+    // with nothing written on it.
+    for (rect, quiet) in &fields {
+        let rect_bottom = rect.y as i32 + rect.height as i32;
+        if rect_bottom <= top || rect.y as i32 >= bottom {
+            continue;
+        }
+        let ink = window.field_ink(*quiet);
+        window.fill(*rect, ink);
+        field_rule(window, *rect, window.field_rule_ink(*quiet));
+    }
 
     // The inverted runs go down before the glyphs, which are drawn in white
     // where they land on one.
@@ -1173,7 +1253,8 @@ pub fn paint(
     }
 
     if let Some(rect) = caret {
-        window.fill(rect, BLACK);
+        let ink = window.caret_ink();
+        window.fill(rect, ink);
     }
 
     // Last, over everything: the box floats above the page, and drawing it
@@ -1221,6 +1302,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A page of `text`, laid out at the default size on a Colorsoft-shaped
+    /// surface, with everything needed to ask where its highlight fields land.
+    fn fielded(text: &str, focus: Option<std::ops::Range<usize>>) -> Vec<(Rect, bool)> {
+        let chars: Vec<char> = text.chars().collect();
+        let markup = karyll_core::markdown::analyze(&chars);
+        let theme = Theme::at(DEFAULT_SIZE);
+        let page = Page::new(&chars, &markup, &theme, (1272, 1696), 1600).focused_on(focus);
+        let lines = layout(&page, &mut crate::font::Proportional, 0);
+        highlight_fields(&page, &mut crate::font::Proportional, &lines)
+    }
+
+    #[test]
+    fn a_highlight_draws_one_field_covering_its_markers() {
+        let fields = fielded("the ==marked== word", None);
+        assert_eq!(fields.len(), 1, "one run, one field");
+        let (rect, quiet) = fields[0];
+        assert!(!quiet, "focus mode is off, so nothing is set back");
+        assert!(rect.width > 0 && rect.height > 0);
+        // It starts after "the " and is as wide as `==marked==` — fourteen
+        // characters of the run against four before it.
+        let (rect_all, _) = fielded("==the marked word==", None)[0];
+        assert!(rect_all.width > rect.width, "a longer run is a wider field");
+        assert!(rect_all.x < rect.x, "and it starts further left");
+    }
+
+    #[test]
+    fn two_runs_on_a_line_are_two_fields() {
+        assert_eq!(fielded("==one== and ==two==", None).len(), 2);
+    }
+
+    #[test]
+    fn no_highlight_is_no_field() {
+        assert!(fielded("nothing marked here", None).is_empty());
+    }
+
+    #[test]
+    fn focus_mode_sets_back_the_fields_it_is_not_on() {
+        // With the cursor in the second run, the first is set back and the
+        // second is not.
+        let text = "==one== and ==two==";
+        let second = text.find("==two==").unwrap();
+        let fields = fielded(text, Some(second..second + 7));
+        assert_eq!(fields.len(), 2);
+        assert!(fields[0].1, "the run off the focused sentence is set back");
+        assert!(!fields[1].1, "the one under it is not");
+    }
+
+    #[test]
+    fn a_field_the_focus_only_partly_covers_stays_lit() {
+        // Splitting the box at the boundary would draw one phrase as two.
+        let fields = fielded("==one two==", Some(0..5));
+        assert_eq!(fields.len(), 1);
+        assert!(!fields[0].1);
+    }
+
+    #[test]
+    fn a_highlight_that_wraps_is_a_field_per_visual_line() {
+        // Long enough to wrap the 1272 px surface at the default size, so the
+        // run crosses a soft wrap and has to be drawn as the runs it visually
+        // is — the same rule a selection follows.
+        //
+        // Trimmed, because a closing marker has to follow a non-space the way
+        // an emphasis one does, and a trailing space would leave the run open.
+        let long = format!("=={}==", "word ".repeat(60).trim_end());
+        let fields = fielded(&long, None);
+        assert!(
+            fields.len() > 1,
+            "a wrapped run draws one box per row, got {}",
+            fields.len()
+        );
     }
 
     #[test]
