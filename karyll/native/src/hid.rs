@@ -17,6 +17,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -72,6 +73,8 @@ pub struct Hid {
     base: PathBuf,
     /// Set when we started it, so we only stop what we own.
     child: Option<Child>,
+    /// Leave the radio up when the editor goes away. Off by default.
+    keep_alive: bool,
 }
 
 impl Hid {
@@ -80,6 +83,7 @@ impl Hid {
         Self {
             base: base.into(),
             child: None,
+            keep_alive: false,
         }
     }
 
@@ -94,19 +98,68 @@ impl Hid {
         Ok(Self::at(ext.join("hid")))
     }
 
-    /// Where the daemon's own output is kept: beside the app's log, on the user
-    /// partition, because `/var/log` is tmpfs here and a reboot destroys
-    /// precisely the log a crash makes you want.
-    fn log_path(&self) -> PathBuf {
+    /// The extension's `var/`, which is where anything outliving a session goes.
+    fn var(&self) -> PathBuf {
         self.base
             .parent()
             .map(|ext| ext.join("var"))
             .unwrap_or_else(|| self.base.clone())
-            .join("hid.log")
+    }
+
+    /// Where the daemon's own output is kept: beside the app's log, on the user
+    /// partition, because `/var/log` is tmpfs here and a reboot destroys
+    /// precisely the log a crash makes you want.
+    fn log_path(&self) -> PathBuf {
+        self.var().join("hid.log")
+    }
+
+    /// Which process the daemon is, written when we spawn one.
+    ///
+    /// [`Hid::start`] adopts a daemon this file names and replaces any other.
+    fn pid_path(&self) -> PathBuf {
+        self.var().join("hid.pid")
     }
 
     pub fn is_installed(&self) -> bool {
         self.base.join("kindle-hid-passthrough").is_file()
+    }
+
+    /// Whether the daemon is meant to outlive the editor.
+    pub fn keep_alive(&self) -> bool {
+        self.keep_alive
+    }
+
+    /// Choose whether quitting takes the Bluetooth stack down with it.
+    ///
+    /// The keyboard on this device is an evdev node the daemon creates, and
+    /// karyll's exclusive grab on it lasts only as long as karyll. A daemon left
+    /// running leaves a live and ungrabbed keyboard behind for the rest of the
+    /// device.
+    ///
+    /// The cost is the radio. The daemon displaces `bsa_server` on `/dev/stpbt`,
+    /// which takes one holder, so Audible and VoiceView have none until this is
+    /// turned off or the Kindle reboots. See [`Hid::start`].
+    ///
+    /// An X client needs one thing more: `evdev_drv.so` binds only devices udev
+    /// has tagged `ID_INPUT_KEYBOARD`, and nothing on this device applies that
+    /// tag. The rule that applies it lives on the rootfs, outside karyll's
+    /// install. karyll reads the node directly and is unaffected — see
+    /// [`crate::evdev`].
+    pub fn set_keep_alive(&mut self, on: bool) {
+        self.keep_alive = on;
+    }
+
+    /// The pid of a daemon we left running, if that pid is still that daemon.
+    ///
+    /// A pid file outlives the process it names and the kernel reissues the
+    /// number, so the pid is confirmed against `/proc` before it is returned.
+    fn left_running(&self) -> Option<u32> {
+        let pid = std::fs::read_to_string(self.pid_path())
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        is_daemon(pid, &self.base).then_some(pid)
     }
 
     /// Whether a daemon is answering, ours or one already running.
@@ -123,6 +176,17 @@ impl Hid {
     pub fn start(&mut self) -> Result<()> {
         if !self.is_installed() {
             bail!("no Bluetooth stack at {}", self.base.display());
+        }
+
+        // A daemon this install left running is adopted: the pid file names it,
+        // and its log is the same file at the same path. Adoption holds a launch
+        // under a second and keeps the keyboard link up across one.
+        if self.is_up()
+            && self.keep_alive
+            && let Some(pid) = self.left_running()
+        {
+            eprintln!("bluetooth: keeping the daemon we left running (pid {pid})");
+            return Ok(());
         }
 
         // A daemon already answering is one we did not start, and inheriting it
@@ -175,11 +239,22 @@ impl Hid {
             .arg("--daemon")
             .current_dir(&self.base)
             .env("KINDLE_HID_BASE", &self.base)
+            // Its own process group, which is what [`Hid::set_keep_alive`]
+            // needs to mean anything. A signal sent to a group reaches every
+            // process in it, the daemon installs a SIGTERM handler and shuts
+            // down cleanly on one, and karyll is killed by group signal — so a
+            // daemon sharing the group dies with the editor whatever `stop`
+            // does, and `stop` is never reached to have an opinion.
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
             .spawn()
             .context("spawn the Bluetooth daemon")?;
+        // The pid file is written at spawn. `panic = "abort"` skips `Drop`, so a
+        // crash leaves the daemon running, and the next launch needs the file to
+        // recognise what it finds.
+        let _ = std::fs::write(self.pid_path(), format!("{}\n", child.id()));
         self.child = Some(child);
 
         let deadline = Instant::now() + START_TIMEOUT;
@@ -192,8 +267,8 @@ impl Hid {
         bail!("the Bluetooth daemon did not answer within {START_TIMEOUT:?}")
     }
 
-    /// Stop the daemon if we started it, releasing the radio. A daemon that was
-    /// already running when we arrived is left alone.
+    /// Stop the daemon, releasing the radio — unless [`Hid::set_keep_alive`]
+    /// says to leave it up, in which case this leaves it exactly where it is.
     ///
     /// Deliberately **not** `/stop` first. That suspends the daemon and powers
     /// the chip down, and killing the process a moment later means nothing ever
@@ -202,11 +277,34 @@ impl Hid {
     /// process is what actually frees `/dev/stpbt`, which is the only thing
     /// that has to happen here.
     pub fn stop(&mut self) {
-        let Some(mut child) = self.child.take() else {
+        if self.keep_alive {
+            // A `Child` has no `Drop` in Rust, so releasing the handle is the
+            // whole of it: the process carries on, its output going to the same
+            // `var/hid.log`, and the pid file naming it.
+            match self.child.take() {
+                Some(child) => {
+                    eprintln!("bluetooth: leaving the daemon running (pid {})", child.id())
+                }
+                None => eprintln!("bluetooth: leaving the adopted daemon running"),
+            }
             return;
-        };
-        let _ = child.kill();
-        let _ = child.wait();
+        }
+
+        let _ = std::fs::remove_file(self.pid_path());
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+
+        // An adopted daemon has no handle to kill — an earlier launch spawned it
+        // — and the `/proc` sweep is the only way to signal a process we are not
+        // the parent of. It is what makes the setting take effect on the launch
+        // that turns it off.
+        if self.is_up() {
+            let killed = kill_running(&self.base);
+            eprintln!("bluetooth: stopped {killed} adopted daemon process(es)");
+        }
     }
 
     /// Devices the daemon has paired.
@@ -379,6 +477,30 @@ impl Drop for Hid {
     }
 }
 
+/// One process' command line, its arguments joined by spaces.
+///
+/// `/proc/<pid>/cmdline` separates arguments with NUL, and joining them is what
+/// lets a match span two of them — which [`kill_running`]'s second pattern
+/// needs. A lossy decode is enough: everything matched against it is ASCII.
+fn cmdline(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(String::from_utf8_lossy(&raw).replace('\0', " "))
+}
+
+/// Whether `pid` is a live daemon from `base`.
+///
+/// Matched on the install path, for the reason [`kill_running`] gives: the
+/// program's own name appears nowhere in its command line. A pid on its own
+/// proves nothing — the kernel hands the number out again — so this match is
+/// what makes a pid file safe to act on.
+///
+/// Narrower than [`kill_running`]'s match: that one sweeps up strays, this one
+/// decides whether to adopt a process, and adoption is safe only for one that
+/// came out of this install.
+fn is_daemon(pid: u32, base: &Path) -> bool {
+    cmdline(pid).is_some_and(|line| line.contains(&*base.to_string_lossy()))
+}
+
 /// Kill every running copy of the daemon, by scanning `/proc` for its command
 /// line. Returns how many were signalled.
 ///
@@ -407,11 +529,9 @@ fn kill_running(base: &Path) -> usize {
         if pid == me {
             continue;
         }
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+        let Some(cmdline) = cmdline(pid) else {
             continue;
         };
-        // Arguments are NUL-separated; a lossy read is enough to match on.
-        let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
         if cmdline.contains(&base) || cmdline.contains("main.py --daemon") {
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             killed += 1;

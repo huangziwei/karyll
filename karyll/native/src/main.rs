@@ -10,6 +10,7 @@ mod pen;
 mod power;
 mod render;
 mod touch;
+mod udev;
 mod ui;
 mod window;
 
@@ -65,14 +66,29 @@ fn main() -> Result<()> {
 
     // Bring the Bluetooth stack up ourselves. There is no kernel Bluetooth on
     // this device, so a userspace daemon is the only route to a keyboard, and
-    // karyll owns its lifetime: starting it displaces the stock stack, and it
-    // is stopped again on exit so Audible and VoiceView only go away while the
-    // editor is open.
+    // karyll owns its lifetime: starting it displaces the stock stack, and by
+    // default it is stopped again on exit so Audible and VoiceView only go away
+    // while the editor is open.
+    //
+    // The writer can say otherwise — see [`hid::Hid::set_keep_alive`]. The
+    // setting is read before `start`, which needs it to tell an adoption from a
+    // replacement.
     //
     // A failure here is reported and not fatal. The editor is still worth
     // opening — the document is readable, and a keyboard paired later is
     // picked up without a restart.
+    // Tag the keyboard for X before the daemon creates it, so a keyboard that
+    // arrives while karyll runs is one kterm and the home screen can read the
+    // moment karyll lets go of it. karyll itself needs nothing from this, and a
+    // failure costs only that reach — see [`udev`].
+    match udev::ensure() {
+        Ok(udev::Outcome::Present) => {}
+        Ok(udev::Outcome::Installed) => eprintln!("udev: installed {}", udev::PATH),
+        Err(err) => eprintln!("udev: {err:#} — the keyboard will reach karyll only"),
+    }
+
     let mut bluetooth = hid::Hid::beside_executable()?;
+    bluetooth.set_keep_alive(read_keep_bluetooth());
     match bluetooth.start() {
         Ok(()) => eprintln!("bluetooth: daemon up"),
         Err(err) => eprintln!("bluetooth: {err:#}"),
@@ -84,7 +100,7 @@ fn main() -> Result<()> {
     // type into yet. The loop picks one up whenever it appears.
     let keyboard = match evdev::Keyboard::open() {
         Ok(keyboard) => {
-            eprintln!("keyboard: {}", keyboard.path().display());
+            report_keyboard(&keyboard, "");
             Some(keyboard)
         }
         Err(err) => {
@@ -858,7 +874,7 @@ impl Editor {
                 {
                     looked_for_keyboard = std::time::Instant::now();
                     if let Ok(found) = evdev::Keyboard::open() {
-                        eprintln!("keyboard: {} (appeared)", found.path().display());
+                        report_keyboard(&found, " (appeared)");
                         keyboard = Some(found);
                         self.keyboard_present = true;
                         // Config stays open rather than being dismissed:
@@ -2329,6 +2345,9 @@ impl Editor {
                     None => Ok(()),
                 };
             }
+            // It paints itself: the status line carries the cost, which the chip
+            // has no room for.
+            Some(ConfigRow::KeepBluetooth) => return self.set_keep_bluetooth(option == 1),
             Some(ConfigRow::None) | None => return Ok(()),
         }
         self.paint()
@@ -2580,6 +2599,20 @@ impl Editor {
                 on: vec![self.scanning.is_some()],
             },
             ConfigRow::Keyboard(vec![KeyAction::Scan]),
+        ));
+
+        // Last in the section: it is about the keyboard, not about any one of
+        // them. The keyboard karyll pairs is the device's only keyboard, so this
+        // row is the only place to ask for it outside karyll. What it does is in
+        // [`hid::Hid::set_keep_alive`].
+        let keep = self.bluetooth.keep_alive();
+        items.push((
+            ui::Item::Choice {
+                label: "When karyll closes".into(),
+                options: vec!["Turn Bluetooth off".into(), "Keep it on".into()],
+                on: vec![!keep, keep],
+            },
+            ConfigRow::KeepBluetooth,
         ));
         items
     }
@@ -3242,6 +3275,28 @@ impl Editor {
             Ok(()) => self.show_status(&format!("Asked {} to disconnect.", device.name)),
             Err(err) => self.show_status(&format!("Could not disconnect: {err:#}")),
         }
+    }
+
+    /// Choose whether the Bluetooth stack outlives the editor.
+    ///
+    /// **Takes effect on the way out.** The daemon runs either way, and the
+    /// keyboard being typed on is its keyboard — turning this off mid-session
+    /// must not drop the link under the writer's hands.
+    ///
+    /// **The status line carries the cost.** It is paid on the home screen and
+    /// in apps karyll has no part in, where nothing points back to this row.
+    fn set_keep_bluetooth(&mut self, on: bool) -> Result<()> {
+        if self.bluetooth.keep_alive() == on {
+            return Ok(());
+        }
+        self.bluetooth.set_keep_alive(on);
+        write_keep_bluetooth(on);
+        eprintln!("bluetooth: keep alive {}", if on { "on" } else { "off" });
+        self.show_status(if on {
+            "Kept on — so is the keyboard. Audible and VoiceView have no radio until this is off."
+        } else {
+            "Off with karyll — the keyboard goes too, and Audible and VoiceView get the radio."
+        })
     }
 
     /// Remove a paired keyboard, so it can be paired afresh.
@@ -4056,7 +4111,14 @@ impl Editor {
 /// interactive mode, so there is one way in and one place the behaviour lives.
 fn pair() -> Result<()> {
     let mut bluetooth = hid::Hid::beside_executable()?;
-    eprintln!("Starting the Bluetooth stack. This displaces the stock one until karyll exits.");
+    // The same setting the editor reads, so pairing from a terminal leaves the
+    // stack the way the writer has asked for it.
+    bluetooth.set_keep_alive(read_keep_bluetooth());
+    if bluetooth.keep_alive() {
+        eprintln!("Starting the Bluetooth stack. Config keeps it running after this exits.");
+    } else {
+        eprintln!("Starting the Bluetooth stack. This displaces the stock one until karyll exits.");
+    }
     bluetooth.start()?;
 
     let known = bluetooth.devices().unwrap_or_default();
@@ -4385,6 +4447,41 @@ fn read_focus() -> bool {
 
 fn write_focus(on: bool) {
     let _ = std::fs::write(focus_file(), if on { "1" } else { "0" });
+}
+
+/// Say which node the keyboard is on, and whether anything but karyll can read
+/// it.
+///
+/// The second half is [`evdev::Keyboard::tagged_for_x`]: X binds only tagged
+/// nodes, so an untagged keyboard types in the editor and nowhere else on the
+/// device. A log naming only the node cannot tell that apart from a keyboard
+/// that reaches everything, which is the question every report of "it works in
+/// karyll but not in kterm" turns on.
+fn report_keyboard(keyboard: &evdev::Keyboard, how: &str) {
+    let reach = match keyboard.tagged_for_x() {
+        Some(true) => "tagged for X",
+        Some(false) => "not tagged for X — karyll only",
+        None => "no udev record",
+    };
+    eprintln!("keyboard: {}{how} ({reach})", keyboard.path().display());
+}
+
+fn bluetooth_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/bluetooth")
+}
+
+/// Whether the Bluetooth stack is to outlive the editor.
+///
+/// **Off unless the file says otherwise**, because the radio going away with the
+/// editor is what the rest of the device is built to expect: the daemon holds
+/// `/dev/stpbt`, and Audible and VoiceView have nothing while it does. A writer
+/// who has never opened Config must not have that taken from them silently.
+fn read_keep_bluetooth() -> bool {
+    std::fs::read_to_string(bluetooth_file()).is_ok_and(|s| s.trim() == "1")
+}
+
+fn write_keep_bluetooth(on: bool) {
+    let _ = std::fs::write(bluetooth_file(), if on { "1" } else { "0" });
 }
 
 fn size_file() -> PathBuf {
@@ -5040,6 +5137,8 @@ enum ConfigRow {
     Size,
     /// One keyboard's chips, or the scan's.
     Keyboard(Vec<KeyAction>),
+    /// Whether the Bluetooth stack outlives the editor. Option 1 keeps it.
+    KeepBluetooth,
 }
 
 /// Something a finger can be on.

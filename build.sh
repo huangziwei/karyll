@@ -48,7 +48,13 @@ GLIBC=2.36-9+deb12u14
 LIBGCC=12.2.0-14+deb12u1
 # The stamp is the whole pin, so bumping any part of it rebuilds the sysroot
 # instead of leaving a stale one in place.
-SYSROOT_STAMP="bookworm $GLIBC $LIBGCC"
+#
+# **Where it lives is part of the pin.** `usr-lib/libc.so` is a linker script
+# naming absolute paths into this directory, so a checkout that moves carries
+# its sysroot with it and leaves the script naming a directory that is gone: the
+# link then fails on a missing `libc.so.6` that is present at the new path.
+# Rebuilding is a relink — the .debs stay in `cache/`, which this never removes.
+SYSROOT_STAMP="bookworm $GLIBC $LIBGCC $SYSROOT"
 
 # name url sha256, one per line.
 PACKAGES="\

@@ -16,6 +16,7 @@
 
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
@@ -232,6 +233,25 @@ impl Keyboard {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Whether udev has tagged this node `ID_INPUT_KEYBOARD`.
+    ///
+    /// karyll does not need the tag: it reads the node directly. X's
+    /// `evdev_drv.so` binds nothing without it, and this device's udev applies
+    /// no such tag on its own — so the tag is the difference between a keyboard
+    /// that works everywhere and one that works only in the editor. A session
+    /// log silent on it cannot tell those two apart.
+    ///
+    /// Read from udev's own database at `/run/udev/data/c<major>:<minor>`, one
+    /// `E:` line per property. `None` when udev has no record of the node.
+    pub fn tagged_for_x(&self) -> Option<bool> {
+        let rdev = self.file.metadata().ok()?.rdev();
+        // The glibc split: both halves are non-contiguous in the encoded value.
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff_u64);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff_u64);
+        let data = std::fs::read_to_string(format!("/run/udev/data/c{major}:{minor}")).ok()?;
+        Some(data.lines().any(|line| line == "E:ID_INPUT_KEYBOARD=1"))
     }
 
     /// The node's descriptor, so a caller can wait on it alongside the X
