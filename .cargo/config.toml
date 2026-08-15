@@ -12,13 +12,9 @@
 # chosen for being pure Rust. If that ever changes the fallback is
 # `brew install zig && cargo install cargo-zigbuild`, then `cargo zigbuild`.
 #
-# One-time prerequisite: rust-lld ships with rustup but lives inside the active
-# toolchain, under a host-triple-specific path that differs between Intel and
-# Apple Silicon. Put it on PATH with a symlink that resolves the triple at link
-# time, and re-run after a `rustup update` that reshuffles bundled tools:
-#
-#   ln -sf "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/^host:/ {print $2}')/bin/rust-lld" \
-#       ~/.cargo/bin/rust-lld
+# The prerequisite is `rustup target add armv7-unknown-linux-gnueabihf`. rustc
+# resolves `rust-lld` from the active toolchain's own `lib/rustlib/<host>/bin`,
+# so it needs no entry on PATH.
 
 # **This is what karyll ships as.** Dynamically linked against
 # the device's own glibc, because CJK input works by `dlopen`-ing Amazon's zh_CN

@@ -178,7 +178,10 @@ VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
 # Stamp the build so a log on the device names the binary that wrote it.
 # Diagnosing a stale copy as though it were the current one costs a round trip
 # and a reboot every time.
-BUILD_STAMP=$(date +%H%M%S)
+#
+# An inherited KARYLL_BUILD wins, so a release carries its tag; otherwise the
+# time of day separates two builds made the same afternoon.
+BUILD_STAMP=${KARYLL_BUILD:-$(date +%H%M%S)}
 echo "==> Cross-compiling karyll $VERSION for $TARGET  [build $BUILD_STAMP]"
 KARYLL_BUILD="$BUILD_STAMP" RUSTFLAGS="$SYSROOT_FLAGS" \
     cargo build --release --target "$TARGET" -p karyll-native
@@ -198,7 +201,34 @@ file "$BIN" | grep -q "dynamically linked" || {
 # starts, and the only symptom there is a tile that does nothing. This is also
 # what enforces the glibc floor above — an older one links perfectly well and
 # adds `libpthread.so.0` and `libdl.so.2`.
-for lib in $(objdump -p "$BIN" 2>/dev/null | awk '/NEEDED/ {print $2}'); do
+#
+# Read with whichever tool can parse a foreign ELF here. macOS has LLVM's
+# `objdump`, which reads any target; a Linux box has GNU `readelf`, which is
+# architecture-independent, while its `objdump` is often built for the host
+# architecture alone and refuses an armhf binary outright.
+# Absent tools and empty greps are both ordinary here — only one of the two
+# readers exists on any given machine — so neither may trip `set -e`.
+elf_needed() {
+    { readelf -d "$1" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'; } || true
+    { objdump -p "$1" 2>/dev/null | awk '/NEEDED/ {print $2}'; } || true
+}
+elf_versions() {
+    { readelf --dyn-syms "$1" 2>/dev/null | grep -o "GLIBC_[0-9.]*"; } || true
+    { objdump -T "$1" 2>/dev/null | grep -o "GLIBC_[0-9.]*"; } || true
+}
+
+NEEDED=$(elf_needed "$BIN" | sort -u)
+# A dynamically linked binary always names libc, so an empty list means the file
+# was not read rather than that it needs nothing.
+[ -n "$NEEDED" ] || {
+    echo "error: could not read the NEEDED list from $BIN" >&2
+    echo "       install GNU binutils (readelf) or an objdump that reads armhf;" >&2
+    echo "       shipping without this check is how a missing library reaches" >&2
+    echo "       the device as a tile that does nothing" >&2
+    exit 1
+}
+
+for lib in $NEEDED; do
     case "$lib" in
         libc.so.6|libgcc_s.so.1) ;;
         *)
@@ -213,7 +243,7 @@ done
 # The oldest glibc that can run it, decided by the sysroot rather than by
 # anything in this repo's source. Logged so a firmware question is answerable
 # from a build log rather than from a device.
-NEEDS=$(objdump -T "$BIN" 2>/dev/null | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -1)
+NEEDS=$(elf_versions "$BIN" | sort -uV | tail -1)
 echo "==> Links against ${NEEDS:-an unknown glibc} or newer"
 
 echo "==> Assembling $OUT"

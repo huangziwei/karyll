@@ -11,11 +11,25 @@ git clone https://github.com/huangziwei/karyll && cd karyll/
 ./build.sh
 ```
 
+## Install
+
+Copy both of these into `/mnt/us/` over MTP:
+
+    extensions/karyll    # the app
+    documents/Karyll.sh  # the scriptlet home-screen tile
+
+
 ## Screenshots
 
-<img />
+<p align="center">
+    <img src=".github/assets/editor.png" height="800" />
+</p>
 
-(TODO)
+<p align="center">
+  <img src=".github/assets/files.png" height="250" />
+  <img src=".github/assets/config.png" height="250" />
+  <img src=".github/assets/help.png" height="250" />
+</p>
 
 ## Thanks
 
