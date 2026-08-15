@@ -9,8 +9,6 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [profile.release]
-# The device has ~514 MB free and ships the binary over MTP, so size is worth
-# more than the last few percent of speed.
 opt-level = "z"
 lto = true
 codegen-units = 1

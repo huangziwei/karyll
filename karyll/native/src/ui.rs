@@ -153,6 +153,17 @@ pub enum Item {
         /// pick, and a control that navigates has none.
         on: Vec<bool>,
     },
+    /// A colour setting: the same row, with the values drawn *as* themselves.
+    ///
+    /// A chip reading "Yellow" says what it is; a yellow circle shows it, and
+    /// on the one panel this row appears on there is a colour to show. iA
+    /// Writer's picker is a line of filled circles and this is the same line.
+    Swatches {
+        label: String,
+        /// One [`crate::window::ink`] index per swatch, in the order drawn.
+        inks: Vec<u8>,
+        on: Vec<bool>,
+    },
 }
 
 /// A full-screen panel: a title, a status line, a list, and a bottom strip.
@@ -249,7 +260,9 @@ pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str
     let widest = items
         .iter()
         .filter_map(|item| match item {
-            Item::Choice { label, .. } | Item::Row { label, .. } => Some(measure_text(label)),
+            Item::Choice { label, .. } | Item::Row { label, .. } | Item::Swatches { label, .. } => {
+                Some(measure_text(label))
+            }
             // A heading is not a label; it starts at the margin and owns its
             // whole line, so however long it is it moves nothing.
             Item::Heading(_) => None,
@@ -306,6 +319,28 @@ pub fn chip_bounds(
         }
         out.push((x, w));
         x = x.saturating_add(w + CHIP_GAP);
+    }
+    out
+}
+
+/// A swatch's slot, wide enough to be a thumb's target rather than a dot.
+const SWATCH_W: u16 = 72;
+
+/// Where a row of swatches sits, from the same column the chips start at.
+///
+/// Fixed width rather than measured: a swatch has no text to be as wide as, and
+/// six circles of one size read as a set of choices where six of different
+/// sizes would read as a ranking.
+pub fn swatch_bounds(column: u16, width: u16, count: usize) -> Vec<(u16, u16)> {
+    let right = width.saturating_sub(MARGIN_X);
+    let mut x = column;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        if x.saturating_add(SWATCH_W) > right {
+            break;
+        }
+        out.push((x, SWATCH_W));
+        x = x.saturating_add(SWATCH_W + CHIP_GAP);
     }
     out
 }
@@ -397,6 +432,11 @@ pub fn hit(
             let bounds = chip_bounds(column, width, label, options, &mut measure_text);
             cell_at(&bounds, x).map(|option| Hit::Option(index, option))
         }
+        Item::Swatches { inks, .. } => {
+            let column = chip_column(items, width, &mut measure_text);
+            let bounds = swatch_bounds(column, width, inks.len());
+            cell_at(&bounds, x).map(|option| Hit::Option(index, option))
+        }
     }
 }
 
@@ -483,7 +523,61 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                     );
                 }
             }
+            Item::Swatches { label, inks, on } => {
+                draw_line(
+                    window, fonts, label, ROW_INSET, middle, TEXT_PX, false, BLACK,
+                );
+                let bounds = swatch_bounds(column, width, inks.len());
+                for (o, _) in bounds.iter().enumerate() {
+                    let rect = chip_rect(layout, i, &bounds, o);
+                    draw_swatch(window, rect, inks[o], on.get(o).copied().unwrap_or(false));
+                }
+            }
         }
+    }
+}
+
+/// One swatch: a filled circle, with a hole punched in the chosen one.
+///
+/// **Not the page's filled-versus-outlined idiom**, because that idiom spends
+/// the fill on saying "this one" and here the fill *is* the value — an
+/// unfilled swatch would be a colour setting with no colour in it. iA Writer
+/// marks its own picker with a dot in the middle and so does this, which
+/// survives the one thing that could take the colour away: on a panel showing
+/// these in grey, the mark is still a mark.
+fn draw_swatch(window: &mut Window, rect: Rect, ink: u8, on: bool) {
+    let radius = rect.width.min(rect.height) / 2;
+    let cx = rect.x + rect.width / 2;
+    let cy = rect.y + rect.height / 2;
+    disc(window, cx, cy, radius, ink);
+    if on {
+        disc(window, cx, cy, radius / 3, WHITE);
+    }
+}
+
+/// A filled circle, scanline by scanline.
+///
+/// Coverage is one bit everywhere else on this panel and it is one bit here:
+/// the edge is hard, which at this size reads as a circle and not as a
+/// staircase.
+fn disc(window: &mut Window, cx: u16, cy: u16, radius: u16, value: u8) {
+    let r = radius as i32;
+    for dy in -r..=r {
+        let half = ((r * r - dy * dy) as f32).sqrt() as i32;
+        let y = cy as i32 + dy;
+        let x = cx as i32 - half;
+        if y < 0 || x < 0 {
+            continue;
+        }
+        window.fill(
+            Rect {
+                x: x as u16,
+                y: y as u16,
+                width: (half * 2) as u16,
+                height: 1,
+            },
+            value,
+        );
     }
 }
 
@@ -573,6 +667,23 @@ pub fn paint_chip(
                 label,
                 on.get(option).copied().unwrap_or(false),
                 pressed,
+            );
+            rect
+        }
+        // A press marks the swatch the way a chosen one is marked, so the
+        // feedback reads the same on the current colour as on any other.
+        Some(Item::Swatches { inks, on, .. }) => {
+            let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
+            let bounds = swatch_bounds(column, width, inks.len());
+            let rect = chip_rect(layout, item, &bounds, option);
+            let Some(ink) = inks.get(option) else {
+                return rect;
+            };
+            draw_swatch(
+                window,
+                rect,
+                *ink,
+                on.get(option).copied().unwrap_or(false) != pressed,
             );
             rect
         }
@@ -1746,6 +1857,38 @@ mod tests {
             );
             assert!(rect.y >= l.rows_top + l.row_h, "chip {option} left its row");
             assert!(rect.y + rect.height <= l.rows_top + l.row_h * 2);
+        }
+    }
+
+    /// The same bug class on the colour row, which has no text to be measured
+    /// from and so lays itself out by its own arithmetic.
+    #[test]
+    fn a_tap_reported_on_a_swatch_is_inside_the_swatch_that_gets_drawn() {
+        let l = layout();
+        // The narrow panel, because it is the one where six of anything is a
+        // question: the colour row only ever appears on a 1272 px Colorsoft.
+        const COLORSOFT: u16 = 1272;
+        let items = vec![Item::Swatches {
+            label: "Highlight".into(),
+            inks: (0..6).map(crate::window::ink::swatch).collect(),
+            on: (0..6).map(|at| at == 3).collect(),
+        }];
+        let column = chip_column(&items, COLORSOFT, stub);
+        let bounds = swatch_bounds(column, COLORSOFT, 6);
+        assert_eq!(bounds.len(), 6, "a colour was left off the page");
+        let y = l.rows_top;
+        for option in 0..6 {
+            let rect = chip_rect(l, 0, &bounds, option);
+            let middle = rect.x + rect.width / 2;
+            assert_eq!(
+                hit(&items, l, COLORSOFT, middle, y, stub),
+                Some(Hit::Option(0, option)),
+                "the middle of swatch {option} does not resolve to it"
+            );
+            assert!(
+                rect.x + rect.width <= COLORSOFT - MARGIN_X,
+                "swatch {option} runs past the margin"
+            );
         }
     }
 

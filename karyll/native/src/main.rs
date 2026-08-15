@@ -189,6 +189,7 @@ fn main() -> Result<()> {
     let mut window = window::Window::open("karyll", orientation)?;
     // Only ever narrows what the panel offered: on the two grey Kindles the
     // capability is absent and this is a no-op.
+    window.set_colours(read_colours());
     window.set_colour(read_colour());
     eprintln!("window: {}x{}", window.width(), window.height());
 
@@ -2539,6 +2540,16 @@ impl Editor {
                 };
             }
             Some(ConfigRow::Colour) => return self.set_colour(option == 1),
+            Some(ConfigRow::CaretColour) => {
+                let mut inks = self.window.colours();
+                inks.caret = option;
+                return self.set_colours(inks);
+            }
+            Some(ConfigRow::HighlightColour) => {
+                let mut inks = self.window.colours();
+                inks.highlight = option;
+                return self.set_colours(inks);
+            }
             Some(ConfigRow::None) | None => return Ok(()),
         }
         self.paint()
@@ -2727,6 +2738,24 @@ impl Editor {
                 },
                 ConfigRow::Colour,
             ));
+            // Only while there is colour to pick. Off, the swatches would be
+            // drawn through the grey palette — six near-black circles, which
+            // is a picker that lies about every one of its choices.
+            if on {
+                let inks = self.window.colours();
+                let swatches = |label: &str, chosen: usize| ui::Item::Swatches {
+                    label: label.into(),
+                    inks: (0..window::COLOURS.len())
+                        .map(window::ink::swatch)
+                        .collect(),
+                    on: (0..window::COLOURS.len()).map(|at| at == chosen).collect(),
+                };
+                items.push((swatches("Caret", inks.caret), ConfigRow::CaretColour));
+                items.push((
+                    swatches("Highlight", inks.highlight),
+                    ConfigRow::HighlightColour,
+                ));
+            }
         }
 
         // Last, and only where it is the only way: a Kindle that turns its own
@@ -3601,6 +3630,26 @@ impl Editor {
         self.window.set_colour(on);
         write_colour(on);
         eprintln!("window: colour {}", if on { "on" } else { "off" });
+        self.frame = None;
+        self.window.refresh()?;
+        self.paint()
+    }
+
+    /// Take a colour for the caret or the highlighter.
+    ///
+    /// A full refresh for the reason [`Editor::set_colour`] takes one: the
+    /// ink already on the panel is about to change hue under a partial update,
+    /// which is what leaves a ghost of the old colour.
+    fn set_colours(&mut self, inks: window::Inks) -> Result<()> {
+        if inks.caret >= window::COLOURS.len() || inks.highlight >= window::COLOURS.len() {
+            return Ok(());
+        }
+        if self.window.colours() == inks {
+            return Ok(());
+        }
+        self.window.set_colours(inks);
+        write_colours(inks);
+        eprintln!("window: colours {inks}");
         self.frame = None;
         self.window.refresh()?;
         self.paint()
@@ -5053,6 +5102,25 @@ fn write_colour(on: bool) {
     let _ = std::fs::write(colour_file(), if on { "1" } else { "0" });
 }
 
+fn colours_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/colours")
+}
+
+/// Which colours the caret and the highlighter are set to, by name.
+///
+/// Names rather than the indices they resolve to, so the file still says what
+/// it means if the picker ever grows a colour in the middle.
+fn read_colours() -> window::Inks {
+    std::fs::read_to_string(colours_file()).map_or_else(
+        |_| window::Inks::default(),
+        |text| window::Inks::parse(&text),
+    )
+}
+
+fn write_colours(inks: window::Inks) {
+    let _ = std::fs::write(colours_file(), inks.to_string());
+}
+
 fn size_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/size")
 }
@@ -5739,6 +5807,11 @@ enum ConfigRow {
     Screen,
     /// Whether the colour panel is used as one. Option 1 is colour.
     Colour,
+    /// Which of [`window::COLOURS`] the caret is drawn in.
+    CaretColour,
+    /// Which of them a `==highlight==` is. One colour, two values on the page:
+    /// the rule takes it and the field takes its wash.
+    HighlightColour,
 }
 
 /// Something a finger can be on.

@@ -82,6 +82,114 @@ pub mod ink {
     pub const FIELD: u8 = 0x02;
     /// The rule along the bottom of one.
     pub const FIELD_RULE: u8 = 0x03;
+    /// The first of [`super::COLOURS`] as its own index.
+    ///
+    /// The three above are whatever the writer has *chosen*; these are the
+    /// colours themselves, so the picker in Config can show all six at once
+    /// while the caret is only ever one of them.
+    pub const SWATCH: u8 = 0x04;
+
+    /// The index a swatch of `COLOURS[at]` is drawn in.
+    pub fn swatch(at: usize) -> u8 {
+        SWATCH + at as u8
+    }
+}
+
+/// A colour the caret and the highlighter can be set to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Colour {
+    pub name: &'static str,
+    /// The caret, and the rule along the bottom of a field.
+    pub rgb: (u8, u8, u8),
+    /// The field itself: the same hue, pale enough to read prose through.
+    pub wash: (u8, u8, u8),
+}
+
+/// The six colours iA Writer offers, in its own order.
+///
+/// **Sampled from its picker rather than chosen**, the way every other value
+/// here was. What the picker shows is the *saturated* member of the pair: iA
+/// Writer draws the chosen colour as the highlight's underline and a pale wash
+/// of it as the field, which is why one entry carries two values.
+///
+/// `wash` is iA Writer's own for the two hues a capture pins down, and for the
+/// rest it is the hue taken to the lightness those two share — so a purple
+/// field is as pale as a yellow one rather than a slab with text on it.
+pub const COLOURS: [Colour; 6] = [
+    Colour {
+        name: "yellow",
+        rgb: (0xff, 0xd6, 0x00),
+        wash: (0xfb, 0xec, 0xa2),
+    },
+    Colour {
+        name: "orange",
+        rgb: (0xff, 0x7e, 0x42),
+        wash: (0xf9, 0xca, 0xb4),
+    },
+    Colour {
+        name: "pink",
+        rgb: (0xf2, 0x1b, 0xb1),
+        wash: (0xf9, 0xb4, 0xe4),
+    },
+    Colour {
+        name: "purple",
+        rgb: (0x7d, 0x26, 0xf2),
+        wash: (0xd1, 0xb4, 0xf9),
+    },
+    Colour {
+        name: "blue",
+        rgb: (0x00, 0xbf, 0xff),
+        wash: (0xc5, 0xeb, 0xf8),
+    },
+    Colour {
+        name: "green",
+        rgb: (0x98, 0xe3, 0x00),
+        wash: (0xe2, 0xf9, 0xb4),
+    },
+];
+
+/// Which of [`COLOURS`] the caret and the highlighter are set to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Inks {
+    pub caret: usize,
+    pub highlight: usize,
+}
+
+impl Default for Inks {
+    /// iA Writer's own pair, and what karyll drew before either was a setting.
+    fn default() -> Self {
+        Inks {
+            caret: 4,
+            highlight: 0,
+        }
+    }
+}
+
+impl Inks {
+    /// The pair named in a settings file, falling back a name at a time — an
+    /// unreadable half should not cost the half that reads.
+    pub fn parse(text: &str) -> Self {
+        let mut names = text.split_whitespace();
+        let at = |name: Option<&str>, fallback| {
+            name.and_then(|name| COLOURS.iter().position(|c| c.name == name))
+                .unwrap_or(fallback)
+        };
+        let default = Inks::default();
+        Inks {
+            caret: at(names.next(), default.caret),
+            highlight: at(names.next(), default.highlight),
+        }
+    }
+}
+
+impl std::fmt::Display for Inks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}",
+            COLOURS[self.caret].name, COLOURS[self.highlight].name
+        )
+    }
 }
 
 /// How a backing-store byte becomes a pixel on the wire.
@@ -102,6 +210,10 @@ pub enum Palette {
         /// so a 32-bit visual does not draw the page fully transparent.
         pad: u32,
         lsb_first: bool,
+        /// What the writer has picked. Carried here rather than beside the
+        /// palette because this is the one place a byte becomes a colour, and
+        /// a second copy of the choice is a second answer to that.
+        inks: Inks,
     },
 }
 
@@ -116,19 +228,22 @@ impl Palette {
             shifts,
             pad,
             lsb_first,
+            inks,
         } = self
         else {
             return [v, v, v, 0xFF];
         };
-        // Sampled from iA Writer rather than chosen: the caret is its own
-        // colour, and the highlighter is a **pale** field under a **saturated**
-        // rule. The pairing is the point — the field is a wash the prose stays
-        // readable through, and the rule is what gives the run an edge. A field
-        // dark enough to draw its own edge is a slab with text on it.
+        // **One colour drives both halves of a highlight.** The rule along the
+        // bottom is the chosen colour and the field is its wash, which is the
+        // pairing iA Writer draws: the field is what the prose stays readable
+        // through, the rule is what gives the run an edge. A field dark enough
+        // to draw its own edge is a slab with text on it.
+        let last = ink::swatch(COLOURS.len() - 1);
         let (r, g, b) = match v {
-            ink::CARET => (0x00, 0xbf, 0xff),
-            ink::FIELD => (0xfb, 0xec, 0xa2),
-            ink::FIELD_RULE => (0xff, 0xd6, 0x04),
+            ink::CARET => COLOURS[inks.caret].rgb,
+            ink::FIELD => COLOURS[inks.highlight].wash,
+            ink::FIELD_RULE => COLOURS[inks.highlight].rgb,
+            at if (ink::SWATCH..=last).contains(&at) => COLOURS[(at - ink::SWATCH) as usize].rgb,
             grey => (grey, grey, grey),
         };
         let (rs, gs, bs) = shifts;
@@ -244,6 +359,7 @@ fn palette_for(conn: &RustConnection, screen: &x11rb::protocol::xproto::Screen) 
                 pad,
                 lsb_first: conn.setup().image_byte_order
                     == x11rb::protocol::xproto::ImageOrder::LSB_FIRST,
+                inks: Inks::default(),
             }
         }
         _ => {
@@ -411,8 +527,41 @@ impl Window {
         self.palette = if on { self.capable } else { Palette::Grey };
     }
 
-    /// The value a caret is drawn in: black on a grey panel, deep navy where
-    /// there is a panel to show one.
+    /// Which of [`COLOURS`] the caret and the highlighter are set to.
+    ///
+    /// Read off `capable` rather than off the palette in force, so switching
+    /// colour off and back on returns the pair the writer picked rather than
+    /// the default.
+    pub fn colours(&self) -> Inks {
+        match self.capable {
+            Palette::Colour { inks, .. } => inks,
+            Palette::Grey => Inks::default(),
+        }
+    }
+
+    /// Take a new pair. Costs a full refresh at the call site: a partial update
+    /// over ink that is changing hue is what leaves a ghost of the old one.
+    pub fn set_colours(&mut self, inks: Inks) {
+        let repaint = |palette: Palette| match palette {
+            Palette::Colour {
+                shifts,
+                pad,
+                lsb_first,
+                ..
+            } => Palette::Colour {
+                shifts,
+                pad,
+                lsb_first,
+                inks,
+            },
+            Palette::Grey => Palette::Grey,
+        };
+        self.capable = repaint(self.capable);
+        self.palette = repaint(self.palette);
+    }
+
+    /// The value a caret is drawn in: black on a grey panel, the chosen colour
+    /// where there is a panel to show one.
     pub fn caret_ink(&self) -> u8 {
         if self.colour() { ink::CARET } else { BLACK }
     }
@@ -785,6 +934,7 @@ mod tests {
             shifts: (16, 8, 0),
             pad: 0xFF00_0000,
             lsb_first: true,
+            inks: Inks::default(),
         }
     }
 
@@ -836,12 +986,14 @@ mod tests {
             shifts: (0, 8, 16),
             pad: 0,
             lsb_first: true,
+            inks: Inks::default(),
         };
         assert_eq!(bgr.pixel(ink::CARET), [0x00, 0xbf, 0xff, 0x00]);
         let msb = Palette::Colour {
             shifts: (16, 8, 0),
             pad: 0,
             lsb_first: false,
+            inks: Inks::default(),
         };
         assert_eq!(msb.pixel(ink::CARET), [0x00, 0x00, 0xbf, 0xff]);
     }
@@ -849,9 +1001,85 @@ mod tests {
     #[test]
     fn a_colour_index_is_never_a_grey_karyll_draws() {
         // The indices are only safe because nothing else writes those values.
-        for index in [ink::CARET, ink::FIELD, ink::FIELD_RULE] {
+        let swatches = (0..COLOURS.len()).map(ink::swatch);
+        for index in [ink::CARET, ink::FIELD, ink::FIELD_RULE]
+            .into_iter()
+            .chain(swatches)
+        {
             assert!(![BLACK, QUIET, FIELD, FIELD_QUIET, WHITE].contains(&index));
         }
+    }
+
+    #[test]
+    fn the_caret_and_the_field_follow_what_was_picked() {
+        // The three dynamic indices are the *choice*, so setting one has to
+        // move the ink that reads it and leave the other alone.
+        let picked = |inks| match colorsoft() {
+            Palette::Colour {
+                shifts,
+                pad,
+                lsb_first,
+                ..
+            } => Palette::Colour {
+                shifts,
+                pad,
+                lsb_first,
+                inks,
+            },
+            grey => grey,
+        };
+        let green = COLOURS.iter().position(|c| c.name == "green").unwrap();
+        let p = picked(Inks {
+            caret: green,
+            highlight: green,
+        });
+        let rgb = |v: u8| {
+            let [b, g, r, _] = p.pixel(v);
+            (r, g, b)
+        };
+        assert_eq!(rgb(ink::CARET), COLOURS[green].rgb);
+        assert_eq!(rgb(ink::FIELD_RULE), COLOURS[green].rgb);
+        assert_eq!(rgb(ink::FIELD), COLOURS[green].wash);
+        // And a swatch is its own colour whatever is picked, or the picker
+        // would show six of whatever the caret already is.
+        for (at, colour) in COLOURS.iter().enumerate() {
+            assert_eq!(rgb(ink::swatch(at)), colour.rgb, "{}", colour.name);
+        }
+    }
+
+    #[test]
+    fn every_field_is_paler_than_the_rule_it_carries() {
+        // The pairing has to hold for all six, not just the yellow it was
+        // measured on: a wash darker than its own rule is a slab.
+        for colour in COLOURS {
+            let light = |(r, g, b): (u8, u8, u8)| r as u32 + g as u32 + b as u32;
+            assert!(
+                light(colour.wash) > light(colour.rgb),
+                "{} washes paler than it rules",
+                colour.name
+            );
+            assert!(
+                light(colour.wash) > 500,
+                "{} is light enough to read black prose on",
+                colour.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_file_round_trips_a_pair() {
+        let inks = Inks {
+            caret: 2,
+            highlight: 5,
+        };
+        assert_eq!(Inks::parse(&inks.to_string()), inks);
+        // A file that says nothing, or says something that is no longer a
+        // colour, leaves the default rather than panicking on an index.
+        assert_eq!(Inks::parse(""), Inks::default());
+        assert_eq!(Inks::parse("chartreuse mauve"), Inks::default());
+        // Half a file keeps the half that reads.
+        assert_eq!(Inks::parse("green").caret, 5);
+        assert_eq!(Inks::parse("green").highlight, Inks::default().highlight);
     }
 
     #[test]
