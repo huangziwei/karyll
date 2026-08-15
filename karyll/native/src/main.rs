@@ -22,6 +22,14 @@ use karyll_core::Document;
 use font::Metrics as _;
 use keymap::{Action, Mods};
 
+/// Stamped in by `build.sh` so a log says which binary wrote it.
+/// Without it there is no way to tell a stale copy on the device from a fresh
+/// one, and every symptom has to be diagnosed twice.
+const BUILD: &str = match option_env!("KARYLL_BUILD") {
+    Some(stamp) => stamp,
+    None => "dev",
+};
+
 fn main() -> Result<()> {
     eprintln!("karyll {} build {BUILD}", env!("CARGO_PKG_VERSION"));
     if std::env::args().nth(1).as_deref() == Some("--pair") {
@@ -5060,10 +5068,75 @@ const INDENT: &str = "  ";
 /// pushing a sixth-level heading off the page.
 const OUTLINE_STEP: &str = "    ";
 
+/// Shown when no file is given: enough mixed content to judge the type on a
+/// real panel, which is the only place it can be judged.
+/// The welcome document, for the one path that has no file: the binary run by
+/// hand with no argument.
+///
+/// **The same file the launcher copies into an empty documents directory**, not
+/// a second copy of it. It is the specimen — every kind of formatting karyll
+/// understands is in it — and a specimen that has drifted from the document
+/// writers actually see is worse than none, because it is the one thing checked
+/// when the type looks wrong.
+const SPECIMEN: &str = include_str!("../../../device/share/Welcome.md");
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// **The specimen has a job, and this is it.** It is the document a fresh
+    /// install opens onto and the one thing looked at when the type is wrong on
+    /// device, so a formatting kind missing from it is a kind nobody checks.
+    /// Prose gets edited; an assertion does not quietly stop covering something.
+    #[test]
+    fn the_specimen_exercises_every_block_kind() {
+        use karyll_core::markdown::{Block, Style};
+        let chars: Vec<char> = SPECIMEN.chars().collect();
+        let markup = karyll_core::markdown::analyze(&chars);
+
+        for want in [
+            Block::Paragraph,
+            Block::Blank,
+            Block::Heading(1),
+            Block::Heading(2),
+            Block::Heading(3),
+            Block::Heading(4),
+            Block::Quote,
+            Block::ListItem { ordered: false },
+            Block::ListItem { ordered: true },
+            Block::Task { done: false },
+            Block::Task { done: true },
+            Block::Fence,
+            Block::Code,
+            Block::Rule,
+        ] {
+            assert!(
+                markup.iter().any(|line| line.block == want),
+                "the specimen has no {want:?} in it"
+            );
+        }
+
+        // And the inline kinds, which are what the faces are actually judged on.
+        for want in [
+            Style::Emphasis,
+            Style::Strong,
+            // The specimen says nesting works, so it has to.
+            Style::StrongEmphasis,
+            Style::Strikethrough,
+            Style::Code,
+            Style::Link,
+            Style::Url,
+        ] {
+            assert!(
+                markup
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.style == want),
+                "the specimen has no {want:?} in it"
+            );
+        }
+    }
 
     mod outline {
         use super::*;

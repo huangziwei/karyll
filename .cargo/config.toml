@@ -1,0 +1,48 @@
+# Target-specific only, so host (macOS) builds and `cargo test` stay untouched
+# and this only applies when cross-compiling to the Kindle.
+#
+#   ./build.sh                                        the real build
+#   cargo check --target armv7-unknown-linux-gnueabihf -p karyll-native
+#
+# The Scribe runs a 32-bit armv7 hardfloat NEON userspace.
+#
+# Linker: rustc's bundled rust-lld. Apple's `ld` cannot link ELF, and this is the
+# pure-Rust cross path — no zig, no GNU cross-binutils. It holds only as long as
+# no crate in the graph has a C build script, which is why every dependency is
+# chosen for being pure Rust. If that ever changes the fallback is
+# `brew install zig && cargo install cargo-zigbuild`, then `cargo zigbuild`.
+#
+# One-time prerequisite: rust-lld ships with rustup but lives inside the active
+# toolchain, under a host-triple-specific path that differs between Intel and
+# Apple Silicon. Put it on PATH with a symlink that resolves the triple at link
+# time, and re-run after a `rustup update` that reshuffles bundled tools:
+#
+#   ln -sf "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/^host:/ {print $2}')/bin/rust-lld" \
+#       ~/.cargo/bin/rust-lld
+
+# **This is what karyll ships as.** Dynamically linked against
+# the device's own glibc, because CJK input works by `dlopen`-ing Amazon's zh_CN
+# predictor plugin off the device and a static binary has no dynamic loader to
+# do it with. That is not a limitation to code around: it is the difference
+# between the two kinds of binary.
+#
+# The cost is that the binary requires glibc >= 2.34, so it is specific to this
+# firmware rather than to any Kindle. That was a deliberate choice: the device
+# is jailbroken and therefore frozen on 5.19.4.0.1 forever, and the CJK plugin
+# is firmware-specific anyway. Anyone wanting karyll on a different firmware
+# forks it.
+#
+# The sysroot flags are NOT here — `build.sh` sets them, because the
+# sysroot has to be assembled before it can be pointed at. It is Debian's armhf
+# glibc, fetched and checksummed by `deploy/sysroot.sh` on first build, so
+# `./build.sh` works from a fresh clone with no device involved.
+[target.armv7-unknown-linux-gnueabihf]
+linker = "rust-lld"
+
+# The old static target, kept only as a fallback while the dynamic build above
+# is still unproven on hardware. Nothing builds with it now. It made the binary
+# firmware-agnostic, which was worth having right up until CJK needed `dlopen`.
+# Delete this once the dynamic binary has run on the device.
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
