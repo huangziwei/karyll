@@ -22,12 +22,56 @@ Copy both of these into `/mnt/us/` over MTP:
 
 ## Screenshots
 
-<p align="center">
-    <img src=".github/assets/editor.png" height="800" />
-    <img src=".github/assets/files.png" height="800" />
-    <img src=".github/assets/config.png" height="800" />
-    <img src=".github/assets/help.png" height="800" />
-</p>
+### Kindle Scribe
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src=".github/assets/ks1-editor.png" width="100%" alt="The editor, with the action strip along the bottom" /><br />
+      <sub>Editor</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src=".github/assets/ks1-files.png" width="100%" alt="The Files panel listing documents" /><br />
+      <sub>Files</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src=".github/assets/ks1-config.png" width="100%" alt="The Config panel: keyboard, input, type and screen settings" /><br />
+      <sub>Config</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src=".github/assets/ks1-help.png" width="100%" alt="The Help panel listing keyboard shortcuts" /><br />
+      <sub>Help</sub>
+    </td>
+  </tr>
+</table>
+
+### Kindle Colorsoft
+
+
+
+<!-- Colorsoft and Oasis 2 shots go in their own table, same shape as the one
+     above. Two per row keeps each device to the height of two screenshots
+     however many are added, and portrait panels sit in the grid without
+     stretching the landscape ones.
+
+### Kindle Colorsoft
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src=".github/assets/colorsoft-editor.png" width="100%" alt="" /><br />
+      <sub>Editor</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src=".github/assets/colorsoft-config.png" width="100%" alt="" /><br />
+      <sub>Colour</sub>
+    </td>
+  </tr>
+</table>
+-->
+
 
 ## Thanks
 

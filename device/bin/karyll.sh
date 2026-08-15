@@ -73,9 +73,22 @@ trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi; lipc-s
 # it, and it must not come back the next time they empty the directory. It used
 # to be an empty `draft.md`, which opened onto a blank page with nothing saying
 # what any of the controls did.
+#
+# **Found by glob and `-nt`, never by `ls`.** BusyBox `ls` prints a `?` for
+# every byte it thinks is unprintable, and with no Unicode support compiled in
+# that is every byte above 0x7F — so a document named in Chinese or Japanese
+# came back as a row of question marks, a path that does not exist, and the
+# editor opened a blank page called `???.md`. The Files panel never had the bug
+# because it reads the directory itself. A glob hands the bytes over untouched.
 DOC="$1"
 if [ -z "$DOC" ]; then
-    DOC=$(ls -t "$DOCS"/*.md 2>/dev/null | head -1)
+    for f in "$DOCS"/*.md; do
+        # The literal pattern, when the directory holds nothing to match it.
+        [ -e "$f" ] || continue
+        if [ -z "$DOC" ] || [ "$f" -nt "$DOC" ]; then
+            DOC="$f"
+        fi
+    done
     if [ -z "$DOC" ]; then
         DOC="$DOCS/Welcome.md"
         cp "$EXT/share/Welcome.md" "$DOC" 2>/dev/null || : > "$DOC"
