@@ -190,6 +190,7 @@ fn main() -> Result<()> {
         preedit: String::new(),
         candidates: Vec::new(),
         page: 0,
+        pages: Vec::new(),
         punctuation: ime::Punctuation::default(),
         // The remembered one is applied below rather than assigned here.
         language: Language::English,
@@ -632,9 +633,13 @@ struct Editor {
     typed: String,
     preedit: String,
     candidates: Vec<String>,
-    /// Which ten of them are on the bar. The word wanted is often not among the
-    /// first ten, which is what the arrows are for while composing.
+    /// Which page of them is on the bar. The word wanted is often not on the
+    /// first page, which is what the arrows are for while composing.
     page: usize,
+    /// Where each page starts, from [`ui::candidate_pages`]. A page is as many
+    /// as the panel can show rather than a fixed ten, so this is the only thing
+    /// that knows which candidate a digit picks.
+    pages: Vec<usize>,
     /// Which way the next quotation mark faces. Chinese quotes are directional
     /// and share one key, so the same keystroke has to alternate.
     punctuation: ime::Punctuation,
@@ -747,6 +752,12 @@ impl Editor {
                     // measures sideways is counting pixels in a screenshot.
                     eprintln!("window: {}x{}", self.window.width(), self.window.height());
                     self.frame = None;
+                    // The candidate bar is paged by how much width there is,
+                    // and there is now a different amount. Nothing else here
+                    // survives a rotation either; this is the one piece of it
+                    // that is not rebuilt by the paint below.
+                    let candidates = std::mem::take(&mut self.candidates);
+                    self.set_candidates(candidates);
                     self.paint()?;
                 }
                 window::Surface::Live { expose: true, .. } => self.window.refresh()?,
@@ -1084,7 +1095,7 @@ impl Editor {
     ///
     /// `&mut self` for one reason: whether there is a `More` to offer depends
     /// on how many rows fit, which is measured from the face in use.
-    fn strip(&mut self) -> Vec<Bar> {
+    fn strip_wanted(&mut self) -> Vec<Bar> {
         // The find bar takes the strip rather than sitting above it, for the
         // reason the candidate bar does: the strip's cells are already the
         // right size for a finger, and a second band would push the page up
@@ -1153,41 +1164,57 @@ impl Editor {
         cells
     }
 
-    /// The strip's labels, for drawing.
+    /// The strip's cells and their words together, cut to the panel it is on.
     ///
-    /// Only the find bar's change: the two fields say what has been typed, the
-    /// count says what was found, and `All` says which tap it is on. Everything
-    /// else is a fixed word.
-    fn strip_labels(&mut self) -> Vec<String> {
-        // The two numbers, not a copy of the search. `hits` is one range per
-        // occurrence, so cloning it to read a length would copy thousands of
-        // them off a common word — on every paint, which is every keystroke.
-        // Composing *into the query*, which is the only field whose half-typed
-        // word puts the count out of step with what is beside it.
-        let composing =
-            self.composing() && self.find.as_ref().is_some_and(|f| f.field == Field::Query);
-        let count = self
-            .find
-            .as_ref()
-            .map(|f| (f.query.is_empty(), f.at, f.hits.len()));
-        let armed = self.find.as_ref().is_some_and(|f| f.arming_all);
-        let page = format!("{} of {}", self.panel_page + 1, self.pages());
-        let bars = self.strip();
-        let mut labels: Vec<String> = bars
-            .iter()
-            .map(|b| match b {
-                Bar::PageAt => page.clone(),
-                // Left blank and filled in below: a field is sized by what the
-                // other cells leave, so it cannot be built alongside them.
-                Bar::Query | Bar::With => String::new(),
-                Bar::Count => count.map_or_else(String::new, |(empty, at, total)| {
-                    find_count(empty, composing, at, total)
-                }),
-                Bar::All if armed => "All?".to_string(),
-                other => other.label().to_string(),
-            })
-            .collect();
+    /// **The cells and the words are one answer, so they are worked out in one
+    /// place.** Three consumers ask — drawing, hit-testing and press feedback —
+    /// and two of them disagreeing is how a tap lands on the wrong cell.
+    ///
+    /// The strip was laid out on a 10.2″ panel and the smaller Kindles are two
+    /// thirds of that width, where the find bar wants more than there is. What
+    /// it gives up, in order: its longer words, and then its readouts, which
+    /// are the only cells that are not controls. **A control is never
+    /// dropped** — which is exactly what [`ui::cell_bounds`] does when it runs
+    /// out of room, and what it drops is the tail, so on a 7″ panel the first
+    /// thing to go would be `[ Done ]`.
+    fn strip_fitted(&mut self) -> (Vec<Bar>, Vec<String>) {
+        let wanted = self.strip_wanted();
+        let readouts = self.readouts();
+        let width = self.window.width();
+        let fonts = &mut self.fonts;
+        let (bars, labels) = fit_strip(width, wanted, &readouts, |s| {
+            ui::measure(fonts, s, ui::TEXT_PX) as u16
+        });
+        self.with_fields(bars, labels)
+    }
 
+    /// What the editor knows that the strip has to say.
+    ///
+    /// Gathered once so that the fitting below is free of the editor and can be
+    /// tested against a stub metric, which is the only place it ever runs
+    /// outside a device.
+    fn readouts(&mut self) -> Readouts {
+        Readouts {
+            // The two numbers, not a copy of the search. `hits` is one range
+            // per occurrence, so cloning it to read a length would copy
+            // thousands of them off a common word — on every paint, which is
+            // every keystroke. Composing *into the query*, which is the only
+            // field whose half-typed word puts the count out of step with what
+            // is beside it.
+            composing: self.composing()
+                && self.find.as_ref().is_some_and(|f| f.field == Field::Query),
+            count: self
+                .find
+                .as_ref()
+                .map(|f| (f.query.is_empty(), f.at, f.hits.len())),
+            armed: self.find.as_ref().is_some_and(|f| f.arming_all),
+            page: (self.panel_page + 1, self.pages()),
+        }
+    }
+
+    /// Write what has been typed into the fields, trimmed to the room the other
+    /// cells leave them.
+    fn with_fields(&mut self, bars: Vec<Bar>, mut labels: Vec<String>) -> (Vec<Bar>, Vec<String>) {
         let fields = stretch_cells(&bars);
         if !fields.is_empty() {
             let others: Vec<String> = labels
@@ -1210,7 +1237,16 @@ impl Editor {
                 }
             }
         }
-        labels
+        (bars, labels)
+    }
+
+    /// The strip's labels, for drawing.
+    ///
+    /// Only the find bar's change: the two fields say what has been typed, the
+    /// count says what was found, and `All` says which tap it is on. Everything
+    /// else is a fixed word.
+    fn strip_labels(&mut self) -> Vec<String> {
+        self.strip_fitted().1
     }
 
     /// Which strip cells take whatever width the others leave.
@@ -1220,7 +1256,7 @@ impl Editor {
     /// `Done` along under the writer's finger and eventually push them off the
     /// end of the strip. The replace bar has two, sharing the slack equally.
     fn strip_stretch(&mut self) -> Vec<usize> {
-        stretch_cells(&self.strip())
+        stretch_cells(&self.strip_fitted().0)
     }
 
     /// The status line: what this document is, how long it is, and whether it
@@ -1421,7 +1457,9 @@ impl Editor {
         // The cells the box was drawn from, by the same function that drew
         // them. Measuring something other than what is on screen is how a tap
         // lands on the wrong one.
-        let labels = ui::Overlay::Candidates(candidate_page(&self.candidates, self.page)).labels();
+        let labels =
+            ui::Overlay::Candidates(candidate_page(&self.candidates, &self.pages, self.page))
+                .labels();
         let cells = ui::overlay_cells(&mut self.fonts, rect, self.theme.body_px, &labels);
         // `None` past the last cell: inside the box but beyond the choices
         // belongs to nothing.
@@ -1770,7 +1808,10 @@ impl Editor {
         };
         let row = match target {
             Target::Strip(cell) => {
-                let cells = self.strip();
+                // The cells as drawn, not as wanted: a strip that gave up a
+                // readout to fit is a strip whose fourth cell is not the fourth
+                // one this would otherwise dispatch.
+                let cells = self.strip_fitted().0;
                 return self.strip_action(cells[cell.min(cells.len() - 1)]);
             }
             // **Page-relative in, absolute out.** A tap reports the row it
@@ -3387,7 +3428,7 @@ impl Editor {
             items: &items,
             strip: &strip,
             overlay: overlay(
-                candidate_page(&self.candidates, self.page),
+                candidate_page(&self.candidates, &self.pages, self.page),
                 self.announcing,
                 self.language,
             ),
@@ -3644,7 +3685,7 @@ impl Editor {
                 self.typed.pop();
                 self.feed('\u{8}');
                 if self.typed.is_empty() {
-                    self.candidates.clear();
+                    self.set_candidates(Vec::new());
                 }
             }
             ime::Compose::Feed(c) => {
@@ -3663,7 +3704,7 @@ impl Editor {
             // Letting the arrow through from the last page would move the
             // cursor out from under a word that is still being written.
             ime::Compose::NextPage => {
-                if (self.page + 1) * ime::WANTED < self.candidates.len() {
+                if self.page + 1 < self.pages.len() {
                     self.page += 1;
                 }
             }
@@ -3717,8 +3758,26 @@ impl Editor {
         };
         let candidates = engine.key(key);
         let composed = engine.preedit();
-        self.candidates = candidates;
         self.preedit = composed.unwrap_or_else(|| self.typed.clone());
+        self.set_candidates(candidates);
+    }
+
+    /// Take a new list of candidates, and work out how it pages.
+    ///
+    /// **Everything that changes the list comes through here**, because how it
+    /// pages is not a property of the list: it is what the panel can hold at
+    /// the size being written in, and a list set without asking would be paged
+    /// by whatever the last one needed. Drawing, tapping and the number row all
+    /// read the answer, so there is one.
+    fn set_candidates(&mut self, candidates: Vec<String>) {
+        self.candidates = candidates;
+        self.pages = ui::candidate_pages(
+            &mut self.fonts,
+            self.window.width(),
+            self.theme.body_px,
+            &self.candidates,
+            ime::WANTED,
+        );
         // A new list is read from its first page. Holding the old page would
         // leave the bar empty on the keystroke that shortened the list.
         self.page = 0;
@@ -3727,13 +3786,21 @@ impl Editor {
     /// Accept a candidate by its place on the bar, from the number row or a tap.
     ///
     /// Out of range does nothing rather than committing something else: the
-    /// engine offers fewer than ten candidates often, and pressing 7 for a list
-    /// of three should not insert the third.
+    /// engine offers fewer than a page of candidates often, and pressing 7 for
+    /// a list of three should not insert the third.
+    ///
+    /// **`n` is a place on the bar, so it is looked up on the bar.** Going to
+    /// the list directly would let a digit past the end of a short page commit
+    /// the first candidate of the next one — a word the writer cannot see.
     fn select_candidate(&mut self, n: usize) {
-        let at = self.page * ime::WANTED + n;
-        let Some(text) = self.candidates.get(at).cloned() else {
+        let from = self.pages.get(self.page).copied().unwrap_or(0);
+        let Some(text) = candidate_page(&self.candidates, &self.pages, self.page)
+            .get(n)
+            .cloned()
+        else {
             return;
         };
+        let at = from + n;
         match self.engine().and_then(|engine| engine.commit(at)) {
             // **The word is not over.** The candidate converted the front of
             // the reading and the engine is composing the rest, so the bar goes
@@ -3743,15 +3810,14 @@ impl Editor {
             Some(rest) => {
                 self.typed.clone_from(&rest.reading);
                 self.preedit = rest.reading;
-                self.candidates = rest.candidates;
+                self.set_candidates(rest.candidates);
             }
             None => {
                 self.typed.clear();
                 self.preedit.clear();
-                self.candidates.clear();
+                self.set_candidates(Vec::new());
             }
         }
-        self.page = 0;
         self.insert_committed(&text);
     }
 
@@ -3835,8 +3901,7 @@ impl Editor {
         }
         self.typed.clear();
         self.preedit.clear();
-        self.candidates.clear();
-        self.page = 0;
+        self.set_candidates(Vec::new());
     }
 
     /// Whether a word is being composed, which is what swaps the action strip
@@ -4028,7 +4093,7 @@ impl Editor {
             cursor,
             selection,
             overlay: overlay(
-                candidate_page(&self.candidates, self.page),
+                candidate_page(&self.candidates, &self.pages, self.page),
                 self.announcing,
                 self.language,
             ),
@@ -4106,7 +4171,8 @@ impl Editor {
         // the bar happens to put it.
         let field = self.find.as_ref().map(|f| f.field).unwrap_or_default();
         let cell = self
-            .strip()
+            .strip_fitted()
+            .0
             .iter()
             .position(|bar| *bar == field.cell())
             .unwrap_or(0);
@@ -4337,14 +4403,16 @@ fn language_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/language")
 }
 
-/// The ten candidates on the bar: the page the writer has paged to, and fewer
-/// than ten on the last one.
+/// The candidates on the bar: the page the writer has paged to.
 ///
-/// Free of the editor for the same reason [`overlay`] is.
-fn candidate_page(candidates: &[String], page: usize) -> &[String] {
-    let from = (page * ime::WANTED).min(candidates.len());
-    let to = (from + ime::WANTED).min(candidates.len());
-    &candidates[from..to]
+/// The pages come from [`ui::candidate_pages`], which is what knows how many
+/// fit. Free of the editor for the same reason [`overlay`] is.
+fn candidate_page<'a>(candidates: &'a [String], pages: &[usize], page: usize) -> &'a [String] {
+    let Some(&from) = pages.get(page) else {
+        return &[];
+    };
+    let to = pages.get(page + 1).copied().unwrap_or(candidates.len());
+    &candidates[from.min(candidates.len())..to.min(candidates.len())]
 }
 
 /// What floats beside the caret right now.
@@ -4394,16 +4462,114 @@ fn page_composition(preedit: &str, sink: Sink) -> &str {
 ///
 /// A word composed into the *replacement* leaves the query alone, so the count
 /// still describes exactly what is on the field beside it and stays up.
-fn find_count(query_empty: bool, composing_query: bool, at: usize, total: usize) -> String {
+/// What the editor knows that the strip has to say: the numbers and the states
+/// that are not fixed words.
+struct Readouts {
+    /// Whether the query is empty, where the search is, and how many hits.
+    count: Option<(bool, usize, usize)>,
+    /// A half-typed CJK word in the query, which puts the count out of step
+    /// with what is beside it.
+    composing: bool,
+    /// Whether `All` is waiting for a second tap.
+    armed: bool,
+    /// Which page of a panel's list, and how many there are.
+    page: (usize, usize),
+}
+
+/// Cut a strip to what the panel can hold.
+///
+/// The order things are given up in, and why, is on [`Editor::strip_fitted`].
+/// Free of the editor so that it runs against a stub metric on the host, the
+/// device's faces not existing there.
+fn fit_strip(
+    width: u16,
+    wanted: Vec<Bar>,
+    readouts: &Readouts,
+    mut measure: impl FnMut(&str) -> u16,
+) -> (Vec<Bar>, Vec<String>) {
+    for short in [false, true] {
+        let labels = cell_words(&wanted, short, readouts);
+        if strip_holds(width, &wanted, &labels, &mut measure) {
+            return (wanted, labels);
+        }
+    }
+    let bare: Vec<Bar> = wanted.into_iter().filter(|b| !b.is_readout()).collect();
+    let labels = cell_words(&bare, true, readouts);
+    (bare, labels)
+}
+
+/// What each cell says, in the strip's own words or in its shorter ones.
+///
+/// The fields are left blank: a field is sized by what the other cells leave,
+/// so it cannot be written alongside them.
+fn cell_words(bars: &[Bar], short: bool, readouts: &Readouts) -> Vec<String> {
+    let (at, of) = readouts.page;
+    let page = if short {
+        format!("{at}/{of}")
+    } else {
+        format!("{at} of {of}")
+    };
+    bars.iter()
+        .map(|b| match b {
+            Bar::PageAt => page.clone(),
+            Bar::Query | Bar::With => String::new(),
+            Bar::Count => readouts
+                .count
+                .map_or_else(String::new, |(empty, at, total)| {
+                    find_count(empty, readouts.composing, short, at, total)
+                }),
+            Bar::All if readouts.armed => "All?".to_string(),
+            other if short => other.short().to_string(),
+            other => other.label().to_string(),
+        })
+        .collect()
+}
+
+/// Whether a strip fits the panel with every cell on it and every field still
+/// worth reading.
+fn strip_holds(
+    width: u16,
+    bars: &[Bar],
+    labels: &[String],
+    mut measure: impl FnMut(&str) -> u16,
+) -> bool {
+    let fields = stretch_cells(bars);
+    let cells: Vec<String> = labels.iter().map(|l| bracket(l)).collect();
+    if ui::cell_bounds(width, &cells, &fields, &mut measure).len() < cells.len() {
+        return false;
+    }
+    if fields.is_empty() {
+        return true;
+    }
+    let others: Vec<String> = cells
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !fields.contains(i))
+        .map(|(_, label)| label.clone())
+        .collect();
+    ui::stretch_room(width, &others, fields.len(), measure) >= ui::FIELD_MIN
+}
+
+fn find_count(
+    query_empty: bool,
+    composing_query: bool,
+    short: bool,
+    at: usize,
+    total: usize,
+) -> String {
     if query_empty || composing_query {
         return String::new();
     }
     if total == 0 {
-        return "not found".to_string();
+        return if short { "none" } else { "not found" }.to_string();
     }
     // How many, not just where — half of what a search bar is for is telling a
     // writer that the word they think they overuse appears eleven times.
-    format!("{} of {total}", at + 1)
+    if short {
+        format!("{}/{total}", at + 1)
+    } else {
+        format!("{} of {total}", at + 1)
+    }
 }
 
 /// A display index as a document one, given where the preedit sits and how long
@@ -5170,6 +5336,29 @@ impl Bar {
             Bar::All => "All",
         }
     }
+
+    /// The word this cell uses when the panel is too narrow for its usual one.
+    ///
+    /// Only where there is a shorter word that means the same thing to the same
+    /// reader. `Prev` for `Previous` is the one abbreviation an English writer
+    /// does not have to think about; `Config` and `Outline` have no such form,
+    /// and inventing one would cost more than the pixels it saved.
+    fn short(self) -> &'static str {
+        match self {
+            Bar::New => "New",
+            Bar::Previous | Bar::PageBack => "Prev",
+            other => other.label(),
+        }
+    }
+
+    /// Whether this cell reports something rather than doing something.
+    ///
+    /// **It is what a strip gives up when it cannot fit.** Losing the count of
+    /// matches costs a writer information they can get by looking; losing
+    /// `[ Done ]` costs them the way out.
+    fn is_readout(self) -> bool {
+        matches!(self, Bar::Count | Bar::PageAt)
+    }
 }
 
 /// What a chip in Config's Keyboard section does.
@@ -5422,6 +5611,212 @@ nine words in this one under the third level
         }
     }
 
+    /// **A row's detail is drawn, not fitted**: it starts at the shared column
+    /// and runs as far as it runs, so a line too long for the panel is cut off
+    /// by the edge of the screen rather than wrapped or shortened. Help is
+    /// where the long ones are — a whole gesture described in a phrase — and it
+    /// is the page a writer reads when something is already not working.
+    #[test]
+    fn no_help_line_runs_off_a_narrow_panel() {
+        use crate::font::Proportional;
+        let items = help_items();
+        for panel in [1264u16, 1272, 1860] {
+            let measure = |s: &str| ui::label_width(&mut Proportional, s, ui::TEXT_PX);
+            let column = ui::chip_column(&items, panel, measure);
+            for item in &items {
+                let ui::Item::Row { label, detail, .. } = item else {
+                    continue;
+                };
+                let end = column + measure(detail);
+                assert!(
+                    end <= panel - ui::MARGIN_X,
+                    "on a {panel} px panel, {label:?} runs to {end}"
+                );
+            }
+        }
+    }
+
+    /// Which candidates are on the bar, given where the pages fall.
+    ///
+    /// The split itself is [`ui::candidate_pages`]'s and tested there; this is
+    /// the other half, and it is the half a digit goes through.
+    mod candidates {
+        use super::*;
+
+        fn list() -> Vec<String> {
+            "你好吗我们".chars().map(|c| c.to_string()).collect()
+        }
+
+        #[test]
+        fn a_page_is_the_run_between_its_start_and_the_next_ones() {
+            let list = list();
+            let pages = vec![0, 2];
+            assert_eq!(candidate_page(&list, &pages, 0), &list[0..2]);
+            assert_eq!(
+                candidate_page(&list, &pages, 1),
+                &list[2..5],
+                "the last page runs to the end of the list"
+            );
+        }
+
+        /// **A page that is not there is empty, not a panic.** The list is
+        /// replaced on every keystroke and can be shorter than it was, and a
+        /// slice past the end of it would take the editor down mid-word.
+        #[test]
+        fn a_page_past_the_end_is_empty() {
+            assert!(candidate_page(&list(), &[0, 2], 2).is_empty());
+            assert!(candidate_page(&list(), &[], 0).is_empty());
+            assert!(candidate_page(&[], &[0], 0).is_empty());
+            assert!(candidate_page(&list(), &[0, 99], 1).is_empty());
+        }
+    }
+
+    /// Every strip [`Editor::strip`] can build, on every panel karyll targets.
+    ///
+    /// **A dropped cell is a control that is not there**, and the strip is what
+    /// a writer with no keyboard has instead of shortcuts — an early device run
+    /// that left `[ Exit ]` unreachable cost a hard reset. The strip was laid
+    /// out on a 10.2″ panel, where all of these fit; the smaller ones are 68%
+    /// of that width.
+    mod strips {
+        use super::*;
+        use crate::font::Proportional;
+
+        /// The panels karyll targets, narrowest first.
+        const PANELS: [u16; 3] = [1264, 1272, 1860];
+
+        /// The strips, as [`Editor::strip`] builds them. Written out rather
+        /// than reached through an `Editor`, which needs a window.
+        fn strips() -> Vec<(&'static str, Vec<Bar>)> {
+            let paging = [Bar::PageBack, Bar::PageAt, Bar::PageOn];
+            let mut out = vec![
+                (
+                    "writing",
+                    vec![Bar::Exit, Bar::Files, Bar::Outline, Bar::Config, Bar::Help],
+                ),
+                ("naming", vec![Bar::Cancel]),
+                ("files", vec![Bar::Done, Bar::New, Bar::Rename]),
+                ("panel", vec![Bar::Done]),
+                (
+                    "find",
+                    vec![
+                        Bar::Query,
+                        Bar::Count,
+                        Bar::Previous,
+                        Bar::Next,
+                        Bar::Replace,
+                        Bar::Done,
+                    ],
+                ),
+                (
+                    "replace",
+                    vec![
+                        Bar::Query,
+                        Bar::With,
+                        Bar::Count,
+                        Bar::Previous,
+                        Bar::Next,
+                        Bar::Change,
+                        Bar::All,
+                        Bar::Done,
+                    ],
+                ),
+            ];
+            // A list longer than the panel adds all three paging cells.
+            for (name, cells) in [("files", 2), ("panel", 3)] {
+                let mut paged = out[cells].1.clone();
+                paged.extend(paging);
+                out.push((name, paged));
+            }
+            out
+        }
+
+        /// The numbers at their longest, which is what the strip has to fit:
+        /// a three-figure count, and a document of twelve pages.
+        fn readouts() -> Readouts {
+            Readouts {
+                count: Some((false, 127, 128)),
+                composing: false,
+                armed: true,
+                page: (8, 12),
+            }
+        }
+
+        fn measure(s: &str) -> u16 {
+            ui::label_width(&mut Proportional, s, ui::TEXT_PX)
+        }
+
+        /// **Every control stays on the strip, at every width.** What the strip
+        /// gives up to manage it is its longer words and then its readouts;
+        /// what it must never give up is a button, which is what
+        /// [`ui::cell_bounds`] does on its own — from the tail, so the first to
+        /// go would be `[ Done ]`.
+        #[test]
+        fn no_strip_drops_a_control_on_any_panel() {
+            for (name, wanted) in strips() {
+                for panel in PANELS {
+                    let (cells, labels) = fit_strip(panel, wanted.clone(), &readouts(), measure);
+                    for bar in &wanted {
+                        assert!(
+                            bar.is_readout() || cells.contains(bar),
+                            "the {name} strip loses {bar:?} on a {panel} px panel"
+                        );
+                    }
+                    let drawn: Vec<String> = labels.iter().map(|l| bracket(l)).collect();
+                    let bounds = ui::cell_bounds(panel, &drawn, &stretch_cells(&cells), measure);
+                    assert_eq!(
+                        bounds.len(),
+                        cells.len(),
+                        "the {name} strip draws only {} of its {} cells on a {panel} px panel",
+                        bounds.len(),
+                        cells.len()
+                    );
+                }
+            }
+        }
+
+        /// A field with no room to show what is being typed into it is a
+        /// control that is present and useless, which the count above would not
+        /// notice.
+        #[test]
+        fn a_find_field_keeps_room_for_what_is_typed_into_it() {
+            for (name, wanted) in strips() {
+                if stretch_cells(&wanted).is_empty() {
+                    continue;
+                }
+                for panel in PANELS {
+                    let (cells, labels) = fit_strip(panel, wanted.clone(), &readouts(), measure);
+                    let fields = stretch_cells(&cells);
+                    let others: Vec<String> = labels
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !fields.contains(i))
+                        .map(|(_, label)| bracket(label))
+                        .collect();
+                    let room = ui::stretch_room(panel, &others, fields.len(), measure);
+                    assert!(
+                        room >= ui::FIELD_MIN,
+                        "the {name} bar's fields get {room} px each on a {panel} px panel"
+                    );
+                }
+            }
+        }
+
+        /// The 10.2″ panel keeps the words it was written with. The narrower
+        /// ones are what the shortening is for, and it must not reach back.
+        #[test]
+        fn the_panel_it_was_written_on_gives_nothing_up() {
+            for (name, wanted) in strips() {
+                let (cells, labels) = fit_strip(1860, wanted.clone(), &readouts(), measure);
+                assert_eq!(cells, wanted, "the {name} strip lost a cell it need not");
+                assert!(
+                    !labels.iter().any(|l| l == "Prev" || l == "New"),
+                    "the {name} strip shortened a word it need not"
+                );
+            }
+        }
+    }
+
     mod replacing {
         use super::*;
 
@@ -5621,17 +6016,17 @@ nine words in this one under the third level
 
     #[test]
     fn the_count_says_nothing_it_cannot_stand_behind() {
-        assert_eq!(find_count(false, false, 2, 12), "3 of 12");
-        assert_eq!(find_count(false, false, 0, 0), "not found");
+        assert_eq!(find_count(false, false, false, 2, 12), "3 of 12");
+        assert_eq!(find_count(false, false, false, 0, 0), "not found");
         // Nothing typed yet: "not found" for an empty search would be an
         // answer to a question nobody asked.
-        assert_eq!(find_count(true, false, 0, 0), "");
+        assert_eq!(find_count(true, false, false, 0, 0), "");
         // And nothing while a word is being composed into the query, because
         // that field is then showing the query plus a half-typed word while the
         // count is still only about the query. A word composed into the
         // replacement leaves the query alone, and the caller says so by passing
         // false — the count stays up.
-        assert_eq!(find_count(false, true, 2, 12), "");
+        assert_eq!(find_count(false, true, false, 2, 12), "");
     }
 
     #[test]

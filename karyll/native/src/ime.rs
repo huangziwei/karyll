@@ -35,16 +35,26 @@
 //!   them first unloads and closes the engine `load()` just built, and
 //!   everything after that runs on freed memory.
 //!
-//! | slot | zh_CN | ja | signature |
-//! |---|---|---|---|
-//! | `+0x00` | `0x1b9c` | `0x218c` | `prv_unload(userData) -> int` |
-//! | `+0x04` | `0x13b8` | `0x1818` | `prv_open(flags, userData) -> int` — begin a session |
-//! | `+0x08` | `0x1ef0` | `0x1c44` | `prv_close(userData) -> int` — ends it, writes the user dictionary |
-//! | `+0x0c` | `0x1a40` | `0x19e4` | `prv_set_surround(str, position, userData) -> int` |
-//! | `+0x10` | `0x117c` | `0x1b00` | `(out: *mut c_char, capacity: usize)` — the composition so far |
-//! | `+0x14` | `0x1528` | `0x2510` | `prv_key_handler(key: u32, userData) -> int` |
-//! | `+0x18` | `0x16fc` | `0x1904` | commit: `(index: u32, userData) -> int` |
-//! | `+0x1c` | `0x1182` | `0x1ce0` | `prv_get_candidate_list(out: *mut *mut c_char, count: *mut u32, userData)` |
+//! | slot | signature |
+//! |---|---|
+//! | `+0x00` | `prv_unload(userData) -> int` |
+//! | `+0x04` | `prv_open(flags, userData) -> int` — begin a session |
+//! | `+0x08` | `prv_close(userData) -> int` — ends it, writes the user dictionary |
+//! | `+0x0c` | `prv_set_surround(str, position, userData) -> int` |
+//! | `+0x10` | `(out: *mut c_char, capacity: usize)` — the composition so far |
+//! | `+0x14` | `prv_key_handler(key: u32, userData) -> int` |
+//! | `+0x18` | commit: `(index: u32, userData) -> int` |
+//! | `+0x1c` | `prv_get_candidate_list(out: *mut *mut c_char, count: *mut u32, userData)` |
+//!
+//! **The order is the ABI. The addresses are not**, and neither is anything
+//! else about a particular build: the same function sits somewhere different in
+//! every firmware, two builds of one language can agree on all their code and
+//! still differ in `.bss`, and an offset copied out of one disassembly points
+//! at arbitrary memory in the next. So no address is written down here. The
+//! plugin is found in `/proc/self/maps` from a pointer it produced itself (see
+//! [`Mapping`]), and the engine state karyll reads directly is found by asking
+//! the running engine — the phonetic context by the magic it stamps on itself,
+//! the pending keys by typing at it and watching which words move.
 //!
 //! Both unnamed slots are unnamed because they carry no entry trace, not
 //! because they are obscure: every other slot logs its own `__func__` and these
@@ -78,6 +88,7 @@
 //! is why they are forwarded rather than special-cased here.
 
 use std::ffi::{c_char, c_void};
+use std::ops::Range;
 
 /// Which language's rules apply — the input method, and the punctuation that
 /// goes with it.
@@ -437,70 +448,41 @@ const MAX_CANDIDATES: usize = 500;
 /// Opaque host cookie, passed last to every slot and only ever logged.
 const USER_DATA: u32 = 0;
 
-/// Where the plugin keeps its ET9 Chinese-phonetic context, as an offset from
-/// the library's load base.
+/// The word the ET9 engine stamps into its Chinese-phonetic context, and where
+/// in the context it puts it.
 ///
-/// The plugin never hands this out — it resolves it PC-relative from its own
-/// `.bss` on every call. It is recovered the same way the plugin does it, from
-/// the literal `+0x1c` loads at `0x11e2` just before `ET9CPBuildSelectionList`:
-/// `word_at(0x1394) + 0x11e8`. The result lands inside `.bss` (which spans
-/// `0x40ec`..`0x3ba20`), which is the check that the arithmetic is right.
-const CP_CONTEXT: usize = 0x31c14;
-
+/// The plugin never hands the context out — it resolves it PC-relative from its
+/// own `.bss` on every call — but it does mark it:
 /// `ET9CPSimplifiedToTraditional` refuses any context whose word at `+0x88` is
-/// not this, so the pointer above can be *verified* rather than trusted. Worth
-/// more than it looks: a wrong context would otherwise be a silent corruption
-/// of the engine's own state.
+/// not this. That makes the mark something to *search for* rather than
+/// something to check a guess against, which is how the context is found.
 const CP_MAGIC_OFFSET: usize = 0x88;
 const CP_MAGIC: u32 = 0x1428_1428;
 
-/// Where the Chinese plugin keeps the keys it has been given and not yet
-/// converted, as an offset from the load base: a count, and then that many
-/// Unicode code points.
+/// 国 and 國 — one character whose Traditional form differs from its
+/// Simplified one, which is enough to tell a real ET9 context from a word that
+/// merely happens to read [`CP_MAGIC`].
+const SIMPLIFIED: u16 = 0x56fd;
+const TRADITIONAL: u16 = 0x570b;
+
+/// Two letters to type at a plugin while watching what it writes.
 ///
-/// **It is the only record of what a partial commit left behind.** Chinese's
-/// composition getter is a stub — `+0x10` writes one NUL and returns — so there
-/// is nowhere else to ask, and the alternative is re-deriving which syllables a
-/// phrase covered, which is the linguistics this file exists to avoid.
-///
-/// `prv_key_handler` appends to it, backspace shortens it, `prv_open` empties
-/// it, and the commit slot rewrites it with whatever the chosen phrase did not
-/// cover. Recovered from the `+0x7d0`/`+0x7d4` loads through all four, against
-/// a `.bss` base of `0x40f0`; the 500 candidate pointers `load()` preallocates
-/// are what fill the `0x7d0` bytes in front of it, which is the check that the
-/// arithmetic lands where it should.
-const ZH_PENDING: usize = 0x48c0;
+/// Any two would do. These are ordinary pinyin and ordinary romaji, so both
+/// engines take them as input rather than as a command, and they are distinct
+/// so that the second says something the first did not.
+const PROBE_KEYS: [char; 2] = ['a', 'b'];
 
 /// The key handler stops recording at 512, so a longer count is a record that
 /// is not this one.
-const ZH_PENDING_MAX: u32 = 512;
-
-/// `+0x10`'s address inside each plugin, which is how the load base is
-/// recovered: the slot pointer minus its known address. Any slot would do; this
-/// one is used because both plugins' `+0x10` bodies are short and distinctive,
-/// so the address was easy to be sure of.
-///
-/// The base is what turns an offset like [`CP_CONTEXT`] or [`JA_STATE_READY`]
-/// into a real pointer, and every use of it is checked against something the
-/// plugin itself wrote.
-const PREEDIT_ADDR_ZH: usize = 0x117c;
-const PREEDIT_ADDR_JA: usize = 0x1b00;
-
-/// Where the Japanese plugin keeps its own state block, as an offset from the
-/// load base, and the readiness flag inside it.
-///
-/// **`load()` hands back a complete-looking vtable even when the engine failed
-/// to come up.** Its error paths log and fall through to the same return, so
-/// the pointer says nothing about whether `wlf_init`, `wlf_load_lang` and
-/// `wlf_set_active_lang` succeeded. This flag is the last thing `load()` writes
-/// and only on the path where all of them did, so it is the difference between
-/// "the plugin loaded" and "Japanese works".
-const JA_STATE: usize = 0x5108;
-const JA_STATE_READY: usize = 0x58;
+const ZH_PENDING_MAX: usize = 512;
 
 /// The composition buffer is 52 bytes and a candidate 50, so this is past any
 /// valid end of either.
 const PREEDIT_CAPACITY: usize = 256;
+
+/// The vtable is eight function pointers. `load()` returns a 48-byte block and
+/// the words past these are its own bookkeeping rather than entry points.
+const SLOTS: usize = 8;
 
 const SLOT_UNLOAD: usize = 0x00;
 const SLOT_OPEN: usize = 0x04;
@@ -534,6 +516,185 @@ fn cstr(s: &str) -> Vec<u8> {
 /// context that fails the magic check, `0x1b` for a null buffer.
 type ToTraditional = unsafe extern "C" fn(*mut c_void, *mut u16, u16) -> i32;
 
+/// Where the kernel says a mapped file is.
+const MAPS: &str = "/proc/self/maps";
+
+/// Where the dynamic linker put a plugin, and what of it karyll may read.
+///
+/// **The kernel is the only authority on where a plugin is.** Every address
+/// inside one moves between builds, so karyll asks rather than assumes, and
+/// then checks every pointer it derives against the answer before reading it.
+/// That is what turns a wrong guess from a corruption of the engine's state
+/// into a message saying Chinese is unavailable.
+///
+/// The object is found from a pointer the plugin itself produced rather than
+/// from the path it was opened under, which is not fussiness:
+/// `libpredictor.so.1` is a symlink to `libpredictor.so.1.0` and
+/// `/proc/self/maps` names the file it resolves to, so the path handed to
+/// `dlopen` never appears there at all.
+struct Mapping {
+    /// What the kernel calls the object. Reported, never matched against.
+    path: String,
+    /// The object's lowest address. Only used to report a discovered address as
+    /// the offset a disassembly would show, which is what makes a device log
+    /// comparable with one.
+    base: usize,
+    /// The executable ranges. A vtable slot outside them is not a function of
+    /// this plugin.
+    code: Vec<Range<usize>>,
+    /// The writable ranges, which is where `.bss` is and therefore where every
+    /// piece of engine state karyll looks for lives.
+    data: Vec<Range<usize>>,
+}
+
+impl Mapping {
+    /// Whether `addr` is code belonging to this object.
+    fn holds_code(&self, addr: usize) -> bool {
+        self.code.iter().any(|r| r.contains(&addr))
+    }
+
+    /// How many words can be read starting at `addr` before the end of the
+    /// range holding it — zero if it is not in writable memory at all.
+    fn words_from(&self, addr: usize) -> usize {
+        self.data
+            .iter()
+            .find(|r| r.contains(&addr))
+            .map_or(0, |r| (r.end - addr) / 4)
+    }
+
+    /// How many words [`Mapping::read`] returns.
+    fn words(&self) -> usize {
+        self.data.iter().map(|r| (r.end - r.start) / 4).sum()
+    }
+
+    /// Where the `index`th word of a [`Mapping::read`] came from.
+    fn address(&self, index: usize) -> Option<usize> {
+        let mut index = index;
+        for r in &self.data {
+            let words = (r.end - r.start) / 4;
+            if index < words {
+                return Some(r.start + index * 4);
+            }
+            index -= words;
+        }
+        None
+    }
+
+    /// Whether word `index` and the one after it are neighbours in memory,
+    /// rather than the last word of one range and the first of the next.
+    fn adjacent(&self, index: usize) -> bool {
+        matches!(
+            (self.address(index), self.address(index + 1)),
+            (Some(a), Some(b)) if b == a + 4
+        )
+    }
+
+    /// Every writable word of the object, in address order.
+    ///
+    /// Volatile because the plugin writes this memory from the other side of an
+    /// FFI call: two of these taken either side of a keystroke are meant to
+    /// differ, and the point of the whole exercise is where.
+    ///
+    /// # Safety
+    /// The ranges must be this process's own, which they are for any `Mapping`
+    /// that came from [`locate`] on [`MAPS`]. The parsing is kept apart from
+    /// the reading so that it can be tested on text.
+    unsafe fn read(&self) -> Vec<u32> {
+        let mut words = Vec::with_capacity(self.words());
+        for r in &self.data {
+            let mut at = r.start;
+            while at + 4 <= r.end {
+                words.push(unsafe { std::ptr::read_volatile(at as *const u32) });
+                at += 4;
+            }
+        }
+        words
+    }
+
+    /// The address of every writable word that reads `value`.
+    ///
+    /// # Safety
+    /// As [`Mapping::read`].
+    unsafe fn scan(&self, value: u32) -> Vec<usize> {
+        unsafe { self.read() }
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word == value)
+            .filter_map(|(i, _)| self.address(i))
+            .collect()
+    }
+}
+
+/// One line of `/proc/self/maps`: an address range, its permissions, and the
+/// file it came from if it came from one.
+struct Row {
+    range: Range<usize>,
+    exec: bool,
+    write: bool,
+    /// Empty for anonymous memory. It is the last column and may hold spaces;
+    /// runs of them collapse here, which costs nothing, because a path is only
+    /// ever compared against another row of the same file and printed.
+    path: String,
+}
+
+fn row(line: &str) -> Option<Row> {
+    let mut fields = line.split_whitespace();
+    let (from, to) = fields.next()?.split_once('-')?;
+    let perms = fields.next()?;
+    Some(Row {
+        range: usize::from_str_radix(from, 16).ok()?..usize::from_str_radix(to, 16).ok()?,
+        exec: perms.contains('x'),
+        write: perms.contains('w'),
+        path: fields.skip(3).collect::<Vec<&str>>().join(" "),
+    })
+}
+
+/// Describe the object holding `addr`, given the text of `/proc/self/maps`.
+///
+/// Pure and separate from every read, so that the parsing is tested against
+/// real map text instead of only ever being exercised on a device.
+fn locate(maps: &str, addr: usize) -> Option<Mapping> {
+    let rows: Vec<Row> = maps.lines().filter_map(row).collect();
+    let path = rows
+        .iter()
+        .find(|r| r.range.contains(&addr))
+        .filter(|r| !r.path.is_empty())?
+        .path
+        .clone();
+    let base = rows
+        .iter()
+        .filter(|r| r.path == path)
+        .map(|r| r.range.start)
+        .min()?;
+    let code = rows
+        .iter()
+        .filter(|r| r.path == path && r.exec)
+        .map(|r| r.range.clone())
+        .collect();
+    let mut data: Vec<Range<usize>> = Vec::new();
+    for r in rows.iter().filter(|r| r.write) {
+        if r.path == path {
+            data.push(r.range.clone());
+        } else if r.path.is_empty() {
+            // `.bss` runs past the end of the file's last page and the loader
+            // maps the remainder anonymously, so writable anonymous memory
+            // butted against the object's own data is the rest of that `.bss`.
+            // It is most of it here: the Chinese plugin's is 228 KB against a
+            // file of 18.
+            match data.last_mut() {
+                Some(last) if last.end == r.range.start => last.end = r.range.end,
+                _ => {}
+            }
+        }
+    }
+    Some(Mapping {
+        path,
+        base,
+        code,
+        data,
+    })
+}
+
 /// One of Amazon's predictor plugins, loaded and ready.
 ///
 /// The ABI is `libkb`'s rather than any one language's, so this is written once
@@ -543,9 +704,9 @@ type ToTraditional = unsafe extern "C" fn(*mut c_void, *mut u16, u16) -> i32;
 struct Plugin {
     table: *const usize,
     handle: *mut c_void,
-    /// Where `+0x10` sits inside this particular plugin, which is what makes
-    /// the load base recoverable.
-    preedit_addr: usize,
+    /// Where this plugin is, and the bounds every pointer derived from it is
+    /// checked against.
+    mapping: Mapping,
 }
 
 impl Plugin {
@@ -557,7 +718,7 @@ impl Plugin {
     /// calls bind under Amazon's own run too. The three XT9 engines are one
     /// build with different embedded data, every entry point at an identical
     /// address, so preloading the wrong one would interpose silently.
-    fn open(path: &str, preedit_addr: usize) -> Result<Plugin, String> {
+    fn open(path: &str) -> Result<Plugin, String> {
         // The host block is what the plugin calls back into. It must hold
         // callable pointers, not zeroes: committing a candidate calls into it,
         // and a zeroed block would be a call through null. karyll does not need
@@ -583,10 +744,43 @@ impl Plugin {
         if table.is_null() {
             return Err(format!("{path}: load() returned null"));
         }
+        let table = table as *const usize;
+
+        // `load()`'s own return value is the one thing here that cannot be
+        // checked before it is read. Everything derived from it is checked
+        // against the mapping the first slot leads to — including the rest of
+        // the table, because the eight slots being these eight functions in
+        // this order is `libkb`'s ABI rather than a fact about a build, and a
+        // firmware that changed it would otherwise be a call through whatever
+        // took their place. The Thumb bit comes off first: in a Thumb-2 build
+        // every one of these addresses is odd.
+        let slots: Vec<usize> = (0..SLOTS).map(|i| unsafe { *table.add(i) } & !1).collect();
+        let maps = std::fs::read_to_string(MAPS)
+            .map_err(|e| format!("{path}: cannot read {MAPS}: {e}"))?;
+        let open_at = slots[SLOT_OPEN / 4];
+        let mapping = locate(&maps, open_at).ok_or_else(|| {
+            format!(
+                "{path}: load() returned a table whose open slot ({open_at:#x}) \
+                 is in no mapped file"
+            )
+        })?;
+        if let Some((slot, at)) = slots
+            .iter()
+            .enumerate()
+            .find(|(_, at)| !mapping.holds_code(**at))
+        {
+            return Err(format!(
+                "{path}: vtable slot +{:#04x} is {at:#x}, which is not code in {} — the plugin's \
+                 table is not the one karyll was written against",
+                slot * 4,
+                mapping.path
+            ));
+        }
+        eprintln!("ime: {} mapped at {:#x}", mapping.path, mapping.base);
         Ok(Plugin {
-            table: table as *const usize,
+            table,
             handle,
-            preedit_addr,
+            mapping,
         })
     }
 
@@ -594,11 +788,10 @@ impl Plugin {
         unsafe { *self.table.add(byte_offset / 4) }
     }
 
-    /// Where the plugin was mapped, from a slot pointer and its known address.
-    /// The Thumb bit has to come off first — every one of these addresses is
-    /// odd in the table.
-    fn base(&self) -> Option<usize> {
-        (self.slot(SLOT_PREEDIT) & !1).checked_sub(self.preedit_addr)
+    /// A discovered address as the offset a disassembly of the plugin would
+    /// show it at, which is the only form worth printing.
+    fn offset_of(&self, addr: usize) -> usize {
+        addr.saturating_sub(self.mapping.base)
     }
 
     fn symbol(&self, name: &str) -> *mut c_void {
@@ -704,59 +897,110 @@ pub struct Chinese {
     /// Whether to convert what the engine offers.
     want_traditional: bool,
     /// The plugin's record of the keys it is still holding, once the plugin has
-    /// confirmed it is where [`ZH_PENDING`] says. `None` costs partial commits,
-    /// not Chinese input.
-    pending: Option<*const u32>,
+    /// shown karyll where it keeps it. `None` costs partial commits, not
+    /// Chinese input.
+    pending: Option<Pending>,
+}
+
+/// The two places the Chinese plugin keeps what it has not converted yet: how
+/// many keys it is holding, and the keys themselves.
+///
+/// **Two pointers rather than one and a `+4`.** They sit side by side in some
+/// builds and 57 KB apart in others, so their being neighbours is a fact about
+/// one build rather than about the record.
+struct Pending {
+    count: *const u32,
+    keys: *const u32,
+    /// How many keys can be read before the end of the mapping holding them, so
+    /// that a count karyll has misread cannot walk off it.
+    room: usize,
 }
 
 impl Chinese {
     pub fn open() -> Result<Chinese, String> {
-        let plugin = Plugin::open(PLUGIN_ZH, PREEDIT_ADDR_ZH)
-            .map_err(|e| format!("{e} — no Chinese input"))?;
+        let plugin = Plugin::open(PLUGIN_ZH).map_err(|e| format!("{e} — no Chinese input"))?;
         let mut zh = Chinese {
             plugin,
             converter: None,
             want_traditional: false,
             pending: None,
         };
-        zh.find_converter();
         // Begin a session. Skipping this produced identical candidates on
         // device, so nothing Chinese depends on it, but it is the documented
-        // lifecycle and it costs one call at startup.
+        // lifecycle, it costs one call at startup, and both searches below want
+        // an engine that has been given no keys yet.
         let st = zh.plugin.call_open();
         if st != 0 {
             eprintln!("ime: zh prv_open returned {st}, continuing");
         }
+        zh.find_converter();
         zh.find_pending();
         Ok(zh)
     }
 
-    /// Find the plugin's record of the keys it has not converted yet, by
-    /// watching it keep one.
+    /// Find where the plugin keeps the keys it has not converted yet, by
+    /// watching it keep some.
     ///
-    /// An offset read out of a disassembly is a guess until the plugin agrees
-    /// with it, and this one can be *asked*: an open session holds no keys, a
-    /// key makes it hold that key, and reopening puts it back. A record that
-    /// does all three is the record, and the probe costs three calls at startup
+    /// **Both halves are found by what they do, not by where they once were.**
+    /// An open session holds no keys; a key makes it hold that key; a second
+    /// makes it hold two; reopening empties it again. So the plugin's writable
+    /// memory is copied at each of those four moments, and the words that told
+    /// that story are the record: the count is the word that read 0, 1, 2, 0,
+    /// and the keys are the pair that became `a`, then `a` and `b`.
+    ///
+    /// They are searched for independently because they are not always
+    /// neighbours. Where a counter does sit immediately in front of the array
+    /// it is preferred over one further off, since that is the count *of that
+    /// array* rather than some other tally that also went up.
+    ///
+    /// The search costs four copies of a few hundred kilobytes and three calls,
     /// and leaves the session exactly as it found it.
     fn find_pending(&mut self) {
-        let Some(base) = self.plugin.base() else {
-            eprintln!("ime: cannot recover the zh plugin's load base");
-            return;
-        };
-        let at = (base + ZH_PENDING) as *const u32;
-        let empty = unsafe { *at };
-        self.plugin.call_key('a');
-        let (one, first) = unsafe { (*at, *at.add(1)) };
+        let quiet = unsafe { self.plugin.mapping.read() };
+        self.plugin.call_key(PROBE_KEYS[0]);
+        let one = unsafe { self.plugin.mapping.read() };
+        self.plugin.call_key(PROBE_KEYS[1]);
+        let two = unsafe { self.plugin.mapping.read() };
         self.plugin.call_open();
-        if (empty, one, first) != (0, 1, 'a' as u32) {
+        let emptied = unsafe { self.plugin.mapping.read() };
+
+        let map = &self.plugin.mapping;
+        let (first, second) = (PROBE_KEYS[0] as u32, PROBE_KEYS[1] as u32);
+        let counts: Vec<usize> = (0..quiet.len())
+            .filter(|&i| (quiet[i], one[i], two[i], emptied[i]) == (0, 1, 2, 0))
+            .collect();
+        let keys: Vec<usize> = (0..quiet.len().saturating_sub(1))
+            .filter(|&i| (quiet[i], quiet[i + 1]) == (0, 0))
+            .filter(|&i| (one[i], two[i], two[i + 1]) == (first, first, second))
+            .filter(|&i| map.adjacent(i))
+            .collect();
+
+        let found = keys.first().and_then(|&keys_at| {
+            let count_at = counts
+                .iter()
+                .find(|&&i| i + 1 == keys_at && map.adjacent(i))
+                .or(counts.first())?;
+            Some((map.address(*count_at)?, map.address(keys_at)?))
+        });
+        let Some((count, keys_at)) = found else {
             eprintln!(
-                "ime: the zh pending-key record at {at:p} reads {empty}, then {one}/{first:#x} \
-                 — a candidate covering part of a word will end it"
+                "ime: the zh plugin's pending-key record did not show itself \
+                 ({} counters, {} arrays) — a candidate covering part of a word will end it",
+                counts.len(),
+                keys.len()
             );
             return;
-        }
-        self.pending = Some(at);
+        };
+        eprintln!(
+            "ime: the zh plugin holds its pending keys at +{:#x}, counted at +{:#x}",
+            self.plugin.offset_of(keys_at),
+            self.plugin.offset_of(count)
+        );
+        self.pending = Some(Pending {
+            count: count as *const u32,
+            keys: keys_at as *const u32,
+            room: self.plugin.mapping.words_from(keys_at),
+        });
     }
 
     /// The reading the plugin is still holding, as the letters it was sent.
@@ -767,14 +1011,14 @@ impl Chinese {
     /// not pinyin says the record is not the one this was written against, and
     /// is `None` for the same reason.
     fn pending(&self) -> Option<String> {
-        let at = self.pending?;
-        let count = unsafe { *at };
-        if count > ZH_PENDING_MAX {
+        let at = self.pending.as_ref()?;
+        let count = unsafe { std::ptr::read_volatile(at.count) } as usize;
+        if count > ZH_PENDING_MAX || count > at.room {
             return None;
         }
-        (0..count as usize)
+        (0..count)
             .map(|i| {
-                char::from_u32(unsafe { *at.add(1 + i) })
+                char::from_u32(unsafe { std::ptr::read_volatile(at.keys.add(i)) })
                     .filter(|c| c.is_ascii_alphabetic() || *c == '\'')
             })
             .collect()
@@ -799,31 +1043,43 @@ impl Chinese {
     ///
     /// The device has one Chinese dictionary and it is Simplified, so this is
     /// the only route to Traditional that keeps pinyin as the input method.
-    /// Both halves are checked before either is kept: a wrong context would not
-    /// merely fail, it would let a stranger's pointer into the engine's state.
+    ///
+    /// **The context is searched for rather than known.** It is a static inside
+    /// the plugin that moves with every build, and it announces itself: the
+    /// engine stamps [`CP_MAGIC`] into it, which is the check
+    /// `ET9CPSimplifiedToTraditional` itself performs. So the magic is what is
+    /// looked for in the plugin's writable memory, and a character that changes
+    /// between the scripts is what confirms a hit — a word that merely happens
+    /// to read the magic would not merely fail, it would let a stranger's
+    /// pointer into the engine's state.
     fn find_converter(&mut self) {
         let convert = self.plugin.symbol("ET9CPSimplifiedToTraditional");
         if convert.is_null() {
             eprintln!("ime: no ET9CPSimplifiedToTraditional — Traditional unavailable");
             return;
         }
-        let Some(base) = self.plugin.base() else {
-            eprintln!("ime: cannot recover the zh plugin's load base");
-            return;
-        };
-        let ctx = (base + CP_CONTEXT) as *mut c_void;
-        let magic = unsafe { *(ctx.byte_add(CP_MAGIC_OFFSET) as *const u32) };
-        if magic != CP_MAGIC {
+        let convert = unsafe { std::mem::transmute::<*mut c_void, ToTraditional>(convert) };
+        let marked = unsafe { self.plugin.mapping.scan(CP_MAGIC) };
+        for at in &marked {
+            let Some(ctx) = at.checked_sub(CP_MAGIC_OFFSET) else {
+                continue;
+            };
+            let ctx = ctx as *mut c_void;
+            if !converts(convert, ctx) {
+                continue;
+            }
             eprintln!(
-                "ime: CP context at {ctx:p} reads 0x{magic:08x}, not 0x{CP_MAGIC:08x} — Traditional unavailable"
+                "ime: Traditional conversion available, the ET9 context at +{:#x}",
+                self.plugin.offset_of(ctx as usize)
             );
+            self.converter = Some((convert, ctx));
             return;
         }
-        self.converter = Some((
-            unsafe { std::mem::transmute::<*mut c_void, ToTraditional>(convert) },
-            ctx,
-        ));
-        eprintln!("ime: Traditional conversion available");
+        eprintln!(
+            "ime: no ET9 phonetic context in the zh plugin ({} words carry the mark, none \
+             converts) — Traditional unavailable",
+            marked.len()
+        );
     }
 
     /// Convert one candidate to Traditional, in the engine's own terms.
@@ -849,6 +1105,17 @@ impl Chinese {
         }
         String::from_utf16_lossy(&buf)
     }
+}
+
+/// Whether a candidate context really is the engine's own, asked by converting
+/// a character that differs between the scripts.
+///
+/// The magic is the engine's own check on the pointer; this is karyll's. 国
+/// comes back as 國 only from a context that is what it claims to be.
+fn converts(convert: ToTraditional, ctx: *mut c_void) -> bool {
+    let mut buf = [SIMPLIFIED];
+    let st = unsafe { convert(ctx, buf.as_mut_ptr(), 1) };
+    st == 0 && buf[0] == TRADITIONAL
 }
 
 impl Ime for Chinese {
@@ -899,8 +1166,7 @@ pub struct Japanese {
 
 impl Japanese {
     pub fn open() -> Result<Japanese, String> {
-        let plugin = Plugin::open(PLUGIN_JA, PREEDIT_ADDR_JA)
-            .map_err(|e| format!("{e} — no Japanese input"))?;
+        let plugin = Plugin::open(PLUGIN_JA).map_err(|e| format!("{e} — no Japanese input"))?;
 
         // **Unlike Chinese, opening the session is mandatory**, and this is the
         // one place the two lifecycles genuinely differ. `prv_open` sets the
@@ -913,19 +1179,28 @@ impl Japanese {
             eprintln!("ime: ja prv_open returned {st}, continuing");
         }
 
-        // `load()` returns a complete-looking table whether or not the engine
-        // came up, so ask the plugin what it thinks rather than trusting the
-        // pointer. Without this the failure mode is an editor that swallows
-        // every keystroke and shows nothing.
-        let Some(base) = plugin.base() else {
-            return Err("cannot recover the ja plugin's load base".into());
-        };
-        let ready = unsafe { *((base + JA_STATE + JA_STATE_READY) as *const u32) };
-        if ready != 1 {
-            return Err(format!(
-                "the ja plugin loaded but its engine did not come up (ready={ready}) \
-                 — check that /usr/share/keyboard/ja/JA.conf and the iWnn dictionaries are present"
-            ));
+        // **`load()` returns a complete-looking table whether or not the engine
+        // came up.** Its error paths log and fall through to the same return,
+        // so the pointer says nothing about whether `wlf_init`, `wlf_load_lang`
+        // and `wlf_set_active_lang` succeeded, and without a check here the
+        // failure is an editor that swallows every keystroke and shows nothing.
+        //
+        // So type at it. An engine that came up answers a letter — with kana
+        // from its own transliteration, with conversions of that kana, usually
+        // both — and one that did not answers neither. That is the same
+        // question the flag `load()` writes would answer, asked in a way that
+        // needs no address, which is what makes it survive a firmware.
+        plugin.call_key(PROBE_KEYS[0]);
+        let candidates = plugin.call_candidates().len();
+        let composed = plugin.call_preedit();
+        plugin.call_open();
+        if candidates == 0 && composed.is_none() {
+            return Err(
+                "the ja plugin loaded but its engine did not come up — it composed nothing from a \
+                 key and offered nothing to convert it to; check that \
+                 /usr/share/keyboard/ja/JA.conf and the iWnn dictionaries are present"
+                    .into(),
+            );
         }
         Ok(Japanese { plugin })
     }
@@ -1303,6 +1578,132 @@ mod tests {
         ime.key('\u{8}');
         ime.key('\u{8}');
         assert_eq!(ime.preedit().as_deref(), Some("に"));
+    }
+
+    /// Finding a plugin in memory, which is everything about the discovery that
+    /// can be tested without one. What is left over — the magic scan, the
+    /// pending-key search, the Japanese engine answering a letter — is a
+    /// conversation with a proprietary library and happens on the device.
+    mod mapping {
+        use super::*;
+
+        /// An armv7 Kindle's `/proc/self/maps`, cut to karyll, the Chinese
+        /// plugin, the XT9 engine it pulled in, and the neighbours that make
+        /// the rules matter. The columns are the kernel's: range, permissions,
+        /// file offset, device, inode, and the path if there is one.
+        const KINDLE: &str = "\
+00010000-000d4000 r-xp 00000000 b3:0c 2101       /mnt/us/extensions/karyll/bin/karyll
+000e3000-000e5000 rw-p 000c3000 b3:0c 2101       /mnt/us/extensions/karyll/bin/karyll
+000e5000-00107000 rw-p 00000000 00:00 0          [heap]
+b6a1c000-b6a3f000 r-xp 00000000 b3:0c 1190       /usr/lib/libxt9a.so.1.0
+b6a3f000-b6a4e000 ---p 00023000 b3:0c 1190       /usr/lib/libxt9a.so.1.0
+b6a4e000-b6a4f000 rw-p 00022000 b3:0c 1190       /usr/lib/libxt9a.so.1.0
+b6d2a000-b6d2f000 r-xp 00000000 b3:0c 1187       /usr/share/keyboard/zh_CN/libpredictor.so.1.0
+b6d2f000-b6d3e000 ---p 00005000 b3:0c 1187       /usr/share/keyboard/zh_CN/libpredictor.so.1.0
+b6d3e000-b6d3f000 r--p 00004000 b3:0c 1187       /usr/share/keyboard/zh_CN/libpredictor.so.1.0
+b6d3f000-b6d40000 rw-p 00005000 b3:0c 1187       /usr/share/keyboard/zh_CN/libpredictor.so.1.0
+b6d40000-b6d78000 rw-p 00000000 00:00 0
+b6e00000-b6e21000 rw-p 00000000 00:00 0
+b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
+";
+
+        /// Somewhere in the Chinese plugin's code, which is the only sort of
+        /// address karyll has to start from: a vtable slot.
+        const A_SLOT: usize = 0xb6d2_a3c4;
+
+        /// **The path karyll opens is not the path the kernel reports.**
+        /// `libpredictor.so.1` is a symlink, `/proc/self/maps` names what it
+        /// resolves to, and looking the object up by the name it was opened
+        /// under would therefore find nothing at all.
+        #[test]
+        fn the_plugin_is_found_from_its_own_pointer_rather_than_from_a_path() {
+            assert!(KINDLE.lines().filter_map(row).all(|r| r.path != PLUGIN_ZH));
+            let map = locate(KINDLE, A_SLOT).expect("a slot lands in the plugin");
+            assert_eq!(map.path, "/usr/share/keyboard/zh_CN/libpredictor.so.1.0");
+            assert_eq!(map.base, 0xb6d2_a000);
+        }
+
+        /// `.bss` is a few hundred kilobytes against a file of eighteen, so
+        /// almost all of it is the anonymous mapping the loader puts on the end
+        /// — and every address karyll goes looking for is in there.
+        #[test]
+        fn the_bss_past_the_end_of_the_file_belongs_to_the_object() {
+            let map = locate(KINDLE, A_SLOT).unwrap();
+            assert_eq!(map.data, vec![0xb6d3_f000..0xb6d7_8000]);
+        }
+
+        /// Writable anonymous memory that is *not* butted against the object is
+        /// somebody else's, and neither is a heap, whatever it is next to.
+        #[test]
+        fn the_neighbours_are_left_alone() {
+            let plugin = locate(KINDLE, A_SLOT).unwrap();
+            assert_eq!(plugin.words_from(0xb6e0_0000), 0);
+            let karyll = locate(KINDLE, 0x0001_0100).unwrap();
+            assert_eq!(karyll.data, vec![0x000e_3000..0x000e_5000]);
+        }
+
+        /// The check that a vtable is still the vtable: eight pointers into
+        /// this plugin's own code. The engine's code is not this plugin's, and
+        /// neither is the plugin's own data.
+        #[test]
+        fn only_this_objects_code_counts_as_a_slot() {
+            let map = locate(KINDLE, A_SLOT).unwrap();
+            assert!(map.holds_code(A_SLOT));
+            assert!(!map.holds_code(0xb6d3_f100));
+            assert!(!map.holds_code(0xb6a1_c100));
+            assert!(!map.holds_code(0xb6f0_0100));
+        }
+
+        /// A code pointer in anonymous memory names no file, and an address in
+        /// nothing at all names nothing. Either way there is no object to check
+        /// the rest of the table against, so there is no plugin.
+        #[test]
+        fn a_pointer_into_no_file_locates_nothing() {
+            assert!(locate(KINDLE, 0xb6e0_0100).is_none());
+            assert!(locate(KINDLE, 0xdead_0000).is_none());
+        }
+
+        /// Two writable segments with a gap between them, which is what the
+        /// word indexing has to survive: the words are contiguous and the
+        /// addresses are not.
+        const SPLIT: &str = "\
+00010000-00011000 r-xp 00000000 00:01 7          /a/plugin.so
+00011000-00012000 rw-p 00001000 00:01 7          /a/plugin.so
+00013000-00014000 rw-p 00002000 00:01 7          /a/plugin.so
+";
+
+        #[test]
+        fn a_word_knows_which_address_it_came_from() {
+            let map = locate(SPLIT, 0x0001_0100).unwrap();
+            assert_eq!(map.words(), 2048);
+            assert_eq!(map.address(0), Some(0x0001_1000));
+            assert_eq!(map.address(1023), Some(0x0001_1ffc));
+            assert_eq!(map.address(1024), Some(0x0001_3000));
+            assert_eq!(map.address(2047), Some(0x0001_3ffc));
+            assert_eq!(map.address(2048), None);
+        }
+
+        /// **Two words next to each other in a snapshot need not be next to
+        /// each other in memory**, and the pending-key search reads a pair, so
+        /// it asks. Without this it could take the last word of one segment and
+        /// the first of another for an array of two.
+        #[test]
+        fn the_last_word_of_a_segment_has_no_neighbour() {
+            let map = locate(SPLIT, 0x0001_0100).unwrap();
+            assert!(map.adjacent(0));
+            assert!(!map.adjacent(1023));
+            assert!(map.adjacent(1024));
+            assert!(!map.adjacent(2047));
+        }
+
+        /// What stops a misread count from walking off the end of the mapping.
+        #[test]
+        fn there_is_only_so_much_room_after_an_address() {
+            let map = locate(SPLIT, 0x0001_0100).unwrap();
+            assert_eq!(map.words_from(0x0001_3000), 1024);
+            assert_eq!(map.words_from(0x0001_3ff0), 4);
+            assert_eq!(map.words_from(0x0001_2000), 0);
+        }
     }
 
     mod composing {

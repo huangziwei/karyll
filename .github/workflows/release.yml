@@ -89,7 +89,9 @@ jobs:
         env:
           VERSION: ${{ github.event.release.tag_name || github.ref_name }}
         run: |
-          name="karyll-$VERSION-kindle-scribe"
+          # One asset, not one per model: nothing about the build is told which
+          # Kindle it is for, so there is nothing to name it after.
+          name="karyll-$VERSION-kindle"
           # Zipped from inside deploy/out so the archive opens onto
           # extensions/ and documents/, which are what get dragged to /mnt/us.
           (cd deploy/out && zip -qr "../$name.zip" .)

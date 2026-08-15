@@ -36,15 +36,21 @@ const EV_ABS: u16 = 3;
 const EV_KEY_BIT: u32 = 1 << EV_KEY;
 const EV_ABS_BIT: u32 = 1 << EV_ABS;
 
-/// The three axes, and the fourth thing this driver reports.
+/// The three axes, and the fourth thing these drivers report.
 ///
 /// `ABS=1000007` on the Scribe's `kx132-accel` sets bits 0, 1, 2 and **24**.
 /// The first three are `ABS_X`, `ABS_Y`, `ABS_Z`. Code 24 is `ABS_PRESSURE` in
 /// the kernel's own headers, which an accelerometer plainly does not have — the
 /// driver has repurposed a spare code, and given that it logs
 /// `KX132_1211_TSCP` and `Orientation state is face up` around the same events,
-/// it is very likely the tilt position. That is a guess until a device run
-/// says otherwise, which is why it is carried through with a neutral name.
+/// it is very likely the tilt position.
+///
+/// A second Kindle says the same thing from the other direction. There the
+/// accelerometer is split in two: a polling node with the three axes and
+/// nothing else, and an interrupt node advertising **only** bits 24 and 25 —
+/// and it is the interrupt node that the framework's own udev rules hand to X,
+/// "to save power". A code that is the whole of what the rotation path carries
+/// on a part from a different maker is the rotation.
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const ABS_Z: u16 = 0x02;
@@ -205,26 +211,35 @@ pub fn pick_touchscreen(raw: &str) -> Option<String> {
         .and_then(|b| b.handler)
 }
 
-/// Choose the accelerometer, returning its `eventN` handler.
+/// Choose the node that says which way the device is being held, returning its
+/// `eventN` handler.
 ///
-/// The rule is **reports three spatial axes and no keys**, which is what
-/// separates an accelerometer from a pointer and from the other sensors sharing
-/// the bus:
+/// **The rule is [`ABS_TILT`] and no keys**, which is to say: karyll wants the
+/// node that carries the one code it reads, and a pen carries that code too but
+/// carries buttons with it.
 ///
 /// | device | `EV=` | `ABS=` | has KEY | |
 /// |---|---|---|---|---|
 /// | `bd71828-pwrkey` | `3` | — | yes | rejected |
 /// | `kx132-accel` | `9` | `1000007` | no | **picked** |
-/// | `bma2x2` | `9` | `100 7` | no | **picked** |
+/// | `bma_interrupt` | `d` | `3000000` | no | **picked** |
+/// | `bma2x2` | `9` | `100 7` | no | rejected |
 /// | `max44009_als` | `9` | `100 0` | no | rejected |
-/// | `bma_interrupt` | `d` | `3000000` | no | rejected |
-/// | `WacomDigitizer`, `pt_mt`, `stylus-custom` | `b`/`f` | | yes | rejected |
+/// | `WacomDigitizer`, `pt_mt`, `stylus-custom` | `b`/`f` | `f000003` | yes | rejected |
 ///
-/// Axes were added to the rule because "absolute axes and no keys" is also an
-/// ambient light sensor, and a device that has one lists it first: on that
-/// Kindle the editor opened `max44009_als` and read brightness as orientation.
-/// `bma_interrupt` is the same accelerometer as `bma2x2` reported through the
-/// interrupt path X uses, and reports neither X nor Y.
+/// **The three spatial axes are the wrong rule**, though they look like the
+/// obvious one and were tried first. On the Scribe they come on the same node
+/// as the tilt code, so the two rules agree and neither is tested; on a Kindle
+/// whose accelerometer is split in two they disagree, and the axes pick the
+/// polling node — which reports the vector nothing may depend on, does not
+/// report the tilt at all, and is the node the framework's own udev rules
+/// deliberately do not use, "to save power". The result would be an editor that
+/// never turns over.
+///
+/// A light sensor is rejected by the same rule that a moment ago needed the
+/// axes to reject it: `max44009_als` advertises `ABS_MISC` and nothing else,
+/// and a device that has one lists it first, so before any of this the editor
+/// opened it and read brightness as orientation.
 ///
 /// Matching on the name would have been easier and wrong: the udev rules ship
 /// `60-kx132.rules`, `60-bma2x2.rules` and `60-bma4xy.rules`, so the part
@@ -232,13 +247,7 @@ pub fn pick_touchscreen(raw: &str) -> Option<String> {
 fn pick_accelerometer(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
-        .find(|b| {
-            b.ev & EV_ABS_BIT != 0
-                && b.ev & EV_KEY_BIT == 0
-                && [ABS_X, ABS_Y, ABS_Z]
-                    .iter()
-                    .all(|&axis| advertises(&b.abs, axis))
-        })
+        .find(|b| b.ev & EV_ABS_BIT != 0 && b.ev & EV_KEY_BIT == 0 && advertises(&b.abs, ABS_TILT))
         .and_then(|b| b.handler)
 }
 
@@ -543,12 +552,15 @@ B: KEY=3ffffff fffffffc
         assert_eq!(pick_touchscreen("I: Bus=0000\nN: Name=\"pwrkey\"\n"), None);
     }
 
+    /// **The node that carries the tilt code, not the one that looks like an
+    /// accelerometer.** One Kindle puts both on `kx132-accel`; the other splits
+    /// them, and there the axes are on `event7` and the tilt is on `event8`.
+    /// Picking by the axes takes `event7`, which never reports a tilt — an
+    /// editor that quietly stops turning over.
     #[test]
-    fn the_accelerometer_is_picked_over_the_other_sensors() {
+    fn the_tilt_is_picked_over_the_other_sensors() {
         assert_eq!(pick_accelerometer(CAPTURE).as_deref(), Some("event1"));
-        // Two light sensors and an interrupt mirror are listed before the real
-        // one; without the axes in the rule the first of them wins.
-        assert_eq!(pick_accelerometer(OASIS2).as_deref(), Some("event7"));
+        assert_eq!(pick_accelerometer(OASIS2).as_deref(), Some("event8"));
     }
 
     #[test]

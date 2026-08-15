@@ -901,6 +901,33 @@ impl Metrics for Stub {
     }
 }
 
+/// Metrics in the proportions the real faces have: a Han glyph is one em wide
+/// and a Latin one about half.
+///
+/// [`Stub`]'s flat ten units are easier to check arithmetic against, and they
+/// say nothing at all about how wide CJK draws — a Han character and a comma
+/// cost the same there. Anything asking whether text *fits* has to know the
+/// difference, because the answer is where every fitting bug comes from: ten
+/// four-character candidates want more than a 7″ panel is wide and less than a
+/// 10.2″ one is, and a stub that measures them alike sees neither case.
+#[cfg(test)]
+pub struct Proportional;
+
+#[cfg(test)]
+impl Metrics for Proportional {
+    fn advance(&mut self, role: Role, px: f32, _ch: char) -> f32 {
+        if role.is_han() { px } else { px * 0.5 }
+    }
+
+    fn line_height(&mut self, px: f32, roles: &[Role]) -> f32 {
+        Stub.line_height(px, roles)
+    }
+
+    fn ascent(&mut self, px: f32, roles: &[Role]) -> f32 {
+        Stub.ascent(px, roles)
+    }
+}
+
 #[cfg(test)]
 fn is_han(role: &Role) -> bool {
     matches!(role, Role::Han | Role::HanEmphasis | Role::HanBold)

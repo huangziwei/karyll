@@ -265,18 +265,42 @@ pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str
 /// reason [`cell_bounds`] is: a chip is only as wide as its own text, so
 /// anything that measured them a second time would put a finger on a different
 /// one. A chip that runs past the right margin is dropped rather than shrunk,
-/// the rule the candidate bar already follows.
+/// the rule the candidate bar follows in [`candidate_pages`].
+///
+/// **The shared column is a courtesy, and a row that cannot afford it keeps its
+/// own.** Seven type sizes need 722 px of chips and a 7″ panel leaves 788 from
+/// the column — eight per cent, which is not a margin, it is a coincidence. A
+/// row whose chips do not all fit therefore starts them just past its own
+/// label instead, which on a short label like `Size` is 240 px further left. It
+/// steps that row out of the table, and that is the trade the whole page is
+/// laid out under: a label running under its own chips is a cosmetic fault, a
+/// control that is not on the page is not.
 pub fn chip_bounds(
     column: u16,
     width: u16,
+    label: &str,
     options: &[String],
     mut measure_text: impl FnMut(&str) -> u16,
 ) -> Vec<(u16, u16)> {
     let right = width.saturating_sub(MARGIN_X);
+    let widths: Vec<u16> = options
+        .iter()
+        .map(|option| measure_text(option).saturating_add(CHIP_PAD * 2))
+        .collect();
+    let wanted = widths
+        .iter()
+        .fold(0u16, |sum, w| sum.saturating_add(*w))
+        .saturating_add(CHIP_GAP * widths.len().saturating_sub(1) as u16);
+    // Its own label only when that is further left than the column: a row with
+    // the longest label on the page is the one the column was measured from,
+    // and starting after it again would gain nothing.
+    let mut x = if column.saturating_add(wanted) <= right {
+        column
+    } else {
+        (ROW_INSET + measure_text(label) + CHIP_GAP).min(column)
+    };
     let mut out = Vec::new();
-    let mut x = column;
-    for label in options {
-        let w = measure_text(label).saturating_add(CHIP_PAD * 2);
+    for w in widths {
         if x.saturating_add(w) > right {
             break;
         }
@@ -368,9 +392,9 @@ pub fn hit(
             }
             Some(Hit::Row(index))
         }
-        Item::Choice { options, .. } => {
+        Item::Choice { label, options, .. } => {
             let column = chip_column(items, width, &mut measure_text);
-            let bounds = chip_bounds(column, width, options, &mut measure_text);
+            let bounds = chip_bounds(column, width, label, options, &mut measure_text);
             cell_at(&bounds, x).map(|option| Hit::Option(index, option))
         }
     }
@@ -444,7 +468,7 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                 draw_line(
                     window, fonts, label, ROW_INSET, middle, TEXT_PX, false, BLACK,
                 );
-                let bounds = chip_bounds(column, width, options, |s| {
+                let bounds = chip_bounds(column, width, label, options, |s| {
                     measure(fonts, s, TEXT_PX) as u16
                 });
                 for (o, _) in bounds.iter().enumerate() {
@@ -533,9 +557,9 @@ pub fn paint_chip(
             draw_chip(window, fonts, rect, label, false, pressed);
             rect
         }
-        Some(Item::Choice { options, on, .. }) => {
+        Some(Item::Choice { label, options, on }) => {
             let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
-            let bounds = chip_bounds(column, width, options, |s| {
+            let bounds = chip_bounds(column, width, label, options, |s| {
                 measure(fonts, s, TEXT_PX) as u16
             });
             let rect = chip_rect(layout, item, &bounds, option);
@@ -565,6 +589,15 @@ pub fn paint_strip(window: &mut Window, fonts: &mut Fonts, layout: Layout, cells
     let cells: Vec<String> = cells.iter().map(|label| format!("[ {label} ]")).collect();
     paint_cells(window, fonts, layout, &cells, &[], "");
 }
+
+/// The least blank a cell may keep either side of its text.
+///
+/// **Padding is what a strip gives up before it gives up a control.** Six
+/// cells at [`CELL_PAD`] spend 312 px on air, which on a 10.2″ panel is what
+/// makes the bar look deliberate and on a 7″ one is the difference between
+/// `[ Done ]` being on the strip and not being anywhere. A cramped button is
+/// still a button.
+const CELL_PAD_MIN: u16 = 8;
 
 /// Blank space either side of a cell's text.
 const CELL_PAD: u16 = 26;
@@ -609,11 +642,18 @@ pub fn cell_bounds(
     // The fixed cells first, because the elastic ones are defined as what they
     // leave — asking one how wide it wants to be would be circular, since its
     // text is trimmed to fit the room it is given.
+    let text: u16 = cells
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !stretch.contains(i))
+        .map(|(_, label)| measure_text(label))
+        .fold(0, u16::saturating_add);
+    let pad = cell_pad(width, text, cells.len(), stretch.len());
     let fixed: u16 = cells
         .iter()
         .enumerate()
         .filter(|(i, _)| !stretch.contains(i))
-        .map(|(_, label)| fitted(label, &mut measure_text))
+        .map(|(_, label)| fitted(label, pad, &mut measure_text))
         .sum();
     let each = share(width, fixed, stretch.len());
 
@@ -623,7 +663,7 @@ pub fn cell_bounds(
         let w = if stretch.contains(&i) {
             each
         } else {
-            fitted(label, &mut measure_text)
+            fitted(label, pad, &mut measure_text)
         };
         if x.saturating_add(w) > width {
             break;
@@ -640,9 +680,33 @@ pub fn cell_bounds(
 }
 
 /// One cell's width: its text, and the blank either side of it.
-fn fitted(label: &str, measure_text: &mut impl FnMut(&str) -> u16) -> u16 {
-    measure_text(label).saturating_add(CELL_PAD * 2)
+fn fitted(label: &str, pad: u16, measure_text: &mut impl FnMut(&str) -> u16) -> u16 {
+    measure_text(label).saturating_add(pad * 2)
 }
+
+/// The blank this strip can afford either side of each cell.
+///
+/// [`CELL_PAD`] whenever the words fit with it, and as little as
+/// [`CELL_PAD_MIN`] when they do not — the whole strip tightening together, so
+/// that it still reads as one bar rather than as cells of two kinds.
+///
+/// **`text` is the fixed cells' text and nothing else.** A stretch cell counts
+/// towards `cells`, because it needs padding like any other, but its words are
+/// trimmed to the room left over — so measuring what it currently says would
+/// make the padding depend on what has been typed into it, and the two places
+/// that ask for it are on opposite sides of that trimming. What each of them
+/// wants instead is [`FIELD_MIN`], claimed here before any of the slack is
+/// spent on air.
+fn cell_pad(width: u16, text: u16, cells: usize, elastic: usize) -> u16 {
+    let wanted = text.saturating_add(FIELD_MIN * elastic as u16);
+    let each = width.saturating_sub(wanted) / (2 * cells.max(1)) as u16;
+    each.clamp(CELL_PAD_MIN, CELL_PAD)
+}
+
+/// The least text a stretch cell is worth giving: eight Latin characters at
+/// [`TEXT_PX`], which is a search query you can still read. Below that the
+/// field is present and useless, which is a worse answer than a tighter bar.
+pub const FIELD_MIN: u16 = (TEXT_PX * 8.0 / 2.0) as u16;
 
 /// What one elastic cell gets of the room the fixed ones leave.
 ///
@@ -668,11 +732,16 @@ pub fn stretch_room(
     elastic: usize,
     mut measure_text: impl FnMut(&str) -> u16,
 ) -> u16 {
+    let text: u16 = others
+        .iter()
+        .map(|label| measure_text(label))
+        .fold(0, u16::saturating_add);
+    let pad = cell_pad(width, text, others.len() + elastic, elastic);
     let fixed: u16 = others
         .iter()
-        .map(|label| fitted(label, &mut measure_text))
+        .map(|label| fitted(label, pad, &mut measure_text))
         .sum();
-    share(width, fixed, elastic).saturating_sub(CELL_PAD * 2)
+    share(width, fixed, elastic).saturating_sub(pad * 2)
 }
 
 /// Where the packed cells end, which is where the rule above them stops and
@@ -1062,8 +1131,9 @@ fn label_roles(label: &str) -> Vec<Role> {
 
 /// How wide a label draws. The same sum `ui::measure` does, but against
 /// `Metrics` rather than the concrete faces, so the geometry above can be
-/// checked on the host.
-fn label_width(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
+/// checked on the host — which is the only place it ever is, the device's faces
+/// not existing on a development machine.
+pub fn label_width(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
     let width: f32 = label
         .chars()
         .map(|c| fonts.advance(role_for(Block::Paragraph, Style::Text, script_of(c)), px, c))
@@ -1091,6 +1161,53 @@ pub fn overlay_cells(
         x += w;
     }
     out
+}
+
+/// Where each page of candidates starts, given what the panel can hold.
+///
+/// **Ten is what the number row can pick, not what the panel can show.** The
+/// box is drawn beside the caret at the writer's own type size, so ten
+/// four-character phrases want more width than a 7″ panel has — and more than a
+/// 10.2″ one has at the larger body sizes. What happened then was that
+/// [`overlay_rect`] clamped the box to the panel and [`overlay_cells`] went on
+/// laying candidates out past its edge: the last of them were drawn off the
+/// screen while the number row went on selecting them. **Committing something
+/// you cannot see is worse than not being offered it**, and paging is the way
+/// out, because the writer can already reach the next page with an arrow.
+///
+/// So a page is as many as fit, at most `most`. The starts are worked out for
+/// the whole list at once and kept, because the page a candidate is on is the
+/// one thing drawing, tapping and the number row all have to agree about — the
+/// rule [`cell_bounds`] follows for the same reason.
+///
+/// Empty for no candidates, and otherwise never empty: a candidate wider than
+/// the whole panel gets a page to itself rather than no page at all.
+pub fn candidate_pages(
+    fonts: &mut impl Metrics,
+    surface_width: u16,
+    body_px: f32,
+    candidates: &[String],
+    most: usize,
+) -> Vec<usize> {
+    let px = body_px * CANDIDATE_SCALE;
+    let (pad_x, _) = padding(px);
+    let mut starts = Vec::new();
+    let (mut start, mut used) = (0usize, 0u16);
+    for (i, text) in candidates.iter().enumerate() {
+        // Measured with a number in front, because that is what gets drawn.
+        // Any digit is as wide as any other, so the tenth's `0` stands for all
+        // of them.
+        let cell = label_width(fonts, &format!("0 {text}"), px) + pad_x * 2;
+        if i > start && (used.saturating_add(cell) > surface_width || i - start == most) {
+            starts.push(start);
+            (start, used) = (i, 0);
+        }
+        used = used.saturating_add(cell);
+    }
+    if !candidates.is_empty() {
+        starts.push(start);
+    }
+    starts
 }
 
 pub fn draw_overlay(
@@ -1178,7 +1295,7 @@ impl Overlay<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font::Stub;
+    use crate::font::{Proportional, Stub};
 
     const HEIGHT: u16 = 2480;
     const WIDTH: u16 = 1860;
@@ -1552,11 +1669,11 @@ mod tests {
         }];
         let column = chip_column(&items, WIDTH, stub);
         assert!(column <= WIDTH / 3, "the column ran away with the label");
-        let Item::Choice { options, .. } = &items[0] else {
+        let Item::Choice { label, options, .. } = &items[0] else {
             unreachable!()
         };
         assert_eq!(
-            chip_bounds(column, WIDTH, options, stub).len(),
+            chip_bounds(column, WIDTH, label, options, stub).len(),
             2,
             "Forget must still be on the page"
         );
@@ -1565,7 +1682,7 @@ mod tests {
     #[test]
     fn chips_tile_left_to_right_and_stay_inside_the_margin() {
         let options = strings(&["Ember", "Bookerly", "Caecilia"]);
-        let bounds = chip_bounds(400, WIDTH, &options, stub);
+        let bounds = chip_bounds(400, WIDTH, "Type", &options, stub);
         assert_eq!(bounds.len(), 3);
         assert_eq!(bounds[0].0, 400);
         for (i, (x, w)) in bounds.iter().enumerate() {
@@ -1579,10 +1696,31 @@ mod tests {
                 "chips are separated by exactly one gap"
             );
         }
-        // A row of chips wider than the page drops the tail rather than
-        // shrinking every one of them past reading, as the candidate bar does.
-        let bounds = chip_bounds(400, 600, &options, stub);
+        // Only when nothing else is left to give: a row that does not fit from
+        // the column starts from its own label first, and only drops the tail
+        // when even that is not enough room.
+        let bounds = chip_bounds(400, 400, "Type", &options, stub);
         assert!(bounds.len() < options.len());
+    }
+
+    /// **The narrow-panel rule.** Three chips that do not fit from the shared
+    /// column do fit from the row's own label, so the row steps out of the
+    /// table rather than dropping a setting off the page.
+    #[test]
+    fn a_row_that_cannot_afford_the_column_keeps_its_own() {
+        let options = strings(&["Ember", "Bookerly", "Caecilia"]);
+        let bounds = chip_bounds(400, 600, "Type", &options, stub);
+        assert_eq!(bounds.len(), 3, "every face is still reachable");
+        assert!(bounds[0].0 < 400, "and they moved left to manage it");
+        assert!(
+            bounds[0].0 >= ROW_INSET + stub("Type"),
+            "without running under the label"
+        );
+
+        // The row the column was measured from has nothing to gain by it, and
+        // must not shove its own chips backwards over its own label.
+        let long = "A Very Long Bluetooth Keyboard Name Indeed";
+        assert_eq!(chip_bounds(400, 600, long, &options, stub)[0].0, 400);
     }
 
     /// The bug class this file has had three times: the invert lands on one
@@ -1593,10 +1731,10 @@ mod tests {
         let l = layout();
         let items = settings();
         let column = chip_column(&items, WIDTH, stub);
-        let Item::Choice { options, .. } = &items[1] else {
+        let Item::Choice { label, options, .. } = &items[1] else {
             panic!("item 1 is the languages row")
         };
-        let bounds = chip_bounds(column, WIDTH, options, stub);
+        let bounds = chip_bounds(column, WIDTH, label, options, stub);
         let y = l.rows_top + l.row_h; // anywhere on item 1
         for option in 0..options.len() {
             let rect = chip_rect(l, 1, &bounds, option);
@@ -1788,6 +1926,142 @@ mod tests {
         assert!(
             rect.y + rect.height <= BOX_BOTTOM,
             "and on the page rather than over the strip"
+        );
+    }
+
+    /// The two panel widths karyll has to fit: the one it was written on, and
+    /// the smaller one it is not allowed to break on. The narrow one is the
+    /// wider of the two small panels, so the tighter one is a few pixels less.
+    const WIDE: u16 = 1860;
+    const NARROW: u16 = 1272;
+
+    /// **Every setting has to be on the page**, at every panel width. A chip
+    /// past the right margin is dropped, which for a Bluetooth keyboard's own
+    /// name is the least bad answer and for karyll's own settings is a control
+    /// the writer cannot reach at all. The type sizes are the row that comes
+    /// closest: seven chips, and the widest label on the page pushes them as
+    /// far right as the column is allowed to go.
+    #[test]
+    fn no_setting_falls_off_a_narrow_panel() {
+        let sizes: Vec<String> = crate::render::SIZES
+            .iter()
+            .map(|px| format!("{px:.0}"))
+            .collect();
+        let languages: Vec<String> = crate::Language::ALL
+            .iter()
+            .map(|l| l.label().to_string())
+            .collect();
+        // A label long enough to push the column against its cap, which is what
+        // a paired keyboard's name does.
+        let items = vec![Item::Choice {
+            label: "A Long Bluetooth Keyboard Name".into(),
+            options: sizes.clone(),
+            on: vec![],
+        }];
+        for panel in [WIDE, NARROW] {
+            let measure = |s: &str| label_width(&mut Proportional, s, TEXT_PX);
+            let column = chip_column(&items, panel, measure);
+            for (label, options) in [("Size", &sizes), ("Languages", &languages)] {
+                let bounds = chip_bounds(column, panel, label, options, measure);
+                assert_eq!(
+                    bounds.len(),
+                    options.len(),
+                    "{panel} px panel: {} of {:?} fit, from a column at {column}",
+                    bounds.len(),
+                    options
+                );
+            }
+        }
+    }
+
+    /// Candidates are drawn at the size being written in, not at [`TEXT_PX`].
+    const BODY: f32 = crate::render::DEFAULT_SIZE;
+
+    /// `count` candidates of `chars` Han characters each — the one thing about
+    /// them the box's width depends on.
+    fn candidates(count: usize, chars: usize) -> Vec<String> {
+        vec!["候".repeat(chars); count]
+    }
+
+    /// **Ten is what the number row can pick, not what the panel can show.**
+    /// Ten three-character candidates are 1520 px of box — inside a 10.2″
+    /// panel and past a 7″ one — so the smaller panel pages them and the
+    /// larger one does not.
+    #[test]
+    fn a_bar_too_wide_for_the_panel_is_paged_rather_than_cut_off() {
+        let list = candidates(10, 3);
+        assert_eq!(
+            candidate_pages(&mut Proportional, WIDE, BODY, &list, crate::ime::WANTED),
+            vec![0]
+        );
+        assert_eq!(
+            candidate_pages(&mut Proportional, NARROW, BODY, &list, crate::ime::WANTED),
+            vec![0, 8],
+            "eight fit, and the other two are a page rather than off the edge"
+        );
+    }
+
+    /// The number row is the other limit, and it binds first when the
+    /// candidates are short: eleven of them are two pages on any panel.
+    #[test]
+    fn a_page_is_never_longer_than_the_number_row() {
+        let list = candidates(11, 1);
+        assert_eq!(
+            candidate_pages(&mut Proportional, WIDE, BODY, &list, crate::ime::WANTED),
+            vec![0, crate::ime::WANTED]
+        );
+    }
+
+    /// **The invariant the paging exists for**: everything on a page is inside
+    /// the box that page is drawn in. It was not — [`overlay_rect`] clamped the
+    /// box to the panel while [`overlay_cells`] went on laying candidates out
+    /// past its edge, so the last ones were drawn off the screen and the number
+    /// row went on picking them.
+    #[test]
+    fn every_candidate_on_a_page_is_inside_its_box() {
+        for panel in [WIDE, NARROW] {
+            for length in 1..=5 {
+                let list = candidates(10, length);
+                let pages =
+                    candidate_pages(&mut Proportional, panel, BODY, &list, crate::ime::WANTED);
+                for (p, &from) in pages.iter().enumerate() {
+                    let to = pages.get(p + 1).copied().unwrap_or(list.len());
+                    let labels = Overlay::Candidates(&list[from..to]).labels();
+                    let rect = overlay_rect(
+                        panel,
+                        &mut Proportional,
+                        caret_at(100),
+                        BODY,
+                        BOX_BOTTOM,
+                        &labels,
+                    )
+                    .unwrap();
+                    let cells = overlay_cells(&mut Proportional, rect, BODY, &labels);
+                    let (x, w) = *cells.last().expect("a page is never empty");
+                    assert!(
+                        x + w <= rect.x + rect.width && x + w <= panel,
+                        "{length}-character candidates, page {p} of {}, on a {panel} px panel: \
+                         the bar ends at {} and the box at {}",
+                        pages.len(),
+                        x + w,
+                        rect.x + rect.width
+                    );
+                }
+            }
+        }
+    }
+
+    /// Nothing to show is no pages, and a candidate too wide for the whole
+    /// panel still gets one — refusing to show it at all would lose it.
+    #[test]
+    fn there_is_a_page_for_anything_the_engine_offers() {
+        assert!(
+            candidate_pages(&mut Proportional, NARROW, BODY, &[], crate::ime::WANTED).is_empty()
+        );
+        let huge = vec!["候".repeat(60)];
+        assert_eq!(
+            candidate_pages(&mut Proportional, NARROW, BODY, &huge, crate::ime::WANTED),
+            vec![0]
         );
     }
 
