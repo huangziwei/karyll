@@ -225,6 +225,73 @@ impl Panel<'_> {
     }
 }
 
+/// Where a row's own text starts, inside the margin.
+pub const ROW_INSET: u16 = MARGIN_X + 24;
+
+/// Blank space either side of a chip's text.
+const CHIP_PAD: u16 = 24;
+/// Between one chip and the next.
+const CHIP_GAP: u16 = 20;
+
+/// Where the chips of *every* choice row start.
+///
+/// One column across the whole panel, from the widest label on it, so the
+/// values line up down the page instead of stepping in and out behind labels
+/// of different lengths — which is most of what makes a settings page read as
+/// a table rather than as a pile.
+///
+/// **Capped at a third of the width**, because one label is not karyll's to
+/// choose: a Bluetooth keyboard is named by whoever made it, and a long enough
+/// name would push the chips past the right margin, where [`chip_bounds`] drops
+/// them — leaving a keyboard that cannot be forgotten. A label running under
+/// its own chips is a cosmetic fault; a control that is not on the page is not.
+pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str) -> u16) -> u16 {
+    let widest = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Choice { label, .. } | Item::Row { label, .. } => Some(measure_text(label)),
+            // A heading is not a label; it starts at the margin and owns its
+            // whole line, so however long it is it moves nothing.
+            Item::Heading(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    (ROW_INSET + widest + CHIP_GAP * 3).min(width / 3)
+}
+
+/// Where each chip of one choice row sits, in window x.
+///
+/// **The single source for drawing, hit-testing and press feedback**, for the
+/// reason [`cell_bounds`] is: a chip is only as wide as its own text, so
+/// anything that measured them a second time would put a finger on a different
+/// one. A chip that runs past the right margin is dropped rather than shrunk,
+/// the rule the candidate bar already follows.
+pub fn chip_bounds(
+    column: u16,
+    width: u16,
+    options: &[String],
+    mut measure_text: impl FnMut(&str) -> u16,
+) -> Vec<(u16, u16)> {
+    let right = width.saturating_sub(MARGIN_X);
+    let mut out = Vec::new();
+    let mut x = column;
+    for label in options {
+        let w = measure_text(label).saturating_add(CHIP_PAD * 2);
+        if x.saturating_add(w) > right {
+            break;
+        }
+        out.push((x, w));
+        x = x.saturating_add(w + CHIP_GAP);
+    }
+    out
+}
+
+/// The rectangle of one chip, given the bounds its row was laid out at.
+pub fn chip_rect(layout: Layout, item: usize, bounds: &[(u16, u16)], option: usize) -> Rect {
+    let (x, width) = bounds.get(option).copied().unwrap_or((0, 0));
+    chip_slot(layout, item, x, width)
+}
+
 /// Where a row's own action chip sits: the right margin, and the same height
 /// and vertical placing as any other chip.
 ///
@@ -241,6 +308,16 @@ pub fn action_rect(
     let w = measure_text(label).saturating_add(CHIP_PAD * 2);
     let x = width.saturating_sub(MARGIN_X).saturating_sub(w);
     chip_slot(layout, item, x, w)
+}
+
+fn chip_slot(layout: Layout, item: usize, x: u16, width: u16) -> Rect {
+    let height = layout.row_h * 3 / 4;
+    Rect {
+        x,
+        y: layout.rows_top + item as u16 * layout.row_h + (layout.row_h - height) / 2,
+        width,
+        height,
+    }
 }
 
 /// Whether a point is inside a rectangle.
@@ -383,6 +460,99 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                 }
             }
         }
+    }
+}
+
+/// One chip: filled when it is what the setting is currently on, outlined when
+/// it is merely available.
+///
+/// **Filled, not ticked.** The renderer cuts coverage to one bit, so a tick or
+/// a grey wash is a smudge at this size; an inverted block is unambiguous
+/// across the room, and it is the idiom the strip already uses for a press.
+fn draw_chip(
+    window: &mut Window,
+    fonts: &mut Fonts,
+    rect: Rect,
+    label: &str,
+    on: bool,
+    pressed: bool,
+) {
+    // A press inverts whatever the chip already was, so the feedback reads the
+    // same on a chip that is on as on one that is off.
+    let filled = on != pressed;
+    let (ground, ink) = if filled {
+        (BLACK, WHITE)
+    } else {
+        (WHITE, BLACK)
+    };
+    window.fill(rect, ground);
+    if !filled {
+        for edge in [
+            Rect { height: 2, ..rect },
+            Rect {
+                y: rect.y + rect.height - 2,
+                height: 2,
+                ..rect
+            },
+            Rect { width: 2, ..rect },
+            Rect {
+                x: rect.x + rect.width - 2,
+                width: 2,
+                ..rect
+            },
+        ] {
+            window.fill(edge, BLACK);
+        }
+    }
+    let w = measure(fonts, label, TEXT_PX) as u16;
+    let start = rect.x + rect.width.saturating_sub(w) / 2;
+    let top = rect.y as i32 + (rect.height as i32 - TEXT_PX as i32) / 2 - 4;
+    draw_line(window, fonts, label, start, top, TEXT_PX, false, ink);
+}
+
+/// Redraw one chip, inverted while held.
+pub fn paint_chip(
+    window: &mut Window,
+    fonts: &mut Fonts,
+    layout: Layout,
+    items: &[Item],
+    item: usize,
+    option: usize,
+    pressed: bool,
+) -> Rect {
+    let width = window.width();
+    match items.get(item) {
+        // A row's own action chip, which [`hit`] reports as option zero.
+        Some(Item::Row {
+            action: Some(label),
+            ..
+        }) => {
+            let rect = action_rect(layout, item, width, label, |s| {
+                measure(fonts, s, TEXT_PX) as u16
+            });
+            draw_chip(window, fonts, rect, label, false, pressed);
+            rect
+        }
+        Some(Item::Choice { options, on, .. }) => {
+            let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
+            let bounds = chip_bounds(column, width, options, |s| {
+                measure(fonts, s, TEXT_PX) as u16
+            });
+            let rect = chip_rect(layout, item, &bounds, option);
+            let Some(label) = options.get(option) else {
+                return rect;
+            };
+            draw_chip(
+                window,
+                fonts,
+                rect,
+                label,
+                on.get(option).copied().unwrap_or(false),
+                pressed,
+            );
+            rect
+        }
+        _ => Rect::default(),
     }
 }
 
@@ -1316,6 +1486,156 @@ mod tests {
         assert!(a.y >= l.rows_top);
         assert!(a.y + a.height <= b.y, "rows do not overlap");
         assert_eq!(a.x, MARGIN_X);
+    }
+
+    fn settings() -> Vec<Item> {
+        vec![
+            Item::Heading("Input".into()),
+            Item::Choice {
+                label: "Languages".into(),
+                options: strings(&["EN", "DE", "简体"]),
+                on: vec![true, true, false],
+            },
+            Item::Row {
+                label: "draft.md".into(),
+                detail: "842 words · yesterday".into(),
+                action: None,
+                on: false,
+            },
+            Item::Heading("Type".into()),
+            Item::Choice {
+                label: "Latin".into(),
+                options: strings(&["Ember", "Bookerly"]),
+                on: vec![true, false],
+            },
+        ]
+    }
+
+    /// Chips and details line up down the page rather than stepping in and out
+    /// behind labels of different lengths, which is most of what makes it read
+    /// as a page and not a pile. **One column for both kinds of line**, so a
+    /// list of files and a page of settings are laid out to the same grid.
+    #[test]
+    fn every_line_starts_its_second_column_in_the_same_place() {
+        let items = settings();
+        let column = chip_column(&items, WIDTH, stub);
+        assert!(column > ROW_INSET + stub("Languages"), "clears the widest");
+        assert!(column > ROW_INSET + stub("Latin"));
+        assert!(column > ROW_INSET + stub("draft.md"), "rows count too");
+
+        // A heading is not a label — it starts at the margin and owns its whole
+        // line, so however long it is it moves nothing.
+        let mut longer = settings();
+        longer.push(Item::Heading("A Very Long Section Heading Indeed".into()));
+        assert_eq!(chip_column(&longer, WIDTH, stub), column);
+
+        // A longer label does move it, and everything with it.
+        longer.push(Item::Row {
+            label: "a-rather-longer-filename.md".into(),
+            detail: "1 word · just now".into(),
+            action: None,
+            on: false,
+        });
+        assert!(chip_column(&longer, WIDTH, stub) > column);
+    }
+
+    /// One label on this page is not karyll's to choose — a Bluetooth keyboard
+    /// carries whatever name its maker gave it. Uncapped, a long one pushes the
+    /// chips past the right margin, `chip_bounds` drops them, and the writer is
+    /// left with a keyboard they cannot forget.
+    #[test]
+    fn a_label_nobody_chose_cannot_push_its_own_controls_off_the_page() {
+        let items = vec![Item::Choice {
+            label: "A Very Long Bluetooth Keyboard Name Indeed, 2024 Edition".into(),
+            options: strings(&["Connect", "Forget"]),
+            on: vec![false, false],
+        }];
+        let column = chip_column(&items, WIDTH, stub);
+        assert!(column <= WIDTH / 3, "the column ran away with the label");
+        let Item::Choice { options, .. } = &items[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            chip_bounds(column, WIDTH, options, stub).len(),
+            2,
+            "Forget must still be on the page"
+        );
+    }
+
+    #[test]
+    fn chips_tile_left_to_right_and_stay_inside_the_margin() {
+        let options = strings(&["Ember", "Bookerly", "Caecilia"]);
+        let bounds = chip_bounds(400, WIDTH, &options, stub);
+        assert_eq!(bounds.len(), 3);
+        assert_eq!(bounds[0].0, 400);
+        for (i, (x, w)) in bounds.iter().enumerate() {
+            assert_eq!(*w, stub(&options[i]) + CHIP_PAD * 2, "chip {i} is its text");
+            assert!(x + w <= WIDTH - MARGIN_X, "chip {i} runs past the margin");
+        }
+        for pair in bounds.windows(2) {
+            assert_eq!(
+                pair[0].0 + pair[0].1 + CHIP_GAP,
+                pair[1].0,
+                "chips are separated by exactly one gap"
+            );
+        }
+        // A row of chips wider than the page drops the tail rather than
+        // shrinking every one of them past reading, as the candidate bar does.
+        let bounds = chip_bounds(400, 600, &options, stub);
+        assert!(bounds.len() < options.len());
+    }
+
+    /// The bug class this file has had three times: the invert lands on one
+    /// control and the tap runs another. Drawing and hit-testing are the same
+    /// two functions here, and this is the test that says so.
+    #[test]
+    fn a_tap_reported_on_a_chip_is_inside_the_chip_that_gets_drawn() {
+        let l = layout();
+        let items = settings();
+        let column = chip_column(&items, WIDTH, stub);
+        let Item::Choice { options, .. } = &items[1] else {
+            panic!("item 1 is the languages row")
+        };
+        let bounds = chip_bounds(column, WIDTH, options, stub);
+        let y = l.rows_top + l.row_h; // anywhere on item 1
+        for option in 0..options.len() {
+            let rect = chip_rect(l, 1, &bounds, option);
+            let middle = rect.x + rect.width / 2;
+            assert_eq!(
+                hit(&items, l, WIDTH, middle, y, stub),
+                Some(Hit::Option(1, option)),
+                "the middle of chip {option} does not resolve to it"
+            );
+            assert!(rect.y >= l.rows_top + l.row_h, "chip {option} left its row");
+            assert!(rect.y + rect.height <= l.rows_top + l.row_h * 2);
+        }
+    }
+
+    #[test]
+    fn headings_labels_and_the_space_past_the_chips_are_not_controls() {
+        let l = layout();
+        let items = settings();
+        let on_row = |i: u16| l.rows_top + i * l.row_h + 10;
+        assert_eq!(
+            hit(&items, l, WIDTH, WIDTH / 2, on_row(0), stub),
+            None,
+            "a heading names what follows and does nothing"
+        );
+        assert_eq!(
+            hit(&items, l, WIDTH, ROW_INSET + 5, on_row(1), stub),
+            None,
+            "the label is not a control"
+        );
+        assert_eq!(
+            hit(&items, l, WIDTH, WIDTH - MARGIN_X - 1, on_row(1), stub),
+            None,
+            "and neither is the space after the last chip"
+        );
+        assert_eq!(
+            hit(&items, l, WIDTH, ROW_INSET, on_row(2), stub),
+            Some(Hit::Row(2)),
+            "a plain row is tappable across its width"
+        );
     }
 
     #[test]

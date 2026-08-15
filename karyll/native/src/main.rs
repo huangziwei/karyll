@@ -2247,6 +2247,48 @@ impl Editor {
         self.paint()
     }
 
+    /// Run the chip a finger landed on, against the list it was drawn from.
+    fn config_action(&mut self, item: usize, option: usize) -> Result<()> {
+        match self.config_items().into_iter().nth(item).map(|(_, a)| a) {
+            Some(ConfigRow::Languages(languages)) => {
+                let Some(language) = languages.get(option) else {
+                    return Ok(());
+                };
+                self.toggle_language(*language);
+            }
+            Some(ConfigRow::Font(group, installed)) => {
+                let Some(family) = installed.get(option) else {
+                    return Ok(());
+                };
+                self.set_family(group, *family);
+            }
+            // It paints itself, because the chip that moves is on the page
+            // doing the painting. The panel's own type does not change with
+            // this — chrome is set at [`ui::TEXT_PX`] and stays there, the way
+            // a toolbar does not grow with the document it sits under.
+            Some(ConfigRow::Size) => {
+                return match render::SIZES.get(option) {
+                    Some(px) => self.set_size(*px),
+                    None => Ok(()),
+                };
+            }
+            // These paint themselves: each reports what the daemon said, and a
+            // scan goes on repainting for the ten seconds it runs.
+            Some(ConfigRow::Keyboard(actions)) => {
+                return match actions.get(option) {
+                    Some(KeyAction::Connect(device)) => self.reconnect(&device.clone()),
+                    Some(KeyAction::Disconnect(device)) => self.disconnect(&device.clone()),
+                    Some(KeyAction::Forget(device)) => self.forget(&device.clone()),
+                    Some(KeyAction::Pair(device)) => self.pair_with(&device.clone()),
+                    Some(KeyAction::Scan) => self.start_scan(),
+                    None => Ok(()),
+                };
+            }
+            Some(ConfigRow::None) | None => return Ok(()),
+        }
+        self.paint()
+    }
+
     /// Break the line, carrying a list or quote marker onto the next one.
     ///
     /// The list the cursor is *in* is the line it sits on, so this reads the
@@ -2341,6 +2383,83 @@ impl Editor {
         self.doc.set_cursor(moved.min(self.doc.len()));
     }
 
+    /// The Config panel, paired with what each control does.
+    ///
+    /// One list, as the Keyboard panel learned to be: drawing and hit-testing
+    /// both come from here, so a control cannot say one thing and do another.
+    ///
+    /// **Two sections, and every line is a label with its values beside it.**
+    /// Undifferentiated rows hiding their choices behind a tap that cycles them
+    /// are a phone's answer to a phone's problem, and this is a 10.2″ panel
+    /// with half the page empty. Every value is on screen, and picking one is a
+    /// tap on the value itself rather than a walk through the others.
+    ///
+    /// **The action carries the list it was drawn from**, rather than a group
+    /// the handler would look up again: the chips are only the *installed*
+    /// families, so a second call to `available` deciding what option 1 means
+    /// is the two-lists bug with extra steps.
+    fn config_items(&self) -> Vec<(ui::Item, ConfigRow)> {
+        // **Pairing comes first, because it is the first thing a new writer has
+        // to do.** There is nothing to type on until they have done it, and
+        // nothing else on this page can be reached from a keyboard that does
+        // not exist yet.
+        let mut items = vec![(ui::Item::Heading("Keyboard".into()), ConfigRow::None)];
+        items.extend(self.keyboard_items());
+
+        items.push((ui::Item::Heading("Input".into()), ConfigRow::None));
+        let languages: Vec<Language> = Language::ALL.into_iter().collect();
+        items.push((
+            ui::Item::Choice {
+                label: "Languages".into(),
+                options: languages.iter().map(|l| l.label().to_string()).collect(),
+                on: languages.iter().map(|l| self.enabled.contains(l)).collect(),
+            },
+            ConfigRow::Languages(languages),
+        ));
+
+        // A writing system with nothing installed at all is left off entirely.
+        // One that has exactly one keeps its row: the chip cannot be changed,
+        // but it still says what the writing on screen is set in, which is half
+        // of what the row is for.
+        let type_rows: Vec<(ui::Item, ConfigRow)> = font_groups(&self.enabled)
+            .into_iter()
+            .filter_map(|group| {
+                let installed = font::available(group);
+                if installed.is_empty() {
+                    return None;
+                }
+                let chosen = self.fonts.choices().get(group);
+                Some((
+                    ui::Item::Choice {
+                        label: group.label().into(),
+                        options: installed
+                            .iter()
+                            .map(|at| font::families(group)[*at].name.to_string())
+                            .collect(),
+                        on: installed.iter().map(|at| *at == chosen).collect(),
+                    },
+                    ConfigRow::Font(group, installed),
+                ))
+            })
+            .collect();
+        items.push((ui::Item::Heading("Type".into()), ConfigRow::None));
+        // Size before the faces: it is the setting a writer reaches for first,
+        // and unlike them it applies to every writing system at once.
+        items.push((
+            ui::Item::Choice {
+                label: "Size".into(),
+                options: render::SIZES.iter().map(|px| format!("{px:.0}")).collect(),
+                on: render::SIZES
+                    .iter()
+                    .map(|px| *px == self.theme.body_px)
+                    .collect(),
+            },
+            ConfigRow::Size,
+        ));
+        items.extend(type_rows);
+        items
+    }
+
     /// The Keyboard section: a line per keyboard, and the scan that finds more.
     ///
     /// Remembered keyboards first — the daemon keeps them and their link keys
@@ -2418,6 +2537,60 @@ impl Editor {
             ConfigRow::Keyboard(vec![KeyAction::Scan]),
         ));
         items
+    }
+
+    /// Draw a writing system in the face that was tapped.
+    ///
+    /// The page is laid out again from scratch on the way back to it — two
+    /// families are not the same height, so every row moves and the remembered
+    /// frame describes a screen that no longer exists. Leaving the panel does
+    /// that anyway, and [`Editor::paint`] drops the frame whenever a panel is
+    /// up, so there is nothing extra to invalidate here.
+    fn set_family(&mut self, group: font::Group, family: usize) {
+        if self.fonts.choices().get(group) == family {
+            return;
+        }
+        self.fonts.set_family(group, family);
+        write_choices(self.fonts.choices());
+        eprintln!(
+            "font: {} in {}",
+            group.label(),
+            self.fonts.family(group).name
+        );
+    }
+
+    /// Switch an input source on or off.
+    ///
+    /// **The last one cannot be switched off.** An empty set would leave no way
+    /// to type, and a settings screen that can make the app unusable is a worse
+    /// answer than a row that declines.
+    ///
+    /// Switching off the one in use moves to the next that is still on, rather
+    /// than leaving the keyboard in a source the cycle can no longer reach.
+    fn toggle_language(&mut self, language: Language) {
+        if self.enabled.contains(&language) {
+            if self.enabled.len() == 1 {
+                eprintln!("config: {} is the only one left", language.label());
+                return;
+            }
+            self.enabled.retain(|l| *l != language);
+        } else {
+            self.enabled.push(language);
+            self.enabled
+                .sort_by_key(|l| Language::ALL.iter().position(|a| a == l).unwrap_or(0));
+        }
+        write_languages(&self.enabled);
+        eprintln!(
+            "config: cycling {}",
+            self.enabled
+                .iter()
+                .map(|l| l.label())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if !self.enabled.contains(&self.language) {
+            self.set_language(self.language.next(&self.enabled));
+        }
     }
 
     fn strip_action(&mut self, button: Bar) -> Result<bool> {
@@ -4054,6 +4227,44 @@ fn write_languages(enabled: &[Language]) {
     let _ = std::fs::write(languages_file(), letters);
 }
 
+/// Which writing systems the Config panel offers a face for.
+///
+/// **One row per system, not per language.** English and German are drawn by
+/// the same Latin faces, so a row each would be two controls over one setting;
+/// and a writer who has turned Japanese off should not be offered a Japanese
+/// face they will never see. Which is the dependency that put the enabled set
+/// first: this list is built from what is on, not from the five karyll can
+/// imagine.
+fn font_groups(enabled: &[Language]) -> Vec<font::Group> {
+    let mut groups: Vec<font::Group> = Vec::new();
+    for language in Language::ALL.into_iter().filter(|l| enabled.contains(l)) {
+        let group = match language.region() {
+            Some(region) => font::Group::Han(region),
+            None => font::Group::Latin,
+        };
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+fn fonts_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/fonts")
+}
+
+/// Which face draws each writing system.
+///
+/// An unreadable or missing file is the default list, which is what a writer
+/// who has never opened Config should get.
+fn read_choices() -> font::Choices {
+    font::Choices::parse(&std::fs::read_to_string(fonts_file()).unwrap_or_default())
+}
+
+fn write_choices(choices: font::Choices) {
+    let _ = std::fs::write(fonts_file(), choices.render());
+}
+
 fn focus_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/focus")
 }
@@ -4698,6 +4909,28 @@ enum KeyAction {
     Scan,
 }
 
+/// What a line of the Config panel does. Built alongside its label, for the
+/// reason [`KeyAction`] is.
+///
+/// The two with a list in them carry **the list the chips were drawn from**, so
+/// the option a finger landed on is resolved against exactly what was on
+/// screen. Looking the list up a second time in the handler is how a panel ends
+/// up drawing one thing and doing another.
+#[derive(Debug, Clone)]
+enum ConfigRow {
+    /// A heading. Not tappable, and here only so the list stays one list.
+    None,
+    /// The language chips: which source each option switches on or off.
+    Languages(Vec<Language>),
+    /// A writing system's chips, and which family each option is — an index
+    /// into [`font::families`], skipping the ones not installed.
+    Font(font::Group, Vec<usize>),
+    /// The body size chips, which are [`render::SIZES`] in order.
+    Size,
+    /// One keyboard's chips, or the scan's.
+    Keyboard(Vec<KeyAction>),
+}
+
 /// Something a finger can be on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -4948,6 +5181,34 @@ nine words in this one under the third level
         assert!(describe_listing(1_284, now, true).contains("1,284 words"));
         assert!(!describe_listing(1_284, now, false).contains("open"));
         assert!(describe_listing(0, now, false).contains("empty"));
+    }
+
+    #[test]
+    fn two_latin_languages_are_one_font_row() {
+        use karyll_core::script::Region;
+        assert_eq!(
+            font_groups(&[Language::English, Language::German]),
+            vec![font::Group::Latin],
+            "one setting, so one row"
+        );
+        assert_eq!(
+            font_groups(&[Language::German, Language::Japanese]),
+            vec![font::Group::Latin, font::Group::Han(Region::Japanese)]
+        );
+        // Turned off is not offered: the panel is built from the enabled set.
+        assert_eq!(
+            font_groups(&[Language::Chinese]),
+            vec![font::Group::Han(Region::Simplified)]
+        );
+        // The two conventions are separate settings, because Han unification
+        // gives them one code point and two correct glyphs.
+        assert_eq!(
+            font_groups(&[Language::Chinese, Language::ChineseTraditional]),
+            vec![
+                font::Group::Han(Region::Simplified),
+                font::Group::Han(Region::Traditional)
+            ]
+        );
     }
 
     #[test]
