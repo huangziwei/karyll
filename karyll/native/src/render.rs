@@ -24,12 +24,42 @@ use karyll_core::wrap;
 use crate::font::{Fonts, Metrics};
 use crate::window::{BLACK, Rect, Window};
 
+/// The body sizes on offer, smallest first.
+///
+/// **A ladder rather than a range**, because every step has to be a size the
+/// page still reads well at, and because Config shows every option at once.
+/// 46 px is ~11 pt on this 300 ppi panel; the ends are ~8 pt and ~15 pt, which
+/// is as far either way as a page of prose is worth taking.
+pub const SIZES: [f32; 7] = [34.0, 38.0, 42.0, 46.0, 52.0, 58.0, 64.0];
+
+/// The size a page opens at.
+pub const DEFAULT_SIZE: f32 = 46.0;
+
 /// The least white space either side of the text column.
 ///
 /// Only ever reached by the largest sizes on the narrow edge of the panel: the
 /// column they ask for is wider than a portrait page, and a page with no margin
 /// is one whose descenders touch the bezel.
 const SIDE_MARGIN: u16 = 70;
+
+/// The ladder entry nearest `px`, so a remembered size from another build lands
+/// on something that exists rather than being refused.
+pub fn nearest_size(px: f32) -> f32 {
+    SIZES
+        .into_iter()
+        .min_by(|a, b| (a - px).abs().total_cmp(&(b - px).abs()))
+        .unwrap_or(DEFAULT_SIZE)
+}
+
+/// The next size up or down, or the one given at either end of the ladder.
+pub fn step_size(px: f32, larger: bool) -> f32 {
+    let at = SIZES
+        .iter()
+        .position(|s| *s == nearest_size(px))
+        .unwrap_or(0);
+    let next = if larger { at + 1 } else { at.wrapping_sub(1) };
+    SIZES.get(next).copied().unwrap_or(SIZES[at])
+}
 
 /// Page geometry and type sizes, in pixels.
 pub struct Theme {
@@ -414,6 +444,22 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
     out
 }
 
+/// The part of `row` that falls inside the focused span, as an offset into the
+/// row itself.
+///
+/// No focus at all means the whole row, because "everything is solid" and
+/// "focus mode is off" have to draw identically and there is no reason for them
+/// to be two states.
+fn focus_within(
+    focus: &Option<std::ops::Range<usize>>,
+    row: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let Some(span) = focus else {
+        return 0..row.end - row.start;
+    };
+    clip_to_row(span, row)
+}
+
 /// Rule a line under composing text, from `from` to `to`.
 ///
 /// Below the baseline rather than on it, by a fraction of the type size so it
@@ -463,6 +509,15 @@ fn span_within(
     row: &std::ops::Range<usize>,
 ) -> std::ops::Range<usize> {
     span.as_ref().map_or(0..0, |span| clip_to_row(span, row))
+}
+
+fn clip_to_row(
+    span: &std::ops::Range<usize>,
+    row: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let start = span.start.clamp(row.start, row.end) - row.start;
+    let end = span.end.clamp(row.start, row.end) - row.start;
+    start..end
 }
 
 /// The visual line holding `cursor`.
@@ -710,6 +765,17 @@ pub fn scroll_for(lines: &[VisualLine], cursor: usize, was: i32, how: Scroll) ->
         // not push blank paper above it.
         Scroll::Top { top } => (row.y - top).max(0),
     }
+}
+
+/// Top and bottom of the rows the focused sentence covers.
+///
+/// `None` when nothing is focused, which is a cursor on a blank line — the
+/// sentence there is empty and has no rows of its own.
+fn focused_extent(lines: &[VisualLine]) -> Option<(i32, i32)> {
+    let mut rows = lines.iter().filter(|l| !l.focus.is_empty());
+    let first = rows.next()?;
+    let last = rows.next_back().unwrap_or(first);
+    Some((first.y, last.y + last.height))
 }
 
 /// Slide every row up by `offset`, so the page sits where `scroll_for` said.
@@ -1157,6 +1223,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_ladder_steps_and_stops_at_both_ends() {
+        assert_eq!(step_size(46.0, true), 52.0);
+        assert_eq!(step_size(46.0, false), 42.0);
+        // No wrapping: the smallest is not one press from the largest, which
+        // would be a surprise rather than a convenience.
+        assert_eq!(step_size(SIZES[0], false), SIZES[0]);
+        assert_eq!(
+            step_size(SIZES[SIZES.len() - 1], true),
+            SIZES[SIZES.len() - 1]
+        );
+    }
+
+    /// A size remembered by another build is snapped rather than refused, the
+    /// way a stored cursor past the end is clamped.
+    #[test]
+    fn a_size_that_is_no_longer_offered_lands_on_the_nearest() {
+        assert_eq!(nearest_size(47.0), 46.0);
+        assert_eq!(nearest_size(1.0), SIZES[0]);
+        assert_eq!(nearest_size(500.0), SIZES[SIZES.len() - 1]);
+        for px in SIZES {
+            assert_eq!(nearest_size(px), px, "an offered size is left alone");
+        }
+    }
+
     /// The largest sizes ask for a column wider than a portrait page. Unfitted,
     /// `left` saturates to zero and the lines run under both bezels.
     #[test]
@@ -1276,6 +1367,33 @@ mod tests {
         // A selection inverts everything it covers, quiet marks included.
         assert_eq!(ink(true, true), WHITE);
         assert_eq!(ink(true, false), WHITE);
+    }
+
+    #[test]
+    fn focus_off_leaves_every_row_solid_from_end_to_end() {
+        let row = 10..20;
+        assert_eq!(focus_within(&None, &row), 0..10);
+    }
+
+    #[test]
+    fn a_row_holding_the_focused_sentence_reports_it_relative_to_itself() {
+        // The span is in document indices; the row wants its own offsets, so
+        // that a line further down the page is not described in terms of how
+        // much text precedes it.
+        assert_eq!(focus_within(&Some(12..18), &(10..20)), 2..8);
+    }
+
+    #[test]
+    fn a_sentence_running_past_a_row_is_clipped_to_it_at_both_ends() {
+        assert_eq!(focus_within(&Some(0..100), &(10..20)), 0..10);
+        assert_eq!(focus_within(&Some(5..15), &(10..20)), 0..5);
+        assert_eq!(focus_within(&Some(15..40), &(10..20)), 5..10);
+    }
+
+    #[test]
+    fn a_row_the_sentence_never_reaches_has_nothing_in_focus() {
+        assert!(focus_within(&Some(0..5), &(10..20)).is_empty());
+        assert!(focus_within(&Some(40..50), &(10..20)).is_empty());
     }
 
     #[test]
@@ -1751,6 +1869,107 @@ mod tests {
         assert_eq!(scroll_for(&lines, 2, 700, FOLLOW), 0);
     }
 
+    const CENTRE: Scroll = Scroll::Centre {
+        top: 100,
+        bottom: 1000,
+    };
+
+    /// A row with only part of it in focus, for the centring tests. The middle
+    /// of the page is 550 and rows here are 34 tall.
+    fn focused(range: std::ops::Range<usize>, markup: usize, y: i32) -> VisualLine {
+        let mut line = para(range, markup, y);
+        line.focus = 0..1;
+        line
+    }
+
+    fn unfocused(range: std::ops::Range<usize>, markup: usize, y: i32) -> VisualLine {
+        let mut line = para(range, markup, y);
+        line.focus = 0..0;
+        line
+    }
+
+    #[test]
+    fn focus_mode_centres_the_first_sentence_by_pushing_blank_paper_above_it() {
+        // The whole difference between a typewriter pin and focus mode: a clamp
+        // at zero leaves the opening sentence at the top while every later one
+        // sits at the centre.
+        let lines = vec![focused(0..6, 0, 100), unfocused(7..13, 1, 134)];
+        // The row spans 100..134, middle 117, against a page middle of 550.
+        assert_eq!(scroll_for(&lines, 3, 0, CENTRE), -433);
+    }
+
+    #[test]
+    fn focus_mode_centres_the_sentence_rather_than_the_caret_row() {
+        // Measured off an iA Writer capture: a sentence wrapped across two
+        // rows put the caret half a line below the middle and the midpoint of
+        // the two rows on it. Centring the caret row would answer 4467 here.
+        let lines = vec![
+            unfocused(0..6, 0, 100),
+            focused(7..13, 1, 4900),
+            focused(14..20, 2, 4934),
+        ];
+        // The sentence spans 4900..4968, midpoint 4934, less the middle 550.
+        assert_eq!(scroll_for(&lines, 15, 0, CENTRE), 4384);
+    }
+
+    #[test]
+    fn focus_mode_ignores_where_the_page_happened_to_be() {
+        let lines = vec![unfocused(0..6, 0, 100), focused(7..13, 1, 5000)];
+        assert_eq!(scroll_for(&lines, 9, 0, CENTRE), 4467);
+        assert_eq!(scroll_for(&lines, 9, 999, CENTRE), 4467);
+    }
+
+    #[test]
+    fn a_sentence_taller_than_the_page_keeps_the_caret_on_it_instead() {
+        // Centring a sentence longer than the page would scroll the caret off
+        // the bottom, which is worse than not centring.
+        let mut lines: Vec<VisualLine> = (0..40)
+            .map(|i| focused(i * 2..i * 2 + 2, i, 100 + i as i32 * 34))
+            .collect();
+        lines.push(unfocused(80..82, 40, 1460));
+        // The sentence spans 100..1460, far taller than the 900 of page. The
+        // caret is on the last of its rows, 1426..1460, whose middle is 1443.
+        assert_eq!(scroll_for(&lines, 78, 0, CENTRE), 1443 - 550);
+        // Which is the point of the guard: centring the sentence would answer
+        // 230, and the caret row would then be drawn below the foot of the
+        // page rather than on it.
+        let centred = (100 + 1460) / 2 - 550;
+        assert!(1426 - centred > 1000, "the caret would be off the page");
+    }
+
+    #[test]
+    fn centring_measures_the_panel_and_following_measures_the_text_column() {
+        // The panel is 1860x2480 and the strip 120 tall, both logged rather
+        // than guessed, so landscape is 1860 of panel and 1740 of page.
+        let panel = 1860;
+        let strip_top = panel - crate::ui::STRIP_H as i32;
+        assert_eq!(strip_top, 1740);
+        assert_eq!(
+            scroll_mode(false, false, false, 160, strip_top, panel),
+            Scroll::Follow {
+                top: 160,
+                bottom: 1740
+            }
+        );
+        // Centring against (160 + 1740) / 2 put the sentence at 950 rather
+        // than 930, half a top margin low; against 1740 alone it moved by half
+        // the strip whenever the chrome came back.
+        assert_eq!(
+            scroll_mode(true, false, false, 160, strip_top, panel),
+            Scroll::Centre {
+                top: 0,
+                bottom: 1860
+            }
+        );
+        // A jump centres by the same measure and for its own reason: following
+        // would pin a search hit to whichever edge it arrived by, so the writer
+        // sees everything before their match and nothing after it.
+        assert_eq!(
+            scroll_mode(false, true, false, 160, strip_top, panel),
+            scroll_mode(true, false, false, 160, strip_top, panel)
+        );
+    }
+
     /// Landing outranks both, because it is the one paint where the writer has
     /// said where they want to be.
     #[test]
@@ -1809,6 +2028,24 @@ mod tests {
         assert_eq!(scroll_for(&lines, 0, 0, Scroll::Top { top: 160 }), 0);
         // And from further down the document, it still comes back to zero.
         assert_eq!(scroll_for(&lines, 0, 900, Scroll::Top { top: 160 }), 0);
+    }
+
+    #[test]
+    fn the_chrome_coming_and_going_does_not_move_the_focused_sentence() {
+        // The sentence must sit in the same place whether the strip is there or
+        // not: the chrome has nothing to do with what is being written.
+        let panel = 1860;
+        let with_strip = scroll_mode(true, false, false, 160, panel - 120, panel);
+        let without = scroll_mode(true, false, false, 160, panel, panel);
+        assert_eq!(with_strip, without);
+    }
+
+    #[test]
+    fn a_cursor_on_a_blank_line_centres_the_row_it_is_on() {
+        // An empty sentence covers no rows at all, so there is nothing to
+        // centre but the caret.
+        let lines = vec![unfocused(0..1, 0, 900)];
+        assert_eq!(scroll_for(&lines, 0, 0, CENTRE), 917 - 550);
     }
 
     #[test]

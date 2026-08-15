@@ -1846,6 +1846,22 @@ impl Editor {
         self.leave_panel()
     }
 
+    /// Set the page at another size.
+    ///
+    /// A full repaint, and it cannot be anything else: the measure, the margin
+    /// and the leading all move with the type, so every line is somewhere new.
+    /// The remembered frame describes a page that no longer exists.
+    fn set_size(&mut self, px: f32) -> Result<()> {
+        if self.theme.body_px == px {
+            return Ok(());
+        }
+        self.theme = render::Theme::at(px);
+        write_size(px);
+        eprintln!("size: {px} px, measure {}", self.theme.measure);
+        self.frame = None;
+        self.paint()
+    }
+
     /// Clear the panel of whatever it is holding onto, and draw the screen
     /// again.
     ///
@@ -2790,6 +2806,26 @@ impl Editor {
             self.doc.cursor(),
             self.page_preedit().chars().count(),
         )
+    }
+
+    /// The sentence to leave solid, or `None` while focus mode is off.
+    /// Takes display indices, like everything else that reads a laid-out page —
+    /// the sentence being composed into is the one around the preedit.
+    fn focus_span(&self, chars: &[char]) -> Option<std::ops::Range<usize>> {
+        self.focus
+            .then(|| karyll_core::sentence_at(chars, self.display_cursor()))
+    }
+
+    /// Turn the page's focus on or off, and remember which.
+    ///
+    /// A full repaint rather than a damage rectangle: every row changes ink at
+    /// once, so there is no smaller rectangle to find.
+    fn toggle_focus(&mut self) -> Result<()> {
+        self.focus = !self.focus;
+        write_focus(self.focus);
+        eprintln!("focus: {}", if self.focus { "on" } else { "off" });
+        self.frame = None;
+        self.paint()
     }
 
     /// Collect scan results while one is running. Called on every tick.
@@ -4016,6 +4052,45 @@ fn read_languages() -> Vec<Language> {
 fn write_languages(enabled: &[Language]) {
     let letters: String = enabled.iter().map(|l| l.letter()).collect();
     let _ = std::fs::write(languages_file(), letters);
+}
+
+fn focus_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/focus")
+}
+
+/// Whether focus mode was on when the last session ended.
+///
+/// Off unless the file says otherwise, so a var directory that has never been
+/// written leaves the page plain.
+fn read_focus() -> bool {
+    std::fs::read_to_string(focus_file()).is_ok_and(|s| s.trim() == "1")
+}
+
+fn write_focus(on: bool) {
+    let _ = std::fs::write(focus_file(), if on { "1" } else { "0" });
+}
+
+fn size_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/size")
+}
+
+/// The body size the last session ended at.
+///
+/// **Stored as the size, not as a rung of the ladder.** An index is a position
+/// in a list that will be edited, and inserting a size would silently move
+/// every writer onto a different one — the same reason the font families are
+/// kept by name. A number that is no longer offered snaps to the nearest that
+/// is, so a setting from another build lands somewhere sensible.
+fn read_size() -> f32 {
+    std::fs::read_to_string(size_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|px| px.is_finite())
+        .map_or(render::DEFAULT_SIZE, render::nearest_size)
+}
+
+fn write_size(px: f32) {
+    let _ = std::fs::write(size_file(), format!("{px}\n"));
 }
 
 fn read_language() -> Language {
