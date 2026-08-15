@@ -23,12 +23,9 @@ Copy both of these into `/mnt/us/` over MTP:
 
 <p align="center">
     <img src=".github/assets/editor.png" height="800" />
-</p>
-
-<p align="center">
-  <img src=".github/assets/files.png" height="250" />
-  <img src=".github/assets/config.png" height="250" />
-  <img src=".github/assets/help.png" height="250" />
+    <img src=".github/assets/files.png" height="800" />
+    <img src=".github/assets/config.png" height="800" />
+    <img src=".github/assets/help.png" height="800" />
 </p>
 
 ## Thanks
