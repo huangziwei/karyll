@@ -4,7 +4,11 @@
 #   ./build.sh                                        the real build
 #   cargo check --target armv7-unknown-linux-gnueabihf -p karyll-native
 #
-# The Scribe runs a 32-bit armv7 hardfloat NEON userspace.
+# **Two targets, because the Kindles run two ARM ABIs.** They are the same
+# 32-bit armv7 userspace either way; what differs is how floats are passed, and
+# a binary built for the wrong one names a loader the device does not have and
+# never starts. `build.sh` builds both and ships both, and the launcher picks by
+# looking for the loader each one names.
 #
 # Linker: rustc's bundled rust-lld. Apple's `ld` cannot link ELF, and this is the
 # pure-Rust cross path — no zig, no GNU cross-binutils. It holds only as long as
@@ -12,33 +16,26 @@
 # chosen for being pure Rust. If that ever changes the fallback is
 # `brew install zig && cargo install cargo-zigbuild`, then `cargo zigbuild`.
 #
-# The prerequisite is `rustup target add armv7-unknown-linux-gnueabihf`. rustc
-# resolves `rust-lld` from the active toolchain's own `lib/rustlib/<host>/bin`,
-# so it needs no entry on PATH.
+# The prerequisite is `rustup target add` for both. rustc resolves `rust-lld`
+# from the active toolchain's own `lib/rustlib/<host>/bin`, so it needs no entry
+# on PATH.
 
-# **This is what karyll ships as.** Dynamically linked against
-# the device's own glibc, because CJK input works by `dlopen`-ing Amazon's zh_CN
-# predictor plugin off the device and a static binary has no dynamic loader to
-# do it with. That is not a limitation to code around: it is the difference
-# between the two kinds of binary.
+# **This is what karyll ships as.** Dynamically linked against the device's own
+# glibc, because CJK input works by `dlopen`-ing Amazon's zh_CN predictor plugin
+# off the device and a static binary has no dynamic loader to do it with. That
+# is not a limitation to code around: it is the difference between the two kinds
+# of binary.
 #
-# The cost is that the binary requires glibc >= 2.34, so it is specific to this
-# firmware rather than to any Kindle. That was a deliberate choice: the device
-# is jailbroken and therefore frozen on 5.19.4.0.1 forever, and the CJK plugin
-# is firmware-specific anyway. Anyone wanting karyll on a different firmware
-# forks it.
-#
-# The sysroot flags are NOT here — `build.sh` sets them, because the
-# sysroot has to be assembled before it can be pointed at. It is Debian's armhf
-# glibc, fetched and checksummed by `deploy/sysroot.sh` on first build, so
-# `./build.sh` works from a fresh clone with no device involved.
+# The sysroot flags are NOT here — `build.sh` sets them, because the sysroot has
+# to be assembled before it can be pointed at. It is Debian jessie's glibc for
+# each architecture, fetched and checksummed on first build, so `./build.sh`
+# works from a fresh clone with no device involved.
+
+# Hard float: the Scribe and the Colorsoft.
 [target.armv7-unknown-linux-gnueabihf]
 linker = "rust-lld"
 
-# The old static target, kept only as a fallback while the dynamic build above
-# is still unproven on hardware. Nothing builds with it now. It made the binary
-# firmware-agnostic, which was worth having right up until CJK needed `dlopen`.
-# Delete this once the dynamic binary has run on the device.
-[target.armv7-unknown-linux-musleabihf]
+# Soft float: the Oasis 2, and every Kindle whose `/lib` has `ld-linux.so.3`
+# rather than `ld-linux-armhf.so.3`.
+[target.armv7-unknown-linux-gnueabi]
 linker = "rust-lld"
-rustflags = ["-C", "link-self-contained=yes"]

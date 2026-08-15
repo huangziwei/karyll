@@ -12,7 +12,12 @@ VAR="$EXT/var"
 LOG="$VAR/karyll.log"
 DOCS=/mnt/us/karyll
 
-mkdir -p "$VAR" 2>/dev/null
+# Both, and both every time. The documents directory is outside the extension
+# so that an update cannot take a draft with it, which also means nothing else
+# creates it: on a Kindle karyll has never run on, it is not there, and then the
+# welcome document cannot be written and the editor opens a path whose directory
+# does not exist.
+mkdir -p "$VAR" "$DOCS" 2>/dev/null
 
 log() { echo "[$(date)] $*" >> "$LOG"; }
 
@@ -53,6 +58,18 @@ if [ -z "$DOC" ]; then
     fi
 fi
 
+# **Which binary this Kindle can start, asked rather than assumed.** Two are
+# shipped, one for each ARM float ABI, and a Kindle has the loader for one of
+# them and not the other. Starting the wrong one fails as `not found` — the
+# shell reporting the missing interpreter, which reads exactly like the binary
+# itself being absent, so it is worth naming here rather than leaving to be
+# rediscovered.
+BIN="$EXT/bin/karyll"
+if [ ! -e /lib/ld-linux-armhf.so.3 ]; then
+    BIN="$EXT/bin/karyll-softfloat"
+    log "no hard-float loader here, using $BIN"
+fi
+
 log "launch $(uname -m), document $DOC"
-"$EXT/bin/karyll" "$DOC" >> "$LOG" 2>&1
+"$BIN" "$DOC" >> "$LOG" 2>&1
 log "exit=$?"

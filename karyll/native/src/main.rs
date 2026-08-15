@@ -30,6 +30,32 @@ const BUILD: &str = match option_env!("KARYLL_BUILD") {
     None => "dev",
 };
 
+/// The document named on the command line, or an empty one where there is no
+/// file yet.
+///
+/// **A file that is not there is a document that has not been written yet**,
+/// which is what the launcher hands over on a Kindle karyll has never run on:
+/// it names the welcome document before anything has created it. Refusing to
+/// start was the worst answer available — the editor exited before it drew
+/// anything, so what the writer saw was a tile that does nothing.
+///
+/// Anything else is still an error. A file that exists and cannot be read is a
+/// permission or a disk fault, and opening an empty page over the top of it
+/// would invite the writer to save an empty page over their draft.
+fn read_document(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "document: {} does not exist yet, starting empty",
+                path.display()
+            );
+            Ok(String::new())
+        }
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
 fn main() -> Result<()> {
     eprintln!("karyll {} build {BUILD}", env!("CARGO_PKG_VERSION"));
     if std::env::args().nth(1).as_deref() == Some("--pair") {
@@ -50,11 +76,19 @@ fn main() -> Result<()> {
         );
     }
 
+    // **Nothing else makes this.** It sits outside the extension so that an
+    // update cannot take a draft with it, which also means no install step
+    // creates it — on a Kindle karyll has never run on it is simply not there,
+    // and then the file list is empty, a new draft cannot be written, and the
+    // welcome document has nowhere to land. karyll owns the directory, so
+    // karyll makes it, however it was started.
+    if let Err(e) = std::fs::create_dir_all(DOCUMENTS) {
+        eprintln!("documents: cannot create {DOCUMENTS}: {e}");
+    }
+
     let path = std::env::args().nth(1).map(PathBuf::from);
     let mut doc = match &path {
-        Some(p) => Document::from_text(
-            &std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?,
-        ),
+        Some(p) => Document::from_text(&read_document(p)?),
         // The specimen is a demonstration, not a draft — it opens at the top.
         None => Document::from_text(SPECIMEN),
     };
@@ -195,6 +229,7 @@ fn main() -> Result<()> {
         // The remembered one is applied below rather than assigned here.
         language: Language::English,
         strip_drawn: Vec::new(),
+        strip_changed: false,
         status_drawn: String::new(),
         last_input: std::time::Instant::now(),
         holding_awake: false,
@@ -648,6 +683,16 @@ struct Editor {
     /// the strip, so redrawing it every keystroke would throw away the damage
     /// rectangle the page just computed.
     strip_drawn: Vec<String>,
+    /// Set when karyll changed what the strip says without being asked to, so
+    /// that the next tap on it is spent looking rather than pressing.
+    ///
+    /// **The same rule as the reveal, for the same reason**: a button that was
+    /// not on screen when the finger came down must not be pressed, and one
+    /// that changed its mind is no different. Pairing is where it happens — it
+    /// leaves Config on its own once the keyboard is up, so a writer reaching
+    /// for the `[ Done ]` they have been looking at finds `[ Exit ]` under
+    /// their finger and the editor closes.
+    strip_changed: bool,
     /// And what the status line beside them said, for the same reason. Kept
     /// apart from the cells because it is not one: it holds the room the
     /// buttons leave rather than a cell of its own, and nothing hit-tests it.
@@ -1765,7 +1810,13 @@ impl Editor {
         // and tapping blank page ran Save — and would as easily have run Close.
         // Elsewhere the tap still does its job, so placing the cursor does not
         // cost two taps.
-        if waking && y >= self.layout().strip_top {
+        //
+        // A strip that changed its own mind is the same case — see
+        // [`Editor::strip_changed`] — and is spent here for the same reason.
+        // Cleared by a tap anywhere, because a tap is the writer having looked
+        // at the screen since it changed.
+        let changed = std::mem::take(&mut self.strip_changed);
+        if (waking || changed) && y >= self.layout().strip_top {
             self.touch_down = None;
             return self.paint().map(|()| false);
         }
@@ -3385,7 +3436,13 @@ impl Editor {
                     self.refresh_paired();
                     self.show_status("Paired. Start typing.")?;
                     std::thread::sleep(std::time::Duration::from_secs(2));
+                    // Out of Config, because there is nothing left to do here
+                    // and a keyboard that works wants typing on. The strip
+                    // changes from `[ Done ]` to the writing row as it goes,
+                    // under a finger that may already be on its way to the
+                    // corner — so the next tap there is spent looking.
                     self.mode = Mode::Writing;
+                    self.strip_changed = true;
                     return self.paint();
                 }
                 Ok(Some(false)) | Err(_) => {
