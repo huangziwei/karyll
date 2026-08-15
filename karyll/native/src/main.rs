@@ -5,9 +5,9 @@ mod font;
 mod hid;
 mod ime;
 mod keymap;
-
+mod orientation;
 mod pen;
-
+mod power;
 mod render;
 mod screenshot;
 mod touch;
@@ -355,6 +355,50 @@ impl Language {
             // defined against that arrangement.
             _ => keymap::Layout::Us,
         }
+    }
+}
+
+/// Watches for accelerometer readings that mean nothing to us.
+///
+/// **Almost silent on purpose, and that took two device runs to earn.** What
+/// the runs established:
+///
+/// * **`ABS_X`, `ABS_Y` and `ABS_Z` are never sent.** The driver advertises all
+///   three and reports `0` for every one forever, so there is no gravity vector
+///   and [`evdev::Sample::dominant`] has nothing to work with on this firmware.
+///   The position code is the entire signal.
+/// * **The sensor reports transitions, not a stream.** It is quiet while the
+///   device is still and emits one event when it is turned. An earlier version
+///   of this warned "nothing for 10s — sensor may be powered down", which was
+///   built for a streaming sensor and would have cried wolf through every
+///   writing session. Silence here is the normal state.
+/// * **It emits a settling burst on power-up** — the same sequence appeared at
+///   the top of every session before the device had been touched. Those codes
+///   are real ones, so they cannot be filtered by value; they are harmless
+///   because turning to an orientation you are already in does nothing.
+///
+/// What is left worth saying is an *unrecognised* code, which would mean this
+/// firmware encodes positions differently and the mapping in
+/// [`orientation::Orientation::from_tilt`] needs redoing. Reported once per
+/// distinct code, because a firmware that did that would do it continuously.
+#[derive(Default)]
+struct AccelWatch {
+    unknown: Vec<i32>,
+}
+
+impl AccelWatch {
+    fn note(&mut self, sample: evdev::Sample) {
+        if orientation::Orientation::from_tilt(sample.tilt).is_some()
+            || self.unknown.contains(&sample.tilt)
+        {
+            return;
+        }
+        self.unknown.push(sample.tilt);
+        eprintln!(
+            "accel: position code {} is not one of 15/16/17/18 — \
+             this firmware may encode orientation differently",
+            sample.tilt
+        );
     }
 }
 
@@ -2688,6 +2732,29 @@ impl Editor {
         }
     }
 
+    /// Let the device sleep once the writer has been away long enough.
+    ///
+    /// **The latch is on writing, not on the app being open.** Holding it for
+    /// the whole session fixed the screensaver arriving mid-sentence and bought
+    /// a Kindle that could never sleep: it also holds WiFi awake, and a device
+    /// rated in weeks of standby was flat by morning if the editor was left on a
+    /// desk.
+    ///
+    /// Safe to give back only because of the keyboard fix: a suspend destroys
+    /// the Bluetooth keyboard's `/dev/input` node, and until `wait` learned to
+    /// report a hangup, waking up meant an editor that never typed again.
+    fn poll_sleep(&mut self) {
+        if !self.holding_awake || self.last_input.elapsed() < power::IDLE_SLEEP {
+            return;
+        }
+        eprintln!(
+            "power: no input for {} minutes — letting the device sleep",
+            power::IDLE_SLEEP.as_secs() / 60
+        );
+        power::prevent_screensaver(false);
+        self.holding_awake = false;
+    }
+
     /// Record where the cursor is in the open document.
     ///
     /// Called wherever a document is left — saved, switched away from, or
@@ -2911,6 +2978,21 @@ impl Editor {
         // Repaint anyway: if it declines, nothing else would.
         self.frame = None;
         self.paint()
+    }
+
+    fn poll_orientation(&mut self) {
+        if self.orientation_checked.elapsed() < ORIENTATION_POLL {
+            return;
+        }
+        self.orientation_checked = std::time::Instant::now();
+        let now = orientation::Orientation::detect();
+        if now != self.touch_orientation {
+            eprintln!(
+                "orientation: framework moved {:?} -> {now:?}",
+                self.touch_orientation
+            );
+            self.touch_orientation = now;
+        }
     }
 
     /// The document as it should appear right now, with any preedit spliced in
@@ -4100,6 +4182,29 @@ fn autosave_due(idle_for: Option<std::time::Duration>, dirty_for: std::time::Dur
     idle_for.is_none_or(|idle| idle >= AUTOSAVE_IDLE) || dirty_for >= AUTOSAVE_MAX
 }
 
+/// Remembered orientation, beside the logs so it survives an update.
+fn orientation_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/orientation")
+}
+
+/// The orientation to open in: what was last chosen, or whatever the framework
+/// currently has.
+fn read_orientation() -> orientation::Orientation {
+    let (orientation, from) = match std::fs::read_to_string(orientation_file()) {
+        Ok(letter) => (
+            orientation::Orientation::from_letter(letter.trim()),
+            "remembered",
+        ),
+        Err(_) => (orientation::Orientation::detect(), "asked winmgr"),
+    };
+    eprintln!("orientation: {orientation:?} ({from})");
+    orientation
+}
+
+fn write_orientation(orientation: orientation::Orientation) {
+    let _ = std::fs::write(orientation_file(), orientation.letter().to_string());
+}
+
 /// The selected input source, remembered for the same reason as the layout: a
 /// writer who left in Chinese comes back to Chinese.
 fn language_file() -> PathBuf {
@@ -4773,6 +4878,11 @@ fn new_document() -> PathBuf {
     }
     PathBuf::from(format!("{DOCUMENTS}/draft.md"))
 }
+
+/// How often to ask the window manager which way the screen is. A subprocess
+/// each time, so not every tick — but often enough that a flip does not leave
+/// the buttons dead for long.
+const ORIENTATION_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How far a finger may wander and still count as having stayed put.
 ///
