@@ -13,14 +13,10 @@
 # The body is hand-edited. Only the `# Icon:` line above is generated — rerun
 # device/make-tile.sh after changing assets/cover.svg.
 
-# Don't stack a second editor on a double tap. Two instances would fight over an
-# exclusive keyboard grab and both try to start and stop the Bluetooth daemon.
-#
-# This is the cheap check that catches the common case; the launcher holds a
-# proper lock across the whole session, including the seconds it spends waiting
-# for a keyboard to connect, which is the window this test cannot see.
-if pidof karyll >/dev/null 2>&1; then
-    exit 0
-fi
-
+# **Every tap gets through to the launcher**, which is what decides what to do
+# about an editor that is already running — it replaces it. Nothing may be
+# turned away here: the framework can take the screen back from karyll while it
+# goes on running behind the home screen, and a tile that quietly does nothing
+# then leaves a writer with no way to their page. Only one editor ever lives,
+# and the lock the launcher holds is what makes that true.
 nohup sh -c 'sleep 1; exec /mnt/us/extensions/karyll/bin/karyll.sh' >/dev/null 2>&1 &

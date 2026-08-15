@@ -30,6 +30,12 @@ const API: &str = "127.0.0.1:8321";
 /// The daemon is a bundled Python runtime and takes seconds to come up.
 const START_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// How long a daemon gets to shut itself down before it is killed. It is
+/// spent while the writer is leaving, so it has to be short — and what matters
+/// most about a clean exit, thawing the framework's `btd`, is the first thing
+/// its handler does. See [`end`].
+const STOP_TIMEOUT: Duration = Duration::from_millis(1500);
+
 /// Long enough for a scan to answer, short enough that a wedged daemon does not
 /// hang the editor.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -68,6 +74,24 @@ pub struct Device {
     pub protocol: String,
 }
 
+/// What the Bluetooth stack can do right now.
+///
+/// **Starting is not failing**, and the difference is the whole of what a
+/// writer needs to be told. Bringing the radio up is a Python runtime, a kernel
+/// module and a chip handoff, and karyll opens the document without waiting for
+/// any of it — so for the first seconds of a session there is no daemon to
+/// answer, and a control that reaches for one anyway comes back with a
+/// connection error that reads like a broken app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ready {
+    /// Spawned, not answering yet.
+    Starting,
+    /// Answering.
+    Up,
+    /// Never spawned: nothing to wait for.
+    Unavailable,
+}
+
 pub struct Hid {
     /// The install directory, which is also the daemon's base path.
     base: PathBuf,
@@ -78,9 +102,14 @@ pub struct Hid {
     /// When the daemon was spawned, which is what [`Hid::poll_up`] measures its
     /// patience from.
     spawned: Instant,
-    /// Whether the question "is it up yet" has been settled, so it is asked
-    /// once rather than on every tick of the editor's loop.
+    /// Whether the daemon has answered, so it is asked only until it has.
     answered: bool,
+    /// Whether it is answering now, which is what the Keyboard section shows
+    /// and what every control on it needs before it can do anything.
+    up: bool,
+    /// Whether the log has been told it is taking a while, which is said once
+    /// and does not stop the asking.
+    complained: bool,
 }
 
 impl Hid {
@@ -92,6 +121,17 @@ impl Hid {
             keep_alive: false,
             spawned: Instant::now(),
             answered: true,
+            up: false,
+            complained: false,
+        }
+    }
+
+    /// How far along the Bluetooth stack is, for a page that has to say.
+    pub fn ready(&self) -> Ready {
+        match (self.up, self.child.is_some()) {
+            (true, _) => Ready::Up,
+            (false, true) => Ready::Starting,
+            (false, false) => Ready::Unavailable,
         }
     }
 
@@ -194,6 +234,7 @@ impl Hid {
             && let Some(pid) = self.left_running()
         {
             eprintln!("bluetooth: keeping the daemon we left running (pid {pid})");
+            self.up = true;
             return Ok(());
         }
 
@@ -265,6 +306,8 @@ impl Hid {
         let _ = std::fs::write(self.pid_path(), format!("{}\n", child.id()));
         self.child = Some(child);
         self.answered = false;
+        self.up = false;
+        self.complained = false;
         self.spawned = Instant::now();
         Ok(())
     }
@@ -280,18 +323,27 @@ impl Hid {
     /// else that needs the daemon asks for it when it is asked for.
     ///
     /// So it is polled while the writer reads, and says so once, either way.
+    ///
+    /// **Being late is not the same as being dead**, and this asks until it
+    /// answers. Warming a Broadcom chip means killing the framework's own
+    /// `bsa_server` and taking the UART, and on a Kindle where that needs a
+    /// retry it is half a minute before the daemon says a word. Giving up on it
+    /// at a deadline leaves the editor believing there is no Bluetooth on a
+    /// device where the keyboard is about to connect — so the deadline only
+    /// buys a line in the log.
     pub fn poll_up(&mut self) -> Option<Result<()>> {
         if self.answered || self.child.is_none() {
             return None;
         }
         if self.is_up() {
             self.answered = true;
+            self.up = true;
             return Some(Ok(()));
         }
-        if self.spawned.elapsed() > START_TIMEOUT {
-            self.answered = true;
+        if !self.complained && self.spawned.elapsed() > START_TIMEOUT {
+            self.complained = true;
             return Some(Err(anyhow!(
-                "the Bluetooth daemon did not answer within {START_TIMEOUT:?}"
+                "the Bluetooth daemon has not answered in {START_TIMEOUT:?} — still asking"
             )));
         }
         None
@@ -322,7 +374,7 @@ impl Hid {
 
         let _ = std::fs::remove_file(self.pid_path());
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            end(child.id());
             let _ = child.wait();
             return;
         }
@@ -541,6 +593,32 @@ fn is_daemon(pid: u32, base: &Path) -> bool {
 /// command line. That left a daemon answering on the API port that karyll could
 /// neither stop nor replace — so it never spawned its own, and never captured
 /// its log.
+/// End the daemon the way it knows how to be ended.
+///
+/// **`SIGKILL` costs the next launch fifteen seconds.** To take the radio the
+/// daemon freezes the framework's `btd` so it cannot respawn `bsa_server`, and
+/// a daemon killed outright never thaws it — so the next start asks `btfd` to
+/// warm the chip, waits twelve seconds for a `bsa_server` that a stopped `btd`
+/// will never spawn, and then has to recover `btd` itself before it can go on.
+/// The same warm-up against a healthy framework takes one second.
+///
+/// So it is asked first: the daemon installs a `SIGTERM` handler and shuts down
+/// cleanly on one. `SIGKILL` is what happens when it does not answer, because
+/// the editor is on its way out and cannot wait long — but by then the thawing
+/// is the first thing its handler will have done.
+fn end(pid: u32) {
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline {
+        // Signal 0 asks whether the process is still there without touching it.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
 fn kill_running(base: &Path) -> usize {
     let base = base.to_string_lossy().to_string();
     let me = std::process::id();
@@ -563,7 +641,7 @@ fn kill_running(base: &Path) -> usize {
             continue;
         };
         if cmdline.contains(&base) || cmdline.contains("main.py --daemon") {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            end(pid);
             killed += 1;
         }
     }

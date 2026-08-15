@@ -61,6 +61,7 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--pair") {
         return pair();
     }
+    catch_signals();
     let fonts = font::Fonts::load(read_choices())?;
     // A firmware that has moved or dropped a face otherwise shows up only as
     // text drawn in the wrong style, so say what was found.
@@ -246,8 +247,8 @@ fn main() -> Result<()> {
 /// Wait until one of `fds` has something to read, or `timeout_ms` passes
 /// (negative for no timeout), and report which are ready.
 ///
-/// A signal interrupting the wait is not an error — nothing has happened yet,
-/// so it just waits again.
+/// A signal interrupting the wait is not an error and not a descriptor: it
+/// reports nothing ready, and the caller goes round once and sees why.
 fn wait(fds: &[std::os::unix::io::RawFd], timeout_ms: i32) -> Result<Vec<bool>> {
     let mut poll: Vec<libc::pollfd> = fds
         .iter()
@@ -257,27 +258,52 @@ fn wait(fds: &[std::os::unix::io::RawFd], timeout_ms: i32) -> Result<Vec<bool>> 
             revents: 0,
         })
         .collect();
-    loop {
-        let n = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, timeout_ms) };
-        if n >= 0 {
-            // **Any `revents`, not just `POLLIN`.** A Bluetooth keyboard's
-            // `/dev/input/eventN` is destroyed the moment the link drops, and
-            // the kernel reports that as `POLLHUP`/`POLLERR` — never as
-            // readable. Testing `POLLIN` alone meant the node was never read,
-            // so the read never failed, so the descriptor was never dropped and
-            // the search for a replacement never restarted: **the app went deaf
-            // for the rest of the session** and only a relaunch fixed it. That
-            // is one bug behind every symptom of it — reconnecting from Config,
-            // power-cycling the keyboard, forgetting and re-pairing, and even
-            // the first pairing of a session that had held a node before.
-            // Reporting the hangup lets the read fail, which is what the
-            // "lost — looking for another" path was always waiting for.
-            return Ok(poll.iter().map(|p| p.revents != 0).collect());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err).context("poll keyboard and display");
-        }
+    let n = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, timeout_ms) };
+    if n >= 0 {
+        // **Any `revents`, not just `POLLIN`.** A Bluetooth keyboard's
+        // `/dev/input/eventN` is destroyed the moment the link drops, and
+        // the kernel reports that as `POLLHUP`/`POLLERR` — never as
+        // readable. Testing `POLLIN` alone meant the node was never read,
+        // so the read never failed, so the descriptor was never dropped and
+        // the search for a replacement never restarted: **the app went deaf
+        // for the rest of the session** and only a relaunch fixed it. That
+        // is one bug behind every symptom of it — reconnecting from Config,
+        // power-cycling the keyboard, forgetting and re-pairing, and even
+        // the first pairing of a session that had held a node before.
+        // Reporting the hangup lets the read fail, which is what the
+        // "lost — looking for another" path was always waiting for.
+        return Ok(poll.iter().map(|p| p.revents != 0).collect());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() != std::io::ErrorKind::Interrupted {
+        return Err(err).context("poll keyboard and display");
+    }
+    // **A signal is an answer.** Waiting again here would block with the flag
+    // [`on_signal`] just set and unread, and the editor would go on running
+    // until something else happened to it. Nothing is ready, and the caller is
+    // free to look at why it woke.
+    Ok(vec![false; poll.len()])
+}
+
+/// Set when the editor has been asked to stop.
+///
+/// **A killed editor still has work to do**: the document is only written by
+/// autosave a couple of seconds after the last keystroke, the Bluetooth daemon
+/// is a child that outlives it and holds both the radio and its API port, and
+/// powerd is holding the screen awake at karyll's request. A launch replaces
+/// the editor that is running by killing it — see the launcher — so this is the
+/// ordinary way karyll ends, not an emergency.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Async-signal-safe by construction: one relaxed store and nothing else.
+extern "C" fn on_signal(_: libc::c_int) {
+    STOPPING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Ask to be told rather than killed outright.
+fn catch_signals() {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe { libc::signal(signal, on_signal as *const () as libc::sighandler_t) };
     }
 }
 
@@ -790,6 +816,13 @@ impl Editor {
         self.paint()?;
 
         loop {
+            // Asked to stop — see [`STOPPING`]. Out through the same door as
+            // `[ Exit ]`, so the document is written, the daemon is stopped and
+            // the screen is let go of.
+            if STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("signal: asked to stop");
+                return Ok(());
+            }
             // Drain X first: x11rb decodes into its own buffer, so an event
             // already read leaves nothing on the socket for `poll` to report.
             match self.window.drain_events()? {
@@ -2718,12 +2751,23 @@ impl Editor {
         // daemon — the log says `Connection cancelled (suspend)` — which drops
         // the very keyboard being typed on. What is remembered shows without
         // asking; scanning is a choice.
+        //
+        // **It says what it is doing, including when that is nothing yet.** The
+        // editor opens without waiting for the radio, so for the first seconds
+        // of a session there is no daemon to answer — and a chip that goes on
+        // offering a scan then is not being kind, it is being wrong twice: it
+        // hides a state the writer can see the consequences of, and it answers
+        // a tap with a connection error.
         items.push((
             ui::Item::Choice {
                 label: "Bluetooth".into(),
-                options: vec![match self.scanning {
-                    Some(started) => format!("Scanning… {}s", started.elapsed().as_secs()),
-                    None => "Scan for keyboards".into(),
+                options: vec![match (self.bluetooth.ready(), self.scanning) {
+                    (hid::Ready::Starting, _) => "Starting…".to_string(),
+                    (hid::Ready::Unavailable, _) => "Unavailable".to_string(),
+                    (_, Some(started)) => {
+                        format!("Scanning… {}s", started.elapsed().as_secs())
+                    }
+                    (_, None) => "Scan for keyboards".to_string(),
                 }],
                 on: vec![self.scanning.is_some()],
             },
@@ -3090,11 +3134,23 @@ impl Editor {
             // and come back on its own afterwards.
             self.show_status("Scanning disconnects the keyboard for a moment…")?;
         }
-        if !self.bluetooth.is_up()
-            && let Err(err) = self.bluetooth.start()
-        {
-            self.scanning = None;
-            return self.show_status(&format!("Bluetooth would not start: {err:#}"));
+        // **Still coming up is not a failure to report as one.** The editor
+        // does not wait for the radio, so this chip can be tapped seconds
+        // before there is anything listening on the other end, and the daemon
+        // is already on its way — there is nothing to do but say so.
+        match self.bluetooth.ready() {
+            hid::Ready::Starting => {
+                self.scanning = None;
+                return self.show_status("Bluetooth is still starting — try again in a moment.");
+            }
+            hid::Ready::Unavailable => {
+                self.scanning = None;
+                if let Err(err) = self.bluetooth.start() {
+                    return self.show_status(&format!("Bluetooth would not start: {err:#}"));
+                }
+                return self.show_status("Starting Bluetooth…");
+            }
+            hid::Ready::Up => {}
         }
         if let Err(err) = self.bluetooth.scan() {
             self.scanning = None;

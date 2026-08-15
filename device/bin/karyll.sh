@@ -21,16 +21,36 @@ mkdir -p "$VAR" "$DOCS" 2>/dev/null
 
 log() { echo "[$(date)] $*" >> "$LOG"; }
 
-# Hold the session against a second tap. Two editors would fight over an
-# exclusive keyboard grab and over the daemon's lifetime.
+# **A tap on the tile replaces whatever is running.** Two editors at once would
+# fight over an exclusive keyboard grab and over the daemon's lifetime, so only
+# one may live — but refusing the launch is the worse half of that: the
+# framework can take the screen back from karyll while it goes on running
+# behind the home screen, and pairing a keyboard is exactly when it does,
+# because the Bluetooth daemon kills `bsa_server` out from under it. A tile that
+# does nothing then is a writer with no way back to their page.
+#
+# What is lost by killing is the last couple of seconds of typing that autosave
+# has not reached, which by the time someone has walked to the library and
+# tapped a tile is nothing. A second tap by mistake costs a restart, which is
+# the cheaper mistake of the two.
 LOCK="$VAR/karyll.pid"
 if [ -f "$LOCK" ]; then
     OLD=$(cat "$LOCK" 2>/dev/null)
     if [ -n "$OLD" ] && [ -d "/proc/$OLD" ]; then
-        log "already running (pid $OLD), ignoring launch"
-        exit 0
+        log "already running (pid $OLD), replacing it"
+        kill "$OLD" 2>/dev/null
+        # Its launcher's own trap clears the lock and the screensaver latch, so
+        # wait for that rather than racing it: the pid is the shell's, and the
+        # editor it is waiting on goes first.
+        i=0
+        while [ -d "/proc/$OLD" ] && [ "$i" -lt 5 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        [ -d "/proc/$OLD" ] && kill -9 "$OLD" 2>/dev/null
+    else
+        log "clearing stale lock (pid ${OLD:-unknown})"
     fi
-    log "clearing stale lock (pid ${OLD:-unknown})"
 fi
 echo $$ > "$LOCK"
 
@@ -39,7 +59,11 @@ echo $$ > "$LOCK"
 # grabbed key cannot reset the idle timer. The binary is built `panic = "abort"`
 # and so skips its own cleanup on an abort, which would leave the Kindle unable
 # to sleep after the editor is gone. This trap fires however the binary died.
-trap 'rm -f "$LOCK"; lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null' EXIT INT TERM
+#
+# **The lock goes only if it is still ours.** A launch that replaced this one
+# has already written its own pid there, and removing it then would leave the
+# next tap unable to see the editor that is running.
+trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi; lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null' EXIT INT TERM
 
 # The most recently touched document, or the welcome one. Documents live
 # outside the extension so replacing it on update cannot take them with it.
