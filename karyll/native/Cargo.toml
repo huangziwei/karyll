@@ -42,12 +42,6 @@ x11rb = { version = "0.13", default-features = false }
 # no build script.
 libc = "0.2"
 
-# image: writing screenshots. Only the PNG encoder — no decoders, no other
-# formats — because the one job is dumping the backing store to a file that can
-# be looked at off-device. Pure Rust (the `png` crate underneath), so the static
-# cross-link holds.
-image = { version = "0.25", default-features = false, features = ["png"] }
-
 # anyhow: error context through the on-device run loop, where a failure needs
 # to name the layer it came from.
 anyhow = "1"

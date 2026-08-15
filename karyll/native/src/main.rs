@@ -9,7 +9,6 @@ mod orientation;
 mod pen;
 mod power;
 mod render;
-mod screenshot;
 mod touch;
 mod ui;
 mod window;
@@ -1580,12 +1579,6 @@ impl Editor {
                         return Ok(true);
                     }
                 }
-                // The firmware's own two-corner gesture. It never fires while
-                // karyll is foreground, so karyll answers it.
-                touch::Touch::Screenshot => match screenshot::capture(&self.window) {
-                    Ok(path) => eprintln!("screenshot: {}", path.display()),
-                    Err(err) => eprintln!("screenshot failed: {err:#}"),
-                },
             }
         }
         Ok(false)

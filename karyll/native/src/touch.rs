@@ -62,11 +62,6 @@ const ABS_MT_TRACKING_ID: u16 = 0x39;
 /// because it is the device saying which node is the finger panel.
 const TOUCH_ALIAS: &str = "/dev/input/touch";
 
-/// Side of the square corner zones for the two-finger screenshot gesture, as a
-/// fraction of the panel. sidle uses ~14% of the width, which reads clearly as
-/// "a corner" without being easy to hit by accident.
-const CORNER: f32 = 0.14;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Touch {
     /// A finger landed. Reported immediately so the target can be inverted
@@ -76,10 +71,6 @@ pub enum Touch {
     /// The finger lifted. This is what resolves an action, at the position it
     /// lifted from.
     Up { x: i32, y: i32 },
-    /// Two contacts in opposite corners — the firmware's own screenshot
-    /// gesture, which never fires while karyll is foreground because the
-    /// framework is not the one drawing.
-    Screenshot,
 }
 
 pub struct Touchscreen {
@@ -95,8 +86,6 @@ pub struct Touchscreen {
     origin: Option<(i32, i32, Instant)>,
     x: i32,
     y: i32,
-    x1: i32,
-    y1: i32,
     /// Set once the current contact has already been reported as a long press,
     /// so holding does not repeat it.
     fired: bool,
@@ -106,11 +95,6 @@ pub struct Touchscreen {
     /// previous touch, which is exactly one behind.
     began: bool,
     ended: bool,
-    /// The second contact, tracked only for the screenshot gesture.
-    slot1: Option<(i32, i32)>,
-    /// Latched so the gesture fires once per two-finger episode rather than on
-    /// every packet while both fingers are down.
-    shot_latched: bool,
     logged: bool,
 }
 
@@ -131,6 +115,11 @@ impl Touchscreen {
         // holding the button for thirty seconds. No editor is worth making the
         // device unrecoverable, so we share the panel and accept that the
         // framework sees the same taps we do.
+        //
+        // It is also why karyll takes no screenshots of its own: the firmware's
+        // opposite-corners gesture reads the framebuffer directly, so it
+        // captures the editor's own drawing and writes it to
+        // `/mnt/us/screenshots` regardless of which process painted.
         let x_extent = read_extent(&file, ABS_MT_POSITION_X, 1859);
         let y_extent = read_extent(&file, ABS_MT_POSITION_Y, 2479);
         eprintln!(
@@ -150,13 +139,9 @@ impl Touchscreen {
             origin: None,
             x: 0,
             y: 0,
-            x1: 0,
-            y1: 0,
             fired: false,
             began: false,
             ended: false,
-            slot1: None,
-            shot_latched: false,
             logged: false,
         })
     }
@@ -191,21 +176,6 @@ impl Touchscreen {
     fn feed(&mut self, kind: u16, code: u16, value: i32, out: &mut Vec<Touch>) {
         match (kind, code) {
             (EV_ABS, ABS_MT_SLOT) => self.slot = value.max(0) as usize,
-            (EV_ABS, ABS_MT_TRACKING_ID) if self.slot == 1 => {
-                self.slot1 = (value >= 0).then_some((self.x1, self.y1));
-            }
-            (EV_ABS, ABS_MT_POSITION_X) if self.slot == 1 => {
-                self.x1 = value;
-                if self.slot1.is_some() {
-                    self.slot1 = Some((self.x1, self.y1));
-                }
-            }
-            (EV_ABS, ABS_MT_POSITION_Y) if self.slot == 1 => {
-                self.y1 = value;
-                if self.slot1.is_some() {
-                    self.slot1 = Some((self.x1, self.y1));
-                }
-            }
             (EV_ABS, ABS_MT_TRACKING_ID) if self.slot == 0 => {
                 if value >= 0 {
                     self.began = true;
@@ -216,9 +186,6 @@ impl Touchscreen {
             (EV_ABS, ABS_MT_POSITION_X) if self.slot == 0 => self.x = value,
             (EV_ABS, ABS_MT_POSITION_Y) if self.slot == 0 => self.y = value,
             (EV_SYN, SYN_REPORT) => {
-                // Two contacts in opposite corners is the screenshot gesture.
-                // Checked before anything else so it wins over a stray tap, and
-                // latched so it fires once per episode.
                 if self.began {
                     self.began = false;
                     self.origin = Some((self.x, self.y, Instant::now()));
@@ -227,24 +194,6 @@ impl Touchscreen {
                         x: self.x,
                         y: self.y,
                     });
-                }
-                if let (Some(origin), Some(second)) = (self.origin, self.slot1) {
-                    if !self.shot_latched
-                        && opposite_corners(
-                            (origin.0, origin.1),
-                            second,
-                            self.x_extent,
-                            self.y_extent,
-                        )
-                    {
-                        self.shot_latched = true;
-                        // The gesture, not a tap: swallow the lift.
-                        self.fired = true;
-                        out.push(Touch::Screenshot);
-                        return;
-                    }
-                } else {
-                    self.shot_latched = false;
                 }
                 if self.ended {
                     self.ended = false;
@@ -265,26 +214,6 @@ impl Touchscreen {
             _ => {}
         }
     }
-}
-
-/// True when two contacts occupy opposite corners, either diagonal and in
-/// either finger order.
-///
-/// Tested in panel coordinates, which needs no orientation: a half turn maps a
-/// diagonal pair onto the other diagonal, and both count.
-fn opposite_corners(a: (i32, i32), b: (i32, i32), x: Extent, y: Extent) -> bool {
-    let box_w = ((x.max - x.min) as f32 * CORNER) as i32;
-    let box_h = ((y.max - y.min) as f32 * CORNER) as i32;
-    let left = |p: (i32, i32)| p.0 - x.min < box_w;
-    let right = |p: (i32, i32)| x.max - p.0 < box_w;
-    let top = |p: (i32, i32)| p.1 - y.min < box_h;
-    let bottom = |p: (i32, i32)| y.max - p.1 < box_h;
-
-    let tl = |p| left(p) && top(p);
-    let tr = |p| right(p) && top(p);
-    let bl = |p| left(p) && bottom(p);
-    let br = |p| right(p) && bottom(p);
-    (tl(a) && br(b)) || (br(a) && tl(b)) || (tr(a) && bl(b)) || (bl(a) && tr(b))
 }
 
 /// Ask a device for an axis range, falling back to `fallback` when the ioctl is
@@ -409,8 +338,6 @@ B: KEY=1c03 0 0 0 0 0 0 0 0 0 0
     fn detached() -> Touchscreen {
         Touchscreen {
             file: File::open("/dev/null").expect("/dev/null"),
-            slot1: None,
-            shot_latched: false,
             x_extent: Extent { min: 0, max: 1859 },
             y_extent: Extent { min: 0, max: 2479 },
             pending: Vec::new(),
@@ -418,8 +345,6 @@ B: KEY=1c03 0 0 0 0 0 0 0 0 0 0
             origin: None,
             x: 0,
             y: 0,
-            x1: 0,
-            y1: 0,
             fired: false,
             began: false,
             ended: false,
@@ -470,37 +395,14 @@ B: KEY=1c03 0 0 0 0 0 0 0 0 0 0
     }
 
     #[test]
-    fn opposite_corners_are_the_screenshot_gesture_in_either_order() {
-        let x = Extent { min: 0, max: 1859 };
-        let y = Extent { min: 0, max: 2479 };
-        // Both diagonals count, and so does either finger first.
-        assert!(opposite_corners((20, 20), (1840, 2460), x, y));
-        assert!(opposite_corners((1840, 2460), (20, 20), x, y));
-        assert!(opposite_corners((1840, 20), (20, 2460), x, y));
-        // Same corner twice, or a corner and the middle, is not.
-        assert!(!opposite_corners((20, 20), (30, 30), x, y));
-        assert!(!opposite_corners((20, 20), (900, 1200), x, y));
-        // Adjacent corners share an edge; that is not a diagonal.
-        assert!(!opposite_corners((20, 20), (1840, 20), x, y));
-    }
-
-    #[test]
-    fn two_corner_contacts_fire_once_and_swallow_the_tap() {
+    fn a_second_finger_reports_nothing_of_its_own() {
+        // Including in opposite corners, which is the firmware's screenshot
+        // gesture: the framework serves it off the same panel, and a second
+        // capture from here would only duplicate the file it writes.
         let mut t = detached();
         contact(&mut t, 20, 20);
         second(&mut t, 1840, 2460);
-        assert_eq!(syn(&mut t), vec![Touch::Screenshot]);
-        // Latched: holding both fingers must not fire again.
         assert!(syn(&mut t).is_empty());
-        // And lifting is not also a tap.
-        assert!(release(&mut t).is_empty());
-    }
-
-    #[test]
-    fn a_second_finger_elsewhere_is_not_the_gesture() {
-        let mut t = detached();
-        contact(&mut t, 900, 1200);
-        second(&mut t, 950, 1250);
         assert!(syn(&mut t).is_empty());
     }
 

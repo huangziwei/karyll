@@ -216,11 +216,6 @@ impl Window {
         }
     }
 
-    /// The backing store, one byte of luminance per pixel. What is on screen.
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
-    }
-
     pub fn put_pixel(&mut self, x: u16, y: u16, value: u8) {
         if x < self.width && y < self.height {
             self.pixels[y as usize * self.width as usize + x as usize] = value;
