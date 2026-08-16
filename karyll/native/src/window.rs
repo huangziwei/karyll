@@ -34,8 +34,8 @@ use crate::orientation::Orientation;
 use x11rb::connection::RequestConnection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat,
-    PropMode, Window as XWindow, WindowClass,
+    AtomEnum, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
+    ImageFormat, PropMode, StackMode, Visibility, Window as XWindow, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 // `change_property8` lives in the wrapper `ConnectionExt`.
@@ -327,6 +327,48 @@ pub struct Window {
     pixels: Vec<u8>,
     app_id: String,
     orientation: Orientation,
+    burial: Burial,
+}
+
+/// The budget for taking the screen back, spent per burial rather than per
+/// session — see [`Window::retake`].
+#[derive(Default)]
+struct Burial {
+    /// Attempts made since the window was last wholly visible.
+    spent: u8,
+}
+
+impl Burial {
+    /// How many times one burial may be answered before the editor gives way.
+    ///
+    /// Small on purpose. Every answer that lands is a panel refresh, so a
+    /// manager that means it — a dialog, a screensaver, anything the framework
+    /// puts up deliberately — costs a bounded flicker and then keeps the
+    /// screen. The budget is there for the one that does not mean it.
+    const LIMIT: u8 = 3;
+
+    /// Fold in what the server said, and answer whether to ask for the screen.
+    ///
+    /// **Wholly visible is the only thing that refills the budget.** Partly
+    /// visible refills nothing: a manager that uncovers a strip and buries the
+    /// rest would otherwise be able to draw an unbounded number of refreshes
+    /// out of the editor, one per exchange.
+    fn saw(&mut self, state: Visibility) -> bool {
+        match state {
+            Visibility::FULLY_OBSCURED if self.spent < Self::LIMIT => {
+                self.spent += 1;
+                true
+            }
+            Visibility::UNOBSCURED => {
+                if self.spent > 0 {
+                    eprintln!("window: back in front");
+                    self.spent = 0;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Decide the palette from the screen's own visual and the panel in front of it.
@@ -428,7 +470,15 @@ impl Window {
             screen.root_visual,
             &CreateWindowAux::new()
                 .background_pixel(screen.white_pixel)
-                .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
+                // **Visibility, because being covered is not being unmapped.**
+                // The manager stacks the home screen over the editor rather
+                // than taking its window away, so `STRUCTURE_NOTIFY` stays
+                // silent through the one event a writer actually notices.
+                .event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::STRUCTURE_NOTIFY
+                        | EventMask::VISIBILITY_CHANGE,
+                ),
         )
         .context("create_window")?;
 
@@ -459,6 +509,7 @@ impl Window {
             pixels,
             app_id: app_id.to_string(),
             orientation,
+            burial: Burial::default(),
         })
     }
 
@@ -476,6 +527,38 @@ impl Window {
         self.orientation = orientation;
         set_name(&self.conn, self.win, &self.app_id, orientation)?;
         self.conn.flush().context("flush after rotate")?;
+        Ok(())
+    }
+
+    /// Ask for the screen back after the framework has stacked itself on top.
+    ///
+    /// **A relaunch races the last exit's restore.** Leaving the editor makes
+    /// the framework redraw the home screen, which on a panel this size is not
+    /// instant, and a tile tapped in that gap opens the editor underneath a
+    /// restore that has not landed yet. The window is mapped, painted and then
+    /// covered — the flash a writer sees before the home screen comes back —
+    /// and the editor goes on running where nothing can reach it. The faster
+    /// the exit, the wider the gap, which is why it looks like an unreliable
+    /// tile rather than a race.
+    ///
+    /// Both levers at once, because neither is documented and one of them
+    /// should hold: the stacking request is X's own, and the window name is the
+    /// layout spec the lab126 manager reads — the same lever
+    /// [`Window::set_orientation`] pulls, re-read here rather than changed.
+    fn retake(&mut self) -> Result<()> {
+        eprintln!(
+            "window: buried by the framework — asking for the screen back ({} of {})",
+            self.burial.spent,
+            Burial::LIMIT
+        );
+        self.conn
+            .configure_window(
+                self.win,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )
+            .context("raise window")?;
+        set_name(&self.conn, self.win, &self.app_id, self.orientation)?;
+        self.conn.flush().context("flush after raise")?;
         Ok(())
     }
 
@@ -680,13 +763,21 @@ impl Window {
     pub fn drain_events(&mut self) -> Result<Surface> {
         let mut expose = false;
         let mut size = None;
+        let mut ask = false;
         while let Some(event) = self.conn.poll_for_event().context("poll_for_event")? {
             match event {
                 Event::Expose(_) => expose = true,
                 Event::ConfigureNotify(event) => size = Some((event.width, event.height)),
                 Event::UnmapNotify(_) | Event::DestroyNotify(_) => return Ok(Surface::Gone),
+                // Every one folded in so the budget sees the whole sequence,
+                // but only the last word acted on: a batch that ends visible
+                // is not a burial however it started.
+                Event::VisibilityNotify(event) => ask = self.burial.saw(event.state),
                 _ => {}
             }
+        }
+        if ask {
+            self.retake()?;
         }
         let resized = match size {
             Some(size) if size != (self.width, self.height) => {
@@ -1103,6 +1194,43 @@ mod tests {
         // 0xFF, and a rasterizer's coverage has to be inverted into it.
         assert_eq!(WHITE, 0xFF);
         assert_eq!(BLACK, 0x00);
+    }
+
+    #[test]
+    fn a_burial_is_answered_a_bounded_number_of_times() {
+        // The whole safety argument for answering at all: a manager that keeps
+        // the screen costs a fixed number of refreshes and then wins.
+        let mut burial = Burial::default();
+        let answered = (0..50)
+            .filter(|_| burial.saw(Visibility::FULLY_OBSCURED))
+            .count();
+        assert_eq!(answered, Burial::LIMIT as usize);
+    }
+
+    #[test]
+    fn coming_back_in_front_refills_the_budget() {
+        // Each burial gets its own budget, or the second time the framework
+        // takes the screen in one session there would be nothing left to
+        // answer it with.
+        let mut burial = Burial::default();
+        while burial.saw(Visibility::FULLY_OBSCURED) {}
+        assert!(!burial.saw(Visibility::UNOBSCURED));
+        assert!(burial.saw(Visibility::FULLY_OBSCURED));
+    }
+
+    #[test]
+    fn a_partly_covered_window_refills_nothing() {
+        // Otherwise a manager that uncovers a strip between burials draws an
+        // unbounded number of panel refreshes out of the editor.
+        let mut burial = Burial::default();
+        let mut answered = 0;
+        for _ in 0..50 {
+            if burial.saw(Visibility::FULLY_OBSCURED) {
+                answered += 1;
+            }
+            burial.saw(Visibility::PARTIALLY_OBSCURED);
+        }
+        assert_eq!(answered, Burial::LIMIT as usize);
     }
 
     #[test]
