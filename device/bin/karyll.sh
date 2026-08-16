@@ -71,16 +71,37 @@ fi
 PID=$$
 echo "$PID" > "$LOCK"
 
+# The screen the tap came from, asked for once the editor is gone. The app
+# manager holds nothing of karyll's on its history stack — a `documents/`
+# scriptlet is registered without a `lipcId`, so nothing is ever put there —
+# and its own fallback is the home screen. The tile carries the originating
+# view in; with neither variable set, the manager chooses.
+#
+# `startView` takes `<view_name>:<layer>:<app_uri>` and acts on the view name,
+# so the address is built from the same name it carries. Layer 0 is the top
+# level, which the home screen and the library both are.
+land() {
+    log "origin ${KARYLL_ORIGIN_VIEW:-none}"
+    case "${KARYLL_ORIGIN_VIEW:-}" in
+        KPP_*|LEGACY_*) ;;
+        *) return 0 ;;
+    esac
+    lipc-set-prop com.lab126.appmgrd startView \
+        "$KARYLL_ORIGIN_VIEW:0:app://com.lab126.KPPMainApp?view=$KARYLL_ORIGIN_VIEW" \
+        2>/dev/null
+}
+
 # Let the device sleep again on the way out. karyll holds powerd's
 # `preventScreenSaver` for the session, because it grabs the keyboard and a
 # grabbed key cannot reset the idle timer. The binary is built `panic = "abort"`
 # and so skips its own cleanup on an abort, which would leave the Kindle unable
 # to sleep after the editor is gone. This trap fires however the binary died.
 #
-# **The lock goes only if it is still ours.** A launch that replaced this one
-# has already written its own pid there, and removing it then would leave the
-# next tap unable to see the editor that is running.
-trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "$PID" ]; then rm -f "$LOCK"; fi; lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null' EXIT
+# **The lock goes only if it is still ours, and so does the landing.** A launch
+# that replaced this one has already written its own pid there; removing it then
+# would leave the next tap unable to see the editor that is running, and asking
+# for a screen then would throw the writer off the editor that just replaced us.
+trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "$PID" ]; then rm -f "$LOCK"; land; fi; lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null' EXIT
 
 # **Passed on, not swallowed.** The framework signals the launcher when it takes
 # the screen back, and the editor is the one that can save and let go of the

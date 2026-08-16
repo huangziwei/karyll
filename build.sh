@@ -425,9 +425,8 @@ for abi in $ABIS; do
 done
 chmod 755 "$EXT/bin"/* 2>/dev/null || true
 
-# The home-screen tile. The hotfix indexes documents/*.sh as a library tile, and
-# that is the primary way in on this device — KUAL is the fallback, and is not
-# present on every firmware.
+# The home-screen tile. The hotfix indexes documents/*.sh as a library tile,
+# which is the only way in on this device.
 cp "$DEVICE"/documents/*.sh "$OUT/documents/"
 chmod 755 "$OUT/documents"/*.sh 2>/dev/null || true
 
