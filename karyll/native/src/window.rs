@@ -25,7 +25,7 @@
 //! they ran before there was a palette.
 
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use x11rb::connection::Connection;
@@ -35,8 +35,8 @@ use crate::orientation::Orientation;
 use x11rb::connection::RequestConnection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
-    ImageFormat, PropMode, StackMode, Visibility, Window as XWindow, WindowClass,
+    AtomEnum, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat,
+    PropMode, Visibility, Window as XWindow, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 // `change_property8` lives in the wrapper `ConnectionExt`.
@@ -331,73 +331,50 @@ pub struct Window {
     burial: Burial,
 }
 
-/// The budget for taking the screen back, spent per burial rather than per
-/// session — see [`Window::retake`].
+/// Whether the framework's screen is over the editor's, and since when.
+///
+/// **Watched, not fought.** A `configure_window` raise and a re-set of the
+/// window name — the only levers an app has on this manager — are ignored while
+/// it is burying us: measured on the device, six burials answered three times
+/// each inside the first four seconds came back after 10.3, 12.2, 19.8, 15.5,
+/// 22.9 and 10.2 seconds, which is the manager's own schedule and not a reply.
+/// So the editor waits it out, and what it does with this is stay off the
+/// touchscreen while it cannot be seen — see [`Window::buried`].
 #[derive(Default)]
 struct Burial {
     /// Whether the last thing the server said was that the window is wholly
-    /// covered. A burial is a state, not an event: it is reported once and
-    /// then holds until something uncovers us.
+    /// covered. A burial is a state, not an event: it is reported once and then
+    /// holds until something uncovers us.
     under: bool,
-    /// Attempts made since the window was last wholly visible.
-    spent: u8,
-    /// When the last one was made, so the next is a beat later rather than in
-    /// the same breath.
-    asked: Option<Instant>,
+    /// When the window went under, so that coming back can report how long it
+    /// took. Nothing else in the log carries a duration, and this is the only
+    /// measure of a delay a writer waits through.
+    since: Option<Instant>,
 }
 
 impl Burial {
-    /// How many times one burial may be answered before the editor gives way.
-    ///
-    /// Small on purpose. Every answer that lands is a panel refresh, so a
-    /// manager that means it — a dialog, a screensaver, anything the framework
-    /// puts up deliberately — costs a bounded flicker and then keeps the
-    /// screen. The budget is there for the one that does not mean it.
-    const LIMIT: u8 = 3;
-
-    /// How long to leave between attempts.
-    ///
-    /// The manager does not answer while it is still putting its own screen
-    /// up, so the budget is spent over a few seconds rather than in the
-    /// instant the burial is reported. Left to itself it comes round in
-    /// something over fifteen seconds, which is long past the point where a
-    /// writer has given up and tapped the tile.
-    const AGAIN: Duration = Duration::from_secs(2);
-
     /// Fold in what the server said about the window.
-    ///
-    /// **Wholly visible is the only thing that refills the budget.** Partly
-    /// visible refills nothing: a manager that uncovers a strip and buries the
-    /// rest would otherwise be able to draw an unbounded number of refreshes
-    /// out of the editor, one per exchange.
-    fn saw(&mut self, state: Visibility) {
+    fn saw(&mut self, state: Visibility, now: Instant) {
         match state {
-            Visibility::FULLY_OBSCURED => self.under = true,
+            Visibility::FULLY_OBSCURED => {
+                if self.since.is_none() {
+                    self.since = Some(now);
+                    eprintln!("window: buried by the framework");
+                }
+                self.under = true;
+            }
             Visibility::UNOBSCURED => {
-                if self.spent > 0 {
-                    eprintln!("window: back in front");
+                if let Some(since) = self.since.take() {
+                    eprintln!(
+                        "window: back in front after {:.1}s",
+                        now.duration_since(since).as_secs_f32()
+                    );
                 }
                 self.under = false;
-                self.spent = 0;
-                self.asked = None;
             }
+            // Any of it showing is enough for a tap to have been meant for us.
             _ => self.under = false,
         }
-    }
-
-    /// Whether to ask for the screen now, given the budget and the last ask.
-    fn due(&self, now: Instant) -> bool {
-        self.under
-            && self.spent < Self::LIMIT
-            && self
-                .asked
-                .is_none_or(|at| now.duration_since(at) >= Self::AGAIN)
-    }
-
-    /// Charge an attempt to the budget.
-    fn spend(&mut self, now: Instant) {
-        self.spent += 1;
-        self.asked = Some(now);
     }
 }
 
@@ -571,39 +548,6 @@ impl Window {
         self.orientation = orientation;
         set_name(&self.conn, self.win, &self.app_id, orientation)?;
         self.conn.flush().context("flush after rotate")?;
-        Ok(())
-    }
-
-    /// Ask for the screen back after the framework has stacked itself on top.
-    ///
-    /// **A relaunch races the last exit's restore.** Leaving the editor makes
-    /// the framework redraw the home screen, which on a panel this size is not
-    /// instant, and a tile tapped in that gap opens the editor underneath a
-    /// restore that has not landed yet. The window is mapped, painted and then
-    /// covered — the flash a writer sees before the home screen comes back —
-    /// and the editor goes on running where nothing can reach it. The faster
-    /// the exit, the wider the gap, which is why it looks like an unreliable
-    /// tile rather than a race.
-    ///
-    /// Both levers at once, because neither is documented and one of them
-    /// should hold: the stacking request is X's own, and the window name is the
-    /// layout spec the lab126 manager reads — the same lever
-    /// [`Window::set_orientation`] pulls, re-read here rather than changed.
-    fn retake(&mut self) -> Result<()> {
-        self.burial.spend(Instant::now());
-        eprintln!(
-            "window: buried by the framework — asking for the screen back ({} of {})",
-            self.burial.spent,
-            Burial::LIMIT
-        );
-        self.conn
-            .configure_window(
-                self.win,
-                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-            )
-            .context("raise window")?;
-        set_name(&self.conn, self.win, &self.app_id, self.orientation)?;
-        self.conn.flush().context("flush after raise")?;
         Ok(())
     }
 
@@ -808,20 +752,15 @@ impl Window {
     pub fn drain_events(&mut self) -> Result<Surface> {
         let mut expose = false;
         let mut size = None;
+        let now = Instant::now();
         while let Some(event) = self.conn.poll_for_event().context("poll_for_event")? {
             match event {
                 Event::Expose(_) => expose = true,
                 Event::ConfigureNotify(event) => size = Some((event.width, event.height)),
                 Event::UnmapNotify(_) | Event::DestroyNotify(_) => return Ok(Surface::Gone),
-                Event::VisibilityNotify(event) => self.burial.saw(event.state),
+                Event::VisibilityNotify(event) => self.burial.saw(event.state, now),
                 _ => {}
             }
-        }
-        // Every pass, not only the one that carried the burial: this is called
-        // once per tick, which is what turns a single asking into a few of
-        // them spread out far enough for the manager to have answered.
-        if self.burial.due(Instant::now()) {
-            self.retake()?;
         }
         let resized = match size {
             Some(size) if size != (self.width, self.height) => {
@@ -1240,88 +1179,39 @@ mod tests {
         assert_eq!(BLACK, 0x00);
     }
 
-    /// One burial, then `ticks` passes of the loop a `step` apart, answering
-    /// whenever the budget says to. Returns how many times it asked.
-    fn asks_over(ticks: u32, step: Duration) -> u8 {
-        let mut burial = Burial::default();
-        burial.saw(Visibility::FULLY_OBSCURED);
+    #[test]
+    fn a_burial_lasts_until_the_window_is_wholly_visible() {
+        // What the timing in the log measures. A burial that is reported again
+        // while it is still going has not restarted, or the duration would
+        // read as the gap between the last two reports.
         let start = Instant::now();
-        for tick in 0..ticks {
-            let now = start + step * tick;
-            if burial.due(now) {
-                burial.spend(now);
-            }
-        }
-        burial.spent
-    }
-
-    #[test]
-    fn one_burial_is_asked_about_more_than_once() {
-        // A burial is reported once and then holds, so the budget has to be
-        // spent against the clock rather than against the events.
-        assert!(asks_over(60, Burial::AGAIN / 4) > 1);
-    }
-
-    #[test]
-    fn a_burial_is_answered_a_bounded_number_of_times() {
-        // The whole safety argument for answering at all: a manager that keeps
-        // the screen costs a fixed number of refreshes and then wins, however
-        // long the editor stays under it.
-        assert_eq!(asks_over(10_000, Burial::AGAIN), Burial::LIMIT);
-    }
-
-    #[test]
-    fn asking_leaves_the_manager_time_to_answer() {
-        // Spending the budget in one tick would be the same as asking once.
-        assert_eq!(asks_over(1_000, Duration::ZERO), 1);
-    }
-
-    #[test]
-    fn coming_back_in_front_refills_the_budget() {
-        // Each burial gets its own, or the second time the framework takes the
-        // screen in one session there is nothing left to answer it with.
         let mut burial = Burial::default();
-        burial.saw(Visibility::FULLY_OBSCURED);
-        let now = Instant::now();
-        while burial.due(now) {
-            burial.spend(now);
-        }
-        burial.saw(Visibility::UNOBSCURED);
-        assert!(!burial.under);
-        burial.saw(Visibility::FULLY_OBSCURED);
-        assert!(burial.due(now));
-    }
-
-    #[test]
-    fn a_partly_covered_window_refills_nothing() {
-        // Otherwise a manager that uncovers a strip between burials draws an
-        // unbounded number of panel refreshes out of the editor.
-        let mut burial = Burial::default();
-        let start = Instant::now();
-        let mut asked = 0;
-        for tick in 0..1_000 {
-            let now = start + Burial::AGAIN * tick;
-            burial.saw(Visibility::PARTIALLY_OBSCURED);
-            burial.saw(Visibility::FULLY_OBSCURED);
-            if burial.due(now) {
-                burial.spend(now);
-                asked += 1;
-            }
-        }
-        assert_eq!(asked, Burial::LIMIT);
+        burial.saw(Visibility::FULLY_OBSCURED, start);
+        let first = burial.since;
+        burial.saw(
+            Visibility::FULLY_OBSCURED,
+            start + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(burial.since, first);
+        burial.saw(
+            Visibility::UNOBSCURED,
+            start + std::time::Duration::from_secs(9),
+        );
+        assert_eq!(burial.since, None);
     }
 
     #[test]
     fn a_window_in_front_is_not_buried() {
         // What gates the touchscreen: a false positive here makes the editor
         // deaf to every tap.
+        let now = Instant::now();
         let mut burial = Burial::default();
         assert!(!burial.under);
-        burial.saw(Visibility::PARTIALLY_OBSCURED);
+        burial.saw(Visibility::PARTIALLY_OBSCURED, now);
         assert!(!burial.under);
-        burial.saw(Visibility::FULLY_OBSCURED);
+        burial.saw(Visibility::FULLY_OBSCURED, now);
         assert!(burial.under);
-        burial.saw(Visibility::UNOBSCURED);
+        burial.saw(Visibility::UNOBSCURED, now);
         assert!(!burial.under);
     }
 
