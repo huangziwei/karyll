@@ -934,7 +934,10 @@ impl Editor {
                         Vec::new()
                     }
                 };
-                if self.contacts(taps, extent)? {
+                // Read either way — a descriptor left ready is a tick that
+                // never blocks — but only acted on while the editor is the
+                // thing under the finger. See [`window::Window::buried`].
+                if !self.window.buried() && self.contacts(taps, extent)? {
                     return Ok(());
                 }
             }
@@ -965,7 +968,7 @@ impl Editor {
                 if !taps.is_empty() {
                     self.note_input();
                 }
-                if self.contacts(taps, extent)? {
+                if !self.window.buried() && self.contacts(taps, extent)? {
                     return Ok(());
                 }
             }
