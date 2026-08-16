@@ -13,10 +13,12 @@ git clone https://github.com/huangziwei/karyll && cd karyll/
 
 ## Install
 
-Copy both of these into `/mnt/us/` over MTP:
+Download and unzip the latest `karyll-v<x.y.z>-kindle.zip` file from the [release page](https://github.com/huangziwei/karyll/releases), then copy some files to your device: 
 
-    extensions/karyll    # the app
-    documents/Karyll.sh  # the scriptlet / home-screen tile
+| from | to | notes |
+|:--|:--|:-- |
+| `extensions/karyll/` | `/mnt/us/extensions/karyll/` | or anywhere you store your extensions |
+| `documents/karyll.sh` | `/mnt/us/documents/karyll.sh` | or anywhere you store your scriptlets |
 
 
 ## Gallery

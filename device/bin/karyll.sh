@@ -39,9 +39,9 @@ if [ -f "$LOCK" ]; then
     if [ -n "$OLD" ] && [ -d "/proc/$OLD" ]; then
         log "already running (pid $OLD), replacing it"
         kill "$OLD" 2>/dev/null
-        # Its launcher's own trap clears the lock and the screensaver latch, so
-        # wait for that rather than racing it: the pid is the shell's, and the
-        # editor it is waiting on goes first.
+        # The editor catches the signal and leaves through the same door as
+        # `[ Exit ]` — the document written, the daemon stopped, the screen let
+        # go of — so wait for it to be gone rather than racing its shutdown.
         i=0
         while [ -d "/proc/$OLD" ] && [ "$i" -lt 5 ]; do
             sleep 1
@@ -52,7 +52,24 @@ if [ -f "$LOCK" ]; then
         log "clearing stale lock (pid ${OLD:-unknown})"
     fi
 fi
-echo $$ > "$LOCK"
+
+# **The lock names the editor, not this shell.** A signal to the shell is not a
+# signal to the editor: a foreground child never receives one, and the shell's
+# own trap cannot run until that child has finished, so the editor outlives
+# both the `kill` and the `kill -9` that follows it. It is then orphaned and
+# still holding the exclusive keyboard grab, the touchscreen and its Bluetooth
+# daemon, and the launch that meant to replace it comes up beside it instead:
+# two editors painting one screen, splitting every tap, each restoring the
+# framework's screen over the other on the way out. That is the tile that will
+# not give a writer their page back.
+#
+# So the editor is started in the background and the lock names it, which makes
+# `kill` reach the process that can act on it and `/proc/$PID` mean what the
+# waiting launcher above reads it to mean. `$$` holds the claim only for the
+# moment before the editor exists, so a tap landing in that gap still finds
+# something alive and waits for it.
+PID=$$
+echo "$PID" > "$LOCK"
 
 # Let the device sleep again on the way out. karyll holds powerd's
 # `preventScreenSaver` for the session, because it grabs the keyboard and a
@@ -63,7 +80,13 @@ echo $$ > "$LOCK"
 # **The lock goes only if it is still ours.** A launch that replaced this one
 # has already written its own pid there, and removing it then would leave the
 # next tap unable to see the editor that is running.
-trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi; lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null' EXIT INT TERM
+trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "$PID" ]; then rm -f "$LOCK"; fi; lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null' EXIT
+
+# **Passed on, not swallowed.** The framework signals the launcher when it takes
+# the screen back, and the editor is the one that can save and let go of the
+# window. Nothing here may exit on its own account: the lock names the editor,
+# so the launcher has to outlive it.
+trap '[ "$PID" != "$$" ] && kill "$PID" 2>/dev/null' INT TERM
 
 # The most recently touched document, or the welcome one. Documents live
 # outside the extension so replacing it on update cannot take them with it.
@@ -108,5 +131,18 @@ if [ ! -e /lib/ld-linux-armhf.so.3 ]; then
 fi
 
 log "launch $(uname -m), document $DOC"
-"$BIN" "$DOC" >> "$LOG" 2>&1
-log "exit=$?"
+"$BIN" "$DOC" >> "$LOG" 2>&1 &
+PID=$!
+echo "$PID" > "$LOCK"
+wait "$PID"
+STATUS=$?
+
+# A trapped signal returns from `wait` while the editor is still on its way
+# out. The next tap watches this lock for the editor to be gone, so wait again
+# for what it actually exited with rather than reporting the interruption.
+while [ -d "/proc/$PID" ]; do
+    sleep 1
+    wait "$PID"
+    STATUS=$?
+done
+log "exit=$STATUS"

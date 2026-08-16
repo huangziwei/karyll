@@ -289,11 +289,13 @@ impl Hid {
             .current_dir(&self.base)
             .env("KINDLE_HID_BASE", &self.base)
             // Its own process group, which is what [`Hid::set_keep_alive`]
-            // needs to mean anything. A signal sent to a group reaches every
-            // process in it, the daemon installs a SIGTERM handler and shuts
-            // down cleanly on one, and karyll is killed by group signal — so a
-            // daemon sharing the group dies with the editor whatever `stop`
-            // does, and `stop` is never reached to have an opinion.
+            // needs to mean anything. The launcher replaces a running editor by
+            // signalling it, and escalates to `SIGKILL` if it does not go; a
+            // daemon inheriting the editor's group is reachable by anything
+            // aimed at that group and dies with it whatever `stop` does, with
+            // `stop` never reached to have an opinion. Out of the group it
+            // outlives even a killed editor, which is what leaves a pid file
+            // worth reading and [`Hid::left_running`] a question worth asking.
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(out)
