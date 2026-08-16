@@ -12,111 +12,118 @@
 # does not, because the version is compiled into the binary and a release whose
 # name disagrees with what it reports is unreadable from a device log.
 #
-# Nothing about the build is CI-specific. build.sh fetches the armhf glibc and
-# the Bluetooth stack itself, each pinned by URL and sha256, so a runner and a
-# workstation assemble the same tree. The zip is not part of that tree and is
+# Nothing about the build is CI-specific. build.sh fetches both float ABIs'
+# glibc and the Bluetooth stack itself, each pinned by URL and sha256, so a
+# runner and a workstation assemble the same tree. The zip is not part of that tree and is
 # made here alone: locally the tree is what gets dragged to the device, and an
 # archive of it would be a build product nobody opens.
 
 name: Release
 
 on:
-  release:
-    types: [published]
-  # For a dry run on a branch: builds, and attaches nothing to anything.
-  workflow_dispatch:
+    release:
+        types: [published]
+    # For a dry run on a branch: builds, and attaches nothing to anything.
+    workflow_dispatch:
 
 permissions:
-  contents: write
+    contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+    release:
+        runs-on: ubuntu-latest
 
-    steps:
-      - uses: actions/checkout@v4
+        steps:
+            - uses: actions/checkout@v4
 
-      - name: Check the tag against Cargo.toml
-        if: github.event_name == 'release'
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          crate=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "$crate" != "${TAG#v}" ]; then
-            echo "error: release $TAG does not match Cargo.toml $crate" >&2
-            exit 1
-          fi
-          echo "version $crate"
+            - name: Check the tag against Cargo.toml
+              if: github.event_name == 'release'
+              env:
+                  TAG: ${{ github.event.release.tag_name }}
+              run: |
+                  crate=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+                  if [ "$crate" != "${TAG#v}" ]; then
+                    echo "error: release $TAG does not match Cargo.toml $crate" >&2
+                    exit 1
+                  fi
+                  echo "version $crate"
 
-      - name: Install the cross target
-        run: rustup target add armv7-unknown-linux-gnueabihf
+            # Both float ABIs, because both binaries ship: a Kindle has the loader for
+            # one of them and not the other, and build.sh stops before it starts if
+            # either target is missing.
+            - name: Install the cross targets
+              run: |
+                  rustup target add \
+                    armv7-unknown-linux-gnueabihf \
+                    armv7-unknown-linux-gnueabi
 
-      # 31 MB of pinned downloads that never change between runs of the same
-      # build.sh. Keyed on the file that holds the pins, so editing a version or
-      # a checksum earns a fresh fetch and nothing else does.
-      - name: Restore the fetched sysroot and Bluetooth stack
-        uses: actions/cache@v4
-        with:
-          path: |
-            deploy/sysroot
-            deploy/hid
-          key: deploy-${{ runner.os }}-${{ hashFiles('build.sh') }}
+            # 31 MB of pinned downloads that never change between runs of the same
+            # build.sh. Keyed on the file that holds the pins, so editing a version or
+            # a checksum earns a fresh fetch and nothing else does.
+            - name: Restore the fetched sysroots and Bluetooth stack
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      deploy/sysroot-armhf
+                      deploy/sysroot-armel
+                      deploy/hid
+                  key: deploy-${{ runner.os }}-${{ hashFiles('build.sh') }}
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Format, lint, test
-        run: |
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+            - name: Format, lint, test
+              run: |
+                  cargo fmt --all --check
+                  cargo clippy --workspace --all-targets -- -D warnings
+                  cargo test --workspace
 
-      - name: Build the install tree
-        env:
-          # Stamps the tag into the binary, so `karyll <version> build <stamp>`
-          # in the device log names the release someone installed. The branch
-          # name stands in for it on a dry run, where there is no tag.
-          KARYLL_BUILD: ${{ github.event.release.tag_name || github.ref_name }}
-        run: ./build.sh
+            - name: Build the install tree
+              env:
+                  # Stamps the tag into the binary, so `karyll <version> build <stamp>`
+                  # in the device log names the release someone installed. The branch
+                  # name stands in for it on a dry run, where there is no tag.
+                  KARYLL_BUILD: ${{ github.event.release.tag_name || github.ref_name }}
+              run: ./build.sh
 
-      - name: Package
-        id: package
-        env:
-          VERSION: ${{ github.event.release.tag_name || github.ref_name }}
-        run: |
-          # One asset, not one per model: nothing about the build is told which
-          # Kindle it is for, so there is nothing to name it after.
-          name="karyll-$VERSION-kindle"
-          # Zipped from inside deploy/out so the archive opens onto
-          # extensions/ and documents/, which are what get dragged to /mnt/us.
-          (cd deploy/out && zip -qr "../$name.zip" .)
-          sha256sum "deploy/$name.zip" | sed "s| deploy/| |" > "deploy/$name.zip.sha256"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          ls -lh "deploy/$name.zip"
+            - name: Package
+              id: package
+              env:
+                  VERSION: ${{ github.event.release.tag_name || github.ref_name }}
+              run: |
+                  # One asset, not one per model: nothing about the build is told which
+                  # Kindle it is for, so there is nothing to name it after.
+                  name="karyll-$VERSION-kindle"
+                  # Zipped from inside deploy/out so the archive opens onto
+                  # extensions/ and documents/, which are what get dragged to /mnt/us.
+                  (cd deploy/out && zip -qr "../$name.zip" .)
+                  sha256sum "deploy/$name.zip" | sed "s| deploy/| |" > "deploy/$name.zip.sha256"
+                  echo "name=$name" >> "$GITHUB_OUTPUT"
+                  ls -lh "deploy/$name.zip"
 
-      # `--clobber` replaces an asset of the same name instead of refusing it,
-      # so re-running after a failure lands the same two files rather than
-      # needing the release taken apart first.
-      - name: Attach to the release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
-          NAME: ${{ steps.package.outputs.name }}
-        run: |
-          gh release upload "$TAG" \
-            "deploy/$NAME.zip" \
-            "deploy/$NAME.zip.sha256" \
-            --clobber
+            # `--clobber` replaces an asset of the same name instead of refusing it,
+            # so re-running after a failure lands the same two files rather than
+            # needing the release taken apart first.
+            - name: Attach to the release
+              if: github.event_name == 'release'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ github.event.release.tag_name }}
+                  NAME: ${{ steps.package.outputs.name }}
+              run: |
+                  gh release upload "$TAG" \
+                    "deploy/$NAME.zip" \
+                    "deploy/$NAME.zip.sha256" \
+                    --clobber
 
-      - name: Keep the tree from a manual run
-        if: github.event_name != 'release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.package.outputs.name }}
-          path: deploy/out
+            - name: Keep the tree from a manual run
+              if: github.event_name != 'release'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ steps.package.outputs.name }}
+                  path: deploy/out
