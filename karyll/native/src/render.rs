@@ -28,18 +28,59 @@ use crate::window::{BLACK, Rect, Window};
 ///
 /// **A ladder rather than a range**, because every step has to be a size the
 /// page still reads well at, and because Config shows every option at once.
-/// 46 px is ~11 pt on this 300 ppi panel; the ends are ~8 pt and ~15 pt, which
-/// is as far either way as a page of prose is worth taking.
-pub const SIZES: [f32; 7] = [34.0, 38.0, 42.0, 46.0, 52.0, 58.0, 64.0];
+/// 46 px is ~11 pt on this 300 ppi panel and the top of the ladder is ~19 pt.
+/// Nothing under 10 pt is offered: a 10.2″ page is not a place to set footnote
+/// type, and every one of these panels is read closer than the laptop iA
+/// Writer is used on.
+pub const SIZES: [f32; 7] = [42.0, 46.0, 52.0, 58.0, 64.0, 72.0, 80.0];
 
 /// The size a page opens at.
 pub const DEFAULT_SIZE: f32 = 46.0;
 
+/// The line lengths on offer, in characters.
+///
+/// **The margin is what is left over, which is why there is no margin
+/// setting.** iA Writer's model, and it carries between panels in a way a
+/// margin in pixels cannot: 55 characters is 55 characters on a 10.2″ Scribe
+/// and on a 7″ Colorsoft, where the same 140 px of white is a thirteenth of
+/// one page and a ninth of the other.
+///
+/// **One ladder for both orientations.** A measure belongs to the eye rather
+/// than to the panel, so a writer who reads 55 characters comfortably in
+/// portrait reads 55 in landscape; the wider surface spends the difference on
+/// margin. What the orientation decides is whether the setting can be honoured
+/// at all — [`column`] fits it to the surface, and on the narrow edge at the
+/// top of [`SIZES`] that cap is what actually sets the line.
+///
+/// iA Writer offers 64/72/80, which are laptop numbers: 80 characters of 64 px
+/// type wants 2400 px and a portrait Scribe is 1860 wide. The bottom of this
+/// ladder is what the top of [`SIZES`] needs — 80 px type fills a portrait page
+/// at 49 characters, so 40 is the first setting that leaves a margin there —
+/// and seven entries because that is what the size row above it has.
+pub const LINE_LENGTHS: [u16; 7] = [40, 45, 50, 55, 60, 65, 70];
+
+/// The line length a page opens at, which is what the fixed 1280 px column it
+/// replaces held at the default size.
+pub const DEFAULT_LINE_LENGTH: u16 = 60;
+
+/// One character of prose as a fraction of the type size, in the face a page
+/// opens in.
+///
+/// iA Writer Duo S is duospace — every glyph 0.46 em except six widened to
+/// 0.69 — so an average over a pangram is 0.47 and barely moves with the text.
+/// The other two shipped faces are 0.46 (Mono) and 0.42 (Quattro). An eighth
+/// between the ends is four characters on a sixty-character line, which is why
+/// a page measures the face it is actually set in through
+/// [`crate::font::average_advance`] rather than reading this. It is what
+/// [`Theme::default`] and the tests set.
+pub const DEFAULT_ADVANCE: f32 = 0.47;
+
 /// The least white space either side of the text column.
 ///
-/// Only ever reached by the largest sizes on the narrow edge of the panel: the
-/// column they ask for is wider than a portrait page, and a page with no margin
-/// is one whose descenders touch the bezel.
+/// Reached when the size and the line length together ask for more than the
+/// narrow edge of the panel holds, and a page with no margin at all is one
+/// whose descenders touch the bezel. A page sitting on this floor is one whose
+/// line is being set by the panel rather than by the writer.
 const SIDE_MARGIN: u16 = 70;
 
 /// The ladder entry nearest `px`, so a remembered size from another build lands
@@ -49,6 +90,15 @@ pub fn nearest_size(px: f32) -> f32 {
         .into_iter()
         .min_by(|a, b| (a - px).abs().total_cmp(&(b - px).abs()))
         .unwrap_or(DEFAULT_SIZE)
+}
+
+/// The ladder entry nearest `chars`, for the same reason [`nearest_size`]
+/// exists: a length stored by another build has to land on one that is offered.
+pub fn nearest_line_length(chars: u16) -> u16 {
+    LINE_LENGTHS
+        .into_iter()
+        .min_by_key(|offered| offered.abs_diff(chars))
+        .unwrap_or(DEFAULT_LINE_LENGTH)
 }
 
 /// The next size up or down, or the one given at either end of the ladder.
@@ -69,6 +119,8 @@ pub struct Theme {
     /// A measure, centred, rather than full-bleed: long lines are harder to
     /// read and there is no reason to use the full 1860 px.
     pub measure: u16,
+    /// The line length the measure was set from, in characters.
+    pub chars: u16,
     pub margin_y: u16,
     /// Multiplier on the face's own line height.
     pub leading: f32,
@@ -78,30 +130,40 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::at(DEFAULT_SIZE)
+        Self::at(
+            DEFAULT_SIZE,
+            DEFAULT_LINE_LENGTH,
+            DEFAULT_SIZE * DEFAULT_ADVANCE,
+        )
     }
 }
 
 impl Theme {
-    /// The page set at `body_px`.
+    /// The page set at `body_px`, `chars` to the line.
     ///
-    /// **The measure follows the type**, and has to: a fixed 1280 px column
-    /// held ~58 Latin characters at 46 px, which is where a line should be —
-    /// but the same column is ~78 characters at 34 px and ~42 at 64, one past
-    /// each end of the comfortable 45–75. Scaling the column with the size
-    /// keeps the line length where it belongs and turns this into a control
-    /// over how much page a writer sees rather than one that quietly ruins the
-    /// setting of it. [`Page::new`] caps it to what the surface can hold.
+    /// **The measure is a line length, and the margin is what the surface has
+    /// left over.** The two settings are independent because they answer
+    /// different questions — how large the type is, and how much of it goes on
+    /// a line — and a column derived from the size alone can only answer the
+    /// first. `advance_px` is what one character of prose costs at this size in
+    /// the face the body is set in, which [`crate::font::average_advance`]
+    /// measures, so the same setting gives the same line in all three shipped
+    /// faces and spends the difference between them on white space.
     ///
-    /// The margin and the leading follow too. Large type on a tight margin
+    /// [`column`] fits the result to the surface. That cap is not a fallback:
+    /// on the narrow edge at the top of [`SIZES`] a long line does not fit at
+    /// all, and shortening it there is the only thing that leaves a margin to
+    /// hold the page by.
+    ///
+    /// The margin and the leading follow the type. Large type on a tight margin
     /// reads as a page that is too full, and it wants proportionally *less*
     /// leading than small type does.
-    pub fn at(body_px: f32) -> Self {
-        let scale = body_px / DEFAULT_SIZE;
+    pub fn at(body_px: f32, chars: u16, advance_px: f32) -> Self {
         Self {
             body_px,
-            measure: (1280.0 * scale) as u16,
-            margin_y: (160.0 * scale) as u16,
+            measure: (chars as f32 * advance_px) as u16,
+            chars,
+            margin_y: (160.0 * (body_px / DEFAULT_SIZE)) as u16,
             leading: if body_px >= DEFAULT_SIZE { 1.30 } else { 1.35 },
             heading_space: 0.75,
         }
@@ -160,9 +222,10 @@ fn caret_width(px: f32) -> u16 {
 
 /// The text column on a surface `width` wide: where it starts, and how wide.
 ///
-/// **Fitted to the surface, not taken from the theme.** The measure scales with
-/// the type size, so the largest sizes ask for a column wider than a portrait
-/// page — unfitted that gives `left = 0` and lines running under both bezels.
+/// **Fitted to the surface, not taken from the theme.** The measure is a line
+/// length in characters at the size the body is set in, so the two settings
+/// together can ask for a column wider than a portrait page — unfitted that
+/// gives `left = 0` and lines running under both bezels.
 ///
 /// One statement of the geometry, because two things need it: the page draws
 /// inside the column, and [`edge_at`] reads the margins either side of it.
@@ -1277,25 +1340,27 @@ pub fn paint(
 mod tests {
     use super::*;
 
-    /// **The line length is what the size control is really setting.** A fixed
-    /// column would make the smallest size ~78 characters and the largest ~42,
-    /// one past each end of the comfortable 45–75, so the column moves with the
-    /// type and the writer gets more or less page rather than a worse-set one.
+    /// A page at `px` and the default line length, set in the default face.
+    fn theme_at(px: f32) -> Theme {
+        Theme::at(px, DEFAULT_LINE_LENGTH, px * DEFAULT_ADVANCE)
+    }
+
+    /// **Every size has to leave a line worth reading**, whichever way up the
+    /// panel is. The setting asks for [`DEFAULT_LINE_LENGTH`] characters and
+    /// gets them until the surface runs out; past that the cap is what sets the
+    /// line, and the top of the ladder on a portrait page is where it bites.
     #[test]
     fn the_column_follows_the_type_so_the_line_stays_readable() {
-        // Measured off the column the page will actually wrap to, which is the
-        // only number that can be wrong: the theme's own measure scales exactly
-        // with the size and so is 58 characters by construction, but the cap
-        // takes width back at the top of the ladder on the narrow edge.
+        // Measured off the column the page will actually wrap to, not off the
+        // theme: the theme asks for the same count at every size by
+        // construction, and the cap is the only thing that can be wrong.
         let chars: Vec<char> = "a".chars().collect();
         let markup = karyll_core::markdown::analyze(&chars);
         for surface in [(1860u16, 2480u16), (2480, 1860)] {
             for px in SIZES {
-                let theme = Theme::at(px);
+                let theme = theme_at(px);
                 let page = Page::new(&chars, &markup, &theme, surface, surface.1 - 120);
-                // 1280 px at 46 px is ~58 Latin characters; everything else is
-                // that ratio.
-                let per_line = 58.0 * (page.measure as f32 / 1280.0) * (46.0 / px);
+                let per_line = page.measure as f32 / (px * DEFAULT_ADVANCE);
                 assert!(
                     (45.0..=75.0).contains(&per_line),
                     "{px} px on {surface:?} sets {per_line:.0} characters to the line"
@@ -1304,12 +1369,46 @@ mod tests {
         }
     }
 
+    /// The line length is the writer's, and the size is not allowed to take it
+    /// back: the same setting has to give the same line at every size the
+    /// surface can hold it at.
+    #[test]
+    fn the_line_length_is_the_line_length_at_every_size_that_fits() {
+        for chars in LINE_LENGTHS {
+            for px in SIZES {
+                let theme = Theme::at(px, chars, px * DEFAULT_ADVANCE);
+                let (_, measure) = column(&theme, 2480);
+                if measure == theme.measure {
+                    let per_line = measure as f32 / (px * DEFAULT_ADVANCE);
+                    assert!(
+                        (per_line - chars as f32).abs() < 1.0,
+                        "{chars} characters at {px} px came out as {per_line:.1}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A shorter line is the margin control, and the only one: the column is
+    /// what was asked for and the margin is the rest of the surface.
+    #[test]
+    fn a_shorter_line_is_a_wider_margin() {
+        let mut last = u16::MAX;
+        for chars in LINE_LENGTHS {
+            let theme = Theme::at(DEFAULT_SIZE, chars, DEFAULT_SIZE * DEFAULT_ADVANCE);
+            let (left, _) = column(&theme, 1860);
+            assert!(left < last, "{chars} characters did not narrow the margin");
+            assert!(left >= SIDE_MARGIN, "{chars} characters leaves no margin");
+            last = left;
+        }
+    }
+
     /// A page of `text`, laid out at the default size on a Colorsoft-shaped
     /// surface, with everything needed to ask where its highlight fields land.
     fn fielded(text: &str, focus: Option<std::ops::Range<usize>>) -> Vec<(Rect, bool)> {
         let chars: Vec<char> = text.chars().collect();
         let markup = karyll_core::markdown::analyze(&chars);
-        let theme = Theme::at(DEFAULT_SIZE);
+        let theme = theme_at(DEFAULT_SIZE);
         let page = Page::new(&chars, &markup, &theme, (1272, 1696), 1600).focused_on(focus);
         let lines = layout(&page, &mut crate::font::Proportional, 0);
         highlight_fields(&page, &mut crate::font::Proportional, &lines)
@@ -1408,7 +1507,7 @@ mod tests {
         let chars: Vec<char> = "a".chars().collect();
         let markup = karyll_core::markdown::analyze(&chars);
         for px in SIZES {
-            let theme = Theme::at(px);
+            let theme = theme_at(px);
             let page = Page::new(&chars, &markup, &theme, (1860, 2480), 2360);
             assert!(page.measure + 2 * SIDE_MARGIN <= 1860, "{px} px overflows");
             assert!(page.left >= SIDE_MARGIN, "{px} px leaves no margin");
@@ -1469,7 +1568,7 @@ mod tests {
         #[test]
         fn every_type_size_leaves_an_edge_worth_aiming_at() {
             for px in SIZES {
-                let theme = Theme::at(px);
+                let theme = theme_at(px);
                 let middle = BOTTOM / 2;
                 assert_eq!(at(&theme, EDGE - 1, middle), Some(Edge::Back), "{px} px");
                 assert_eq!(
@@ -1575,12 +1674,14 @@ mod tests {
     #[test]
     fn the_body_size_is_readable_on_a_ten_inch_page() {
         let theme = Theme::default();
-        // ~300 ppi, so 1 pt is about 4.17 px. The old 34 px was 8.2 pt —
-        // footnote size on a page nearly as large as A4 — and it also pushed the
-        // line to ~78 characters, past the comfortable 45–75.
+        // ~300 ppi, so 1 pt is about 4.17 px. Below 10 pt is footnote type on a
+        // page nearly as large as A4, which is why the ladder starts where it
+        // does.
         let pt = theme.body_px / 4.17;
         assert!((10.0..=12.0).contains(&pt), "body is {pt} pt");
-        // The measure is fixed, so a larger body is what shortens the line.
+        // Against a nominal half-em character rather than the face's own, so
+        // this checks the page a writer opens and not the arithmetic that set
+        // it.
         let latin_advance = theme.body_px * 0.5;
         let chars_per_line = theme.measure as f32 / latin_advance;
         assert!(

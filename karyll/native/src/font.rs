@@ -52,6 +52,28 @@ pub trait Metrics {
     fn ascent(&mut self, px: f32, roles: &[Role]) -> f32;
 }
 
+/// What one character of prose costs at `px`, in the face the body is set in.
+///
+/// **The measure is a line length in characters**, and a character is not one
+/// width across the three faces a writer can choose: Duo is 0.46 em with six
+/// letters widened to 0.69, Mono is 0.46 throughout, and Quattro's four widths
+/// average 0.42. An eighth between the ends is four characters on a
+/// sixty-character line, so the column is measured against the face in use —
+/// which makes choosing the narrow face buy margin rather than a longer line.
+///
+/// **A pangram rather than the alphabet**, because a line of English is about
+/// a sixth spaces and the space is the narrowest glyph in the face that varies
+/// most. Measured at `px` rather than per em so the answer comes out of the
+/// same advance cache the page is about to draw from.
+pub fn average_advance(fonts: &mut impl Metrics, px: f32) -> f32 {
+    const SAMPLE: &str = "the quick brown fox jumps over the lazy dog";
+    let total: f32 = SAMPLE
+        .chars()
+        .map(|ch| fonts.advance(Role::Body, px, ch))
+        .sum();
+    total / SAMPLE.chars().count() as f32
+}
+
 /// A row that only ever holds Latin: chrome, panel titles, anything whose text
 /// karyll wrote itself rather than read out of a document.
 pub const LATIN_ROW: &[Role] = &[Role::Chrome];

@@ -64,7 +64,7 @@ fn main() -> Result<()> {
         return pair();
     }
     catch_signals();
-    let fonts = font::Fonts::load(read_choices())?;
+    let mut fonts = font::Fonts::load(read_choices())?;
     // A firmware that has moved or dropped a face otherwise shows up only as
     // text drawn in the wrong style, so say what was found.
     for path in fonts.present() {
@@ -185,6 +185,13 @@ fn main() -> Result<()> {
         }
     };
 
+    let size = read_size();
+    let theme = render::Theme::at(
+        size,
+        read_line_length(),
+        font::average_advance(&mut fonts, size),
+    );
+
     let orientation = read_orientation(accel.as_ref());
     let mut window = window::Window::open("karyll", orientation)?;
     // Only ever narrows what the panel offered: on the two grey Kindles the
@@ -200,7 +207,7 @@ fn main() -> Result<()> {
         path,
         window,
         fonts,
-        theme: render::Theme::at(read_size()),
+        theme,
         mods: Mods::default(),
         frame: None,
         roles: Vec::new(),
@@ -2068,17 +2075,41 @@ impl Editor {
     }
 
     /// Set the page at another size.
-    ///
-    /// A full repaint, and it cannot be anything else: the measure, the margin
-    /// and the leading all move with the type, so every line is somewhere new.
-    /// The remembered frame describes a page that no longer exists.
     fn set_size(&mut self, px: f32) -> Result<()> {
         if self.theme.body_px == px {
             return Ok(());
         }
-        self.theme = render::Theme::at(px);
         write_size(px);
-        eprintln!("size: {px} px, measure {}", self.theme.measure);
+        self.reset_page(px, self.theme.chars)
+    }
+
+    /// Set the page to another line length.
+    ///
+    /// **This is the margin control**, though it is not named as one: the
+    /// column is the characters asked for and the margin is the rest of the
+    /// surface, so a shorter line is a wider margin. Naming it the other way
+    /// round would make the setting mean a different amount of page on each of
+    /// the three panels.
+    fn set_line_length(&mut self, chars: u16) -> Result<()> {
+        if self.theme.chars == chars {
+            return Ok(());
+        }
+        write_line_length(chars);
+        self.reset_page(self.theme.body_px, chars)
+    }
+
+    /// Lay the page out again at `px` and `chars`, and draw it.
+    ///
+    /// A full repaint, and it cannot be anything else: the measure, the margin
+    /// and the leading all move with the type, so every line is somewhere new.
+    /// The remembered frame describes a page that no longer exists.
+    fn reset_page(&mut self, px: f32, chars: u16) -> Result<()> {
+        let advance = font::average_advance(&mut self.fonts, px);
+        self.theme = render::Theme::at(px, chars, advance);
+        eprintln!(
+            "page: {px} px, {chars} characters, measure {}",
+            self.theme.measure
+        );
         self.frame = None;
         self.paint()
     }
@@ -2528,6 +2559,12 @@ impl Editor {
                     None => Ok(()),
                 };
             }
+            Some(ConfigRow::LineLength) => {
+                return match render::LINE_LENGTHS.get(option) {
+                    Some(chars) => self.set_line_length(*chars),
+                    None => Ok(()),
+                };
+            }
             // These paint themselves: each reports what the daemon said, and a
             // scan goes on repainting for the ten seconds it runs.
             Some(ConfigRow::Keyboard(actions)) => {
@@ -2742,6 +2779,23 @@ impl Editor {
             },
             ConfigRow::Size,
         ));
+        // Directly under Size, because the two are read together: the pair is
+        // what decides how much page is left around the text, and neither
+        // number means much without the other in view.
+        items.push((
+            ui::Item::Choice {
+                label: "Line length".into(),
+                options: render::LINE_LENGTHS
+                    .iter()
+                    .map(|chars| chars.to_string())
+                    .collect(),
+                on: render::LINE_LENGTHS
+                    .iter()
+                    .map(|chars| *chars == self.theme.chars)
+                    .collect(),
+            },
+            ConfigRow::LineLength,
+        ));
         items.extend(type_rows);
 
         // Only on a Kindle that has a colour panel to switch off, the same rule
@@ -2912,10 +2966,17 @@ impl Editor {
         }
         self.fonts.set_family(group, family);
         write_choices(self.fonts.choices());
+        // The measure is a character count, so a face of a different width
+        // moves the column rather than the line length. A Han family leaves the
+        // Latin advance where it was and this settles back on the same number.
+        let advance = font::average_advance(&mut self.fonts, self.theme.body_px);
+        self.theme = render::Theme::at(self.theme.body_px, self.theme.chars, advance);
+        self.frame = None;
         eprintln!(
-            "font: {} in {}",
+            "font: {} in {}, measure {}",
             group.label(),
-            self.fonts.family(group).name
+            self.fonts.family(group).name,
+            self.theme.measure
         );
     }
 
@@ -5244,6 +5305,26 @@ fn write_size(px: f32) {
     let _ = std::fs::write(size_file(), format!("{px}\n"));
 }
 
+fn line_length_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/line-length")
+}
+
+/// The line length the last session ended at, in characters.
+///
+/// Stored as the count for the reason the size is stored as the size: it is a
+/// number that means something on its own, where an index into a ladder means
+/// whatever the next build's ladder says it does.
+fn read_line_length() -> u16 {
+    std::fs::read_to_string(line_length_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .map_or(render::DEFAULT_LINE_LENGTH, render::nearest_line_length)
+}
+
+fn write_line_length(chars: u16) {
+    let _ = std::fs::write(line_length_file(), format!("{chars}\n"));
+}
+
 fn read_language() -> Language {
     // Not logged here. `set_language` reports what was actually taken up, and
     // two lines saying the same name would have hidden that they could differ.
@@ -5899,6 +5980,8 @@ enum ConfigRow {
     Font(font::Group, Vec<usize>),
     /// The body size chips, which are [`render::SIZES`] in order.
     Size,
+    /// The line length chips, which are [`render::LINE_LENGTHS`] in order.
+    LineLength,
     /// One keyboard's chips, or the scan's.
     Keyboard(Vec<KeyAction>),
     /// Whether the Bluetooth stack outlives the editor. Option 1 keeps it.
