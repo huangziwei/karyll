@@ -2701,23 +2701,33 @@ impl Editor {
         // of what the row is for.
         let type_rows: Vec<(ui::Item, ConfigRow)> = font_groups(&self.enabled)
             .into_iter()
-            .filter_map(|group| {
+            .flat_map(|group| {
                 let installed = font::available(group);
-                if installed.is_empty() {
-                    return None;
-                }
                 let chosen = self.fonts.choices().get(group);
-                Some((
-                    ui::Item::Choice {
-                        label: group.label().into(),
-                        options: installed
-                            .iter()
-                            .map(|at| font::families(group)[*at].name.to_string())
-                            .collect(),
-                        on: installed.iter().map(|at| *at == chosen).collect(),
-                    },
-                    ConfigRow::Font(group, installed),
-                ))
+                chip_rows(&installed)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(row, part)| {
+                        (
+                            ui::Item::Choice {
+                                // Only the first says which writing system this
+                                // is. A second name would read as a second
+                                // setting, and there is one face per system.
+                                label: if row == 0 {
+                                    group.label().into()
+                                } else {
+                                    String::new()
+                                },
+                                options: part
+                                    .iter()
+                                    .map(|at| font::families(group)[*at].name.to_string())
+                                    .collect(),
+                                on: part.iter().map(|at| *at == chosen).collect(),
+                            },
+                            ConfigRow::Font(group, part),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         items.push((ui::Item::Heading("Type".into()), ConfigRow::None));
@@ -5047,6 +5057,37 @@ fn font_groups(enabled: &[Language]) -> Vec<font::Group> {
     groups
 }
 
+/// The most chips one settings row carries.
+///
+/// **[`ui::chip_bounds`] drops a chip that would cross the right margin**, and
+/// the same function hit-tests, so an option past the edge is neither drawn nor
+/// tappable — a face that is installed and cannot be chosen. Six Latin families
+/// on one row want 1209 px of chips where the narrowest panel offers 994; three
+/// want 674, which leaves a third of the row spare.
+///
+/// **A count rather than a measurement**, though the widths are measurable:
+/// chips are drawn in whichever family is selected, so a fitted row would
+/// reflow as the writer taps along it — the wider face they just picked pushing
+/// the next choice off the page. A fixed count is the same shape whatever is
+/// selected and on whichever Kindle.
+const CHIPS_PER_ROW: usize = 3;
+
+/// Split a row's options across as many rows as they need, evenly.
+///
+/// Even rather than filled-then-remainder: four families read as two and two,
+/// not as three and a stray. Nothing in, nothing out — a writing system with no
+/// family installed contributes no row at all.
+fn chip_rows(options: &[usize]) -> Vec<Vec<usize>> {
+    if options.is_empty() {
+        return Vec::new();
+    }
+    let rows = options.len().div_ceil(CHIPS_PER_ROW);
+    options
+        .chunks(options.len().div_ceil(rows))
+        .map(<[usize]>::to_vec)
+        .collect()
+}
+
 fn fonts_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/fonts")
 }
@@ -6479,6 +6520,40 @@ nine words in this one under the third level
                 font::Group::Han(Region::Simplified),
                 font::Group::Han(Region::Traditional)
             ]
+        );
+    }
+
+    /// Every option reaches a row, in order and exactly once. The chip a finger
+    /// lands on is looked up through the list its row was drawn from, so an
+    /// option dropped or duplicated by the split would set the wrong family.
+    #[test]
+    fn splitting_a_row_keeps_every_option_in_order() {
+        for count in 0..12usize {
+            let options: Vec<usize> = (0..count).collect();
+            let rows = chip_rows(&options);
+            assert!(
+                rows.iter().all(|row| row.len() <= CHIPS_PER_ROW),
+                "{count} options put more than {CHIPS_PER_ROW} on a row: {rows:?}"
+            );
+            assert_eq!(rows.concat(), options, "{count} options came back changed");
+        }
+    }
+
+    /// Even, not filled-then-remainder: four families read as two and two.
+    #[test]
+    fn a_split_row_divides_evenly() {
+        assert!(chip_rows(&[]).is_empty(), "nothing in, no row out");
+        assert_eq!(chip_rows(&[0]), vec![vec![0]]);
+        assert_eq!(
+            chip_rows(&[0, 1, 2]),
+            vec![vec![0, 1, 2]],
+            "three still fit"
+        );
+        assert_eq!(chip_rows(&[0, 1, 2, 3]), vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(
+            chip_rows(&[0, 1, 2, 3, 4, 5]),
+            vec![vec![0, 1, 2], vec![3, 4, 5]],
+            "the six Latin families are two rows of three"
         );
     }
 

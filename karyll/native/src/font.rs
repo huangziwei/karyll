@@ -138,17 +138,29 @@ pub struct Family {
     faces: &'static [&'static str],
 }
 
-/// The Latin families, default first.
+/// The Latin families, default first: three the device carries, then three
+/// karyll ships.
 ///
-/// Three, spanning what this device can set well rather than everything it
-/// carries: Ember's sans, a serif drawn for e-ink, and the slab that Kindles
-/// read in for a decade. Each is a true four-face family, so emphasis and
-/// strong are real italics and bolds rather than synthetic slants.
+/// The device's three span what this screen can set well rather than everything
+/// it holds: Ember's sans, a serif drawn for e-ink, and the slab that Kindles
+/// read in for a decade. Baskerville and Palatino are present on the firmware
+/// and left out on the argument that picked the Han body — they are
+/// high-contrast serifs whose hairlines thin further under a one-bit cut, where
+/// Bookerly was drawn for this screen and Caecilia holds an even stroke weight.
 ///
-/// Baskerville and Palatino are here too and are left out on the argument that
-/// picked the Han body: they are high-contrast serifs whose hairlines thin
-/// further under a one-bit cut. Bookerly was drawn for this screen and Caecilia
-/// holds an even stroke weight, which is why those two are the serifs on offer.
+/// **The three iA faces are bundled because no Kindle carries a monospace text
+/// face.** Every device this was built against ships the same firmware faces,
+/// and the only one named for the word is a symbol font — so a fenced block or
+/// a table has nothing to line its columns up in. They are cut from one design
+/// at a shared 0.6 em base, differing in how many widths they allow: Mono holds
+/// one, so it is the only one whose columns align; Duo widens six letters by
+/// half and is the writing face iA itself defaults to; Quattro allows four
+/// widths and sets some 9% narrower than Duo, which is what buys back the line
+/// length a fixed pitch costs.
+///
+/// Each entry, firmware or bundled, is a true four-face family, so emphasis and
+/// strong are real italics and bolds rather than synthetic slants — which is
+/// what [`available`] declines an incomplete family to protect.
 const LATIN_FAMILIES: &[Family] = &[
     Family {
         name: "Ember",
@@ -175,6 +187,33 @@ const LATIN_FAMILIES: &[Family] = &[
             "/usr/java/lib/fonts/Caecilia_LT_66_Medium_Italic.ttf",
             "/usr/java/lib/fonts/Caecilia_LT_75_Bold.ttf",
             "/usr/java/lib/fonts/Caecilia_LT_76_Bold_Italic.ttf",
+        ],
+    },
+    Family {
+        name: "Duo",
+        faces: &[
+            "/mnt/us/extensions/karyll/fonts/iAWriterDuoS-Regular.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterDuoS-Italic.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterDuoS-Bold.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterDuoS-BoldItalic.ttf",
+        ],
+    },
+    Family {
+        name: "Mono",
+        faces: &[
+            "/mnt/us/extensions/karyll/fonts/iAWriterMonoS-Regular.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterMonoS-Italic.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterMonoS-Bold.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterMonoS-BoldItalic.ttf",
+        ],
+    },
+    Family {
+        name: "Quattro",
+        faces: &[
+            "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-Regular.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-Italic.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-Bold.ttf",
+            "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-BoldItalic.ttf",
         ],
     },
 ];
@@ -1270,10 +1309,40 @@ mod tests {
         );
     }
 
+    /// The three bundled faces are the ones karyll ships, so they live under
+    /// the extension rather than on the firmware — and a device whose
+    /// `/mnt/us` is not mounted must offer the firmware's three, not none.
+    #[test]
+    fn the_bundled_families_are_the_ones_karyll_ships() {
+        const BUNDLED: &str = "/mnt/us/extensions/karyll/fonts/";
+        let shipped: Vec<&str> = LATIN_FAMILIES
+            .iter()
+            .filter(|f| f.faces.iter().all(|p| p.starts_with(BUNDLED)))
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(shipped, vec!["Duo", "Mono", "Quattro"]);
+        // No entry may straddle the two: a family half on the firmware and half
+        // in the extension would survive `available` with /mnt/us unmounted and
+        // then fail to load the half that is gone.
+        for family in LATIN_FAMILIES {
+            let bundled = family.faces.iter().filter(|p| p.starts_with(BUNDLED));
+            assert!(
+                bundled.clone().count() == 0 || bundled.count() == family.faces.len(),
+                "{} draws from both the firmware and the extension",
+                family.name
+            );
+        }
+        assert_eq!(
+            available_by(Group::Latin, |path| !path.starts_with(BUNDLED)),
+            vec![0, 1, 2],
+            "the firmware's three have to stand alone"
+        );
+    }
+
     #[test]
     fn only_families_whose_every_face_is_installed_are_offered() {
         let all = available_by(Group::Latin, |_| true);
-        assert_eq!(all, vec![0, 1, 2]);
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 5]);
         assert!(available_by(Group::Latin, |_| false).is_empty());
         // One missing italic is enough: a Latin role has no second face to fall
         // back to, so emphasis would come out of the pan-Unicode fallback.

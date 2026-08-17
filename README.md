@@ -74,4 +74,4 @@ The Oasis doesn't deserve a screenshot. It will be just same grayscale images, b
 
 ## Thanks
 
-This project will not be possible without [kindle-hid-passthrough](https://github.com/zampierilucas/kindle-hid-passthrough).
+This project will not be possible without [kindle-hid-passthrough](https://github.com/zampierilucas/kindle-hid-passthrough). And our design is heavily inspired by [iA writer](https://ia.net).

@@ -483,6 +483,78 @@ printf 'kindle-hid-passthrough %s\nsource: https://github.com/zampierilucas/kind
 # into the extension and its log off tmpfs.
 cp "$DEVICE"/hid/*.md "$DEVICE"/hid/*.ini "$EXT/hid/" 2>/dev/null || true
 
+# The writing faces. **No Kindle carries a monospace text face**: the devices
+# probed ship the same 87 faces, one of them adds a set of handwriting styles,
+# and the only file named for the word is a symbol font. So a face to write code
+# and tables in has to come from here, and iA's three come with the argument for
+# what a writing face is as well as the files.
+#
+# Fetched rather than committed, for the reason the Bluetooth stack is: it is
+# someone else's release. Pinned to a commit because the repository has neither
+# tags nor releases, and checksummed **per file rather than per archive**, since
+# GitHub's generated tarballs are not byte-stable across recompressions while
+# the blob at a commit is.
+FONTS_COMMIT=f32c04c3058a75d7ce28919ce70fe8800817491b
+FONTS_CACHE="$ROOT/deploy/fonts"
+FONTS_RAW="https://raw.githubusercontent.com/iaolo/iA-Fonts/$FONTS_COMMIT"
+
+# sha256, the directory under the repository root, and the file. Only the static
+# cuts: the variable files carry no bold at all, and nothing here sets a
+# variation axis, so they would draw one weight under four names.
+FONTS_MANIFEST="
+454a20d2b4569ba66810f0f710bb022065cbaac11c82fdcef677545ab27329f2 iA%20Writer%20Duo/Static iAWriterDuoS-Regular.ttf
+8e15abab476026abd362d079fd519e9c1220e0ab32b3ce3e4c13695af53e7153 iA%20Writer%20Duo/Static iAWriterDuoS-Italic.ttf
+779963585007973753ba1c4aa85d67b21c29854c1f9730411d80dc0c879b0908 iA%20Writer%20Duo/Static iAWriterDuoS-Bold.ttf
+830443f3ec75a277ec00917a7ed0523a93869ea9a7ea5f8d9f1d643b25b6cd47 iA%20Writer%20Duo/Static iAWriterDuoS-BoldItalic.ttf
+929605302a57250e712908cb5f6e1ce80c7d0accd5fd2555345f29a5e8d4e30b iA%20Writer%20Mono/Static iAWriterMonoS-Regular.ttf
+c7e7e36e8167bf50f27e46c9cab447d04cc570bd388b998044e2e29f4cebc216 iA%20Writer%20Mono/Static iAWriterMonoS-Italic.ttf
+76aa5b5b4f9091a9c686a2a6fe5ff3495bb791994d7079857e5b24ae98063743 iA%20Writer%20Mono/Static iAWriterMonoS-Bold.ttf
+b0cf9571234528b0896aacf97eb3ec45712da40b8410c799fa43ea123bc19e35 iA%20Writer%20Mono/Static iAWriterMonoS-BoldItalic.ttf
+6e367e0e00e057d383680ffae7b64f520d06e1f96abd28bddd67d424fee8e8df iA%20Writer%20Quattro/Static iAWriterQuattroS-Regular.ttf
+84c19517be57e8c0521f43a1d5c29766b1f0cb9353300e819b193da1b02f47ac iA%20Writer%20Quattro/Static iAWriterQuattroS-Italic.ttf
+40dbb1ffed472cdc96a0133073bc777a40782883678b80dfd31677d5963b72b9 iA%20Writer%20Quattro/Static iAWriterQuattroS-Bold.ttf
+f61aa3c97d611dec01c7414e07b9212a164501b6d1a800af0dcda11acf4eabb0 iA%20Writer%20Quattro/Static iAWriterQuattroS-BoldItalic.ttf
+2eb84d6d03a9af6e99816f82f50a77c26e7ff6681293f4619cd33a392a8c13b6 iA%20Writer%20Quattro LICENSE.md
+"
+
+fonts_have() {
+    [ -f "$2" ] || return 1
+    [ "$(shasum -a 256 "$2" 2>/dev/null | cut -d" " -f1)" = "$1" ]
+}
+
+fonts_fetch() {
+    out="$FONTS_CACHE/$3"
+    fonts_have "$1" "$out" && return 0
+    if ! curl -fsSL -o "$out.part" "$FONTS_RAW/$2/$3"; then
+        rm -f "$out.part"
+        echo "error: could not download $FONTS_RAW/$2/$3" >&2
+        exit 1
+    fi
+    if ! fonts_have "$1" "$out.part"; then
+        echo "error: checksum mismatch on $3" >&2
+        echo "       expected $1" >&2
+        echo "       got      $(shasum -a 256 "$out.part" | cut -d" " -f1)" >&2
+        rm -f "$out.part"
+        exit 1
+    fi
+    mv "$out.part" "$out"
+}
+
+mkdir -p "$FONTS_CACHE" "$EXT/fonts"
+echo "==> Bundling the writing faces (iA-Fonts $(echo "$FONTS_COMMIT" | cut -c1-7))"
+# Redirected rather than piped: a pipeline runs the loop in a subshell, where a
+# failed checksum would exit that shell and let the build carry on regardless.
+while read -r sha dir name; do
+    [ -n "$name" ] || continue
+    fonts_fetch "$sha" "$dir" "$name"
+    cp "$FONTS_CACHE/$name" "$EXT/fonts/$name"
+done <<EOF
+$FONTS_MANIFEST
+EOF
+
+printf 'iA-Fonts @ %s\nsource: https://github.com/iaolo/iA-Fonts\nlicence: SIL Open Font License 1.1, see LICENSE.md\nStatic cuts only; each file pinned by sha256 in build.sh.\n' \
+    "$FONTS_COMMIT" > "$EXT/fonts/PROVENANCE"
+
 echo
 echo "==> Ready: $OUT"
 du -sh "$OUT" 2>/dev/null || true
