@@ -130,11 +130,13 @@ pub trait Ime {
 
     /// Hand back Traditional characters rather than Simplified.
     ///
-    /// The device ships exactly one Chinese dictionary — `zh_CN.ldb`, which is
-    /// Simplified pinyin — so Traditional is not a second engine but the same
-    /// candidates converted. Amazon's own Traditional locales are Cangjie and
-    /// Zhuyin, neither of which is pinyin, so there was never a stock
-    /// Traditional-from-pinyin to borrow.
+    /// The device ships exactly one Chinese *keyboard* database — `zh_CN.ldb`,
+    /// which is Simplified pinyin — so Traditional is not a second engine but
+    /// the same candidates converted. Amazon's own Traditional locales are
+    /// Cangjie and Zhuyin, neither of which is pinyin, so there was never a
+    /// stock Traditional-from-pinyin to borrow. The Traditional word list under
+    /// `/usr/lib/mmseg/tcn` is no help here: it says where words end, not which
+    /// characters a sound could be.
     fn set_traditional(&mut self, traditional: bool);
 
     /// The engine's own reading of what has been typed, when it keeps one.

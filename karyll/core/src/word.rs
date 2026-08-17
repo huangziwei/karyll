@@ -39,7 +39,8 @@ pub enum Kind {
     /// Letters and digits from an alphabet — Latin, and anything else that is
     /// alphanumeric without being CJK.
     Word,
-    /// Han. One run is one unit; see the note above about dictionaries.
+    /// Han. A run of it is cut into words by dictionary, or left whole when
+    /// there is none; see the note above.
     Han,
     Hiragana,
     Katakana,
