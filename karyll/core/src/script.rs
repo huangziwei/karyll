@@ -59,11 +59,42 @@ pub enum Role {
     /// Han emphasis: a different family, never a slant.
     HanEmphasis,
     HanBold,
+    /// karyll's own Latin text — a panel label, the action strip, a filename.
+    Chrome,
+    ChromeBold,
 }
 
 impl Role {
     pub fn is_han(self) -> bool {
         matches!(self, Role::Han | Role::HanEmphasis | Role::HanBold)
+    }
+
+    /// Whether this role draws karyll's own text rather than the document's.
+    pub fn is_chrome(self) -> bool {
+        matches!(self, Role::Chrome | Role::ChromeBold)
+    }
+}
+
+/// The face for karyll's own text, as opposed to the writer's.
+///
+/// **The app does not restyle itself when the document face changes.** Chrome
+/// and prose are two typographic jobs: the panel is a tool that names things,
+/// the page is the draft. Setting them from one control meant a settings row
+/// redrew in the face it was in the middle of choosing — chips changing width
+/// under the finger picking them, and a row that fitted the panel before the tap
+/// no longer fitting after it. So Latin chrome is pinned, and [`role_for`] is
+/// left to the document alone.
+///
+/// **Han chrome is not pinned**, and follows the writer's Han family. A label
+/// that says 简体 is showing which convention is set as well as naming it, and
+/// there is no second Han face to pin it to that would not be one more 10 MB
+/// file resident for the sake of four labels.
+pub fn chrome_role_for(bold: bool, script: Script) -> Role {
+    match (script == Script::Han, bold) {
+        (true, true) => Role::HanBold,
+        (true, false) => Role::Han,
+        (false, true) => Role::ChromeBold,
+        (false, false) => Role::Chrome,
     }
 }
 
@@ -106,8 +137,10 @@ pub fn role_for(block: Block, style: Style, script: Script) -> Role {
         };
     }
 
-    // Code has no monospace face on this device, so it takes the body face and
-    // is distinguished by the renderer instead.
+    // Code takes the body face and is distinguished by the renderer instead.
+    // Setting it in a face of its own would fix the document's monospace for it,
+    // where the body face is the writer's to choose — and one of the faces on
+    // offer already is one.
     match (heading || strong, emphasis) {
         (true, true) => Role::BodyBoldItalic,
         (true, false) => Role::BodyBold,

@@ -5061,15 +5061,18 @@ fn font_groups(enabled: &[Language]) -> Vec<font::Group> {
 ///
 /// **[`ui::chip_bounds`] drops a chip that would cross the right margin**, and
 /// the same function hit-tests, so an option past the edge is neither drawn nor
-/// tappable — a face that is installed and cannot be chosen. Six Latin families
-/// on one row want 1209 px of chips where the narrowest panel offers 994; three
-/// want 674, which leaves a third of the row spare.
+/// tappable — a face that is installed and cannot be chosen. The narrowest panel
+/// leaves about 990 px for chips once the shared label column is taken, and the
+/// Latin names run to some 200 px apiece with their padding: four is close
+/// enough to that budget to be riding on the length of the words, which is not a
+/// thing to hold a control on the page with.
 ///
-/// **A count rather than a measurement**, though the widths are measurable:
-/// chips are drawn in whichever family is selected, so a fitted row would
-/// reflow as the writer taps along it — the wider face they just picked pushing
-/// the next choice off the page. A fixed count is the same shape whatever is
-/// selected and on whichever Kindle.
+/// A count rather than a fitted row, now that chrome no longer follows the
+/// document face and the widths hold still: the arithmetic would have to run in
+/// `Editor::config_items`, which is `&self` where measuring wants the faces
+/// mutably. Three is under the budget on every supported panel and splits the
+/// Latin list where it already divides — the writing faces, then the firmware's
+/// serifs.
 const CHIPS_PER_ROW: usize = 3;
 
 /// Split a row's options across as many rows as they need, evenly.
@@ -6551,9 +6554,13 @@ nine words in this one under the third level
         );
         assert_eq!(chip_rows(&[0, 1, 2, 3]), vec![vec![0, 1], vec![2, 3]]);
         assert_eq!(
+            chip_rows(&[0, 1, 2, 3, 4]),
+            vec![vec![0, 1, 2], vec![3, 4]],
+            "the Latin list splits into the writing faces and the firmware's"
+        );
+        assert_eq!(
             chip_rows(&[0, 1, 2, 3, 4, 5]),
-            vec![vec![0, 1, 2], vec![3, 4, 5]],
-            "the six Latin families are two rows of three"
+            vec![vec![0, 1, 2], vec![3, 4, 5]]
         );
     }
 

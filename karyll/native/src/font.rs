@@ -1,25 +1,30 @@
-//! Loading the device's own faces, and measuring with them.
+//! Loading faces, and measuring with them.
 //!
-//! No font ships with the binary — everything is read from
-//! `/usr/java/lib/fonts`, which carries 122 faces. The policy for *which* face
-//! a run wants lives in `karyll_core::script` and is testable without any of
-//! them present; this module is the part that needs the files.
+//! Nothing is compiled into the binary. The firmware's own faces are read from
+//! `/usr/java/lib/fonts`, and the three writing faces karyll ships are read from
+//! `fonts/` beside it in the extension. The policy for *which* face a run wants
+//! lives in `karyll_core::script` and is testable without any of them present;
+//! this module is the part that needs the files.
+//!
+//! **The app and the page are set separately.** [`CHROME_FACES`] draws karyll's
+//! own text and cannot be changed; [`LATIN_FAMILIES`] and the Han lists are what
+//! a document can be set in. One face doing both jobs made the panel look like a
+//! draft and moved the panel's own geometry every time a writer tried a face on.
 //!
 //! **Why these faces.** The renderer thresholds glyph coverage to one bit,
 //! because the partial waveform is two-level and an antialiased grey edge comes
 //! out muddy. That rules the body face more than taste does: 宋体 sets thin
 //! horizontal strokes that thin out further under a one-bit cut, where 黑体
 //! holds an even stroke weight and survives it. So the Han body defaults to
-//! **STHeitiMedium**, and Latin to **Amazon Ember**, pairing a sans with a sans.
+//! **STHeitiMedium** and Latin to **iA Writer Duo**, pairing a sans with a sans.
 //!
 //! **The defaults are the head of a short list, not the only option.** The
 //! stroke-thinning argument is a prediction rather than a measurement, and it is
 //! also a matter of taste once it stops being a matter of legibility, so
-//! [`families`] offers two or three per writing system and the settings panel
+//! [`families`] offers two to five per writing system and the settings panel
 //! picks between them. It is a curated list and deliberately not a browser over
-//! the 122 faces the device carries: most of them are handwriting styles or
-//! scripts karyll does not typeset, and a list nobody can read through is not a
-//! choice.
+//! the faces the device carries: most of them are handwriting styles or scripts
+//! karyll does not typeset, and a list nobody can read through is not a choice.
 //!
 //! **Faces are read on first use, never at startup.** A face costs its file
 //! size in resident bytes, and the Han faces are ~10 MB each against ~514 MB
@@ -49,7 +54,7 @@ pub trait Metrics {
 
 /// A row that only ever holds Latin: chrome, panel titles, anything whose text
 /// karyll wrote itself rather than read out of a document.
-pub const LATIN_ROW: &[Role] = &[Role::Body];
+pub const LATIN_ROW: &[Role] = &[Role::Chrome];
 
 /// A set of roles that are chosen between as one: the Latin four, or one
 /// convention's Han three.
@@ -138,57 +143,44 @@ pub struct Family {
     faces: &'static [&'static str],
 }
 
-/// The Latin families, default first: three the device carries, then three
-/// karyll ships.
+/// The faces karyll's own text is drawn in, in [`CHROME_ROLES`] order.
 ///
-/// The device's three span what this screen can set well rather than everything
-/// it holds: Ember's sans, a serif drawn for e-ink, and the slab that Kindles
-/// read in for a decade. Baskerville and Palatino are present on the firmware
-/// and left out on the argument that picked the Han body — they are
+/// **Amazon Ember, and it is not on offer.** It is the Kindle's interface face,
+/// so a panel set in it reads as part of the device rather than as a document —
+/// which is what chrome is for. It also never changes, so the geometry laid out
+/// against it in [`crate::ui`] holds for the life of the process; see
+/// [`karyll_core::script::chrome_role_for`] for why that matters.
+const CHROME_FACES: [&str; 2] = [
+    "/usr/java/lib/fonts/Amazon-Ember-Regular.ttf",
+    "/usr/java/lib/fonts/Amazon-Ember-Bold.ttf",
+];
+
+/// The Latin families a *document* can be set in, default first.
+///
+/// **Ember is absent on purpose**: it draws the app, and a face doing both jobs
+/// makes the page look like the panel. What is left is the two firmware serifs
+/// and the three writing faces karyll ships, which is a list of things to write
+/// in rather than an inventory.
+///
+/// **The three iA faces lead, and are bundled because no Kindle carries a
+/// monospace text face.** Every device this was built against ships the same
+/// firmware faces, and the only one named for the word is a symbol font — so a
+/// fenced block or a table has nothing to line its columns up in. They are cut
+/// from one design at a shared 0.6 em base and differ in how many widths they
+/// allow: Mono holds one, so it is the only one whose columns align; **Duo**
+/// widens six letters by half and is the writing face iA itself defaults to,
+/// which is why it is the default here; Quattro allows four widths and sets some
+/// 9% narrower than Duo, buying back the line length a fixed pitch costs.
+///
+/// The firmware pair follow. Baskerville and Palatino are on the device too and
+/// are left out on the argument that picked the Han body — they are
 /// high-contrast serifs whose hairlines thin further under a one-bit cut, where
 /// Bookerly was drawn for this screen and Caecilia holds an even stroke weight.
 ///
-/// **The three iA faces are bundled because no Kindle carries a monospace text
-/// face.** Every device this was built against ships the same firmware faces,
-/// and the only one named for the word is a symbol font — so a fenced block or
-/// a table has nothing to line its columns up in. They are cut from one design
-/// at a shared 0.6 em base, differing in how many widths they allow: Mono holds
-/// one, so it is the only one whose columns align; Duo widens six letters by
-/// half and is the writing face iA itself defaults to; Quattro allows four
-/// widths and sets some 9% narrower than Duo, which is what buys back the line
-/// length a fixed pitch costs.
-///
-/// Each entry, firmware or bundled, is a true four-face family, so emphasis and
-/// strong are real italics and bolds rather than synthetic slants — which is
-/// what [`available`] declines an incomplete family to protect.
+/// Every entry is a true four-face family, so emphasis and strong are real
+/// italics and bolds rather than synthetic slants — which is what [`available`]
+/// declines an incomplete family to protect.
 const LATIN_FAMILIES: &[Family] = &[
-    Family {
-        name: "Ember",
-        faces: &[
-            "/usr/java/lib/fonts/Amazon-Ember-Regular.ttf",
-            "/usr/java/lib/fonts/Amazon-Ember-RegularItalic.ttf",
-            "/usr/java/lib/fonts/Amazon-Ember-Bold.ttf",
-            "/usr/java/lib/fonts/Amazon-Ember-BoldItalic.ttf",
-        ],
-    },
-    Family {
-        name: "Bookerly",
-        faces: &[
-            "/usr/java/lib/fonts/Bookerly-Regular.ttf",
-            "/usr/java/lib/fonts/Bookerly-Italic.ttf",
-            "/usr/java/lib/fonts/Bookerly-Bold.ttf",
-            "/usr/java/lib/fonts/Bookerly-BoldItalic.ttf",
-        ],
-    },
-    Family {
-        name: "Caecilia",
-        faces: &[
-            "/usr/java/lib/fonts/Caecilia_LT_65_Medium.ttf",
-            "/usr/java/lib/fonts/Caecilia_LT_66_Medium_Italic.ttf",
-            "/usr/java/lib/fonts/Caecilia_LT_75_Bold.ttf",
-            "/usr/java/lib/fonts/Caecilia_LT_76_Bold_Italic.ttf",
-        ],
-    },
     Family {
         name: "Duo",
         faces: &[
@@ -214,6 +206,24 @@ const LATIN_FAMILIES: &[Family] = &[
             "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-Italic.ttf",
             "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-Bold.ttf",
             "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-BoldItalic.ttf",
+        ],
+    },
+    Family {
+        name: "Bookerly",
+        faces: &[
+            "/usr/java/lib/fonts/Bookerly-Regular.ttf",
+            "/usr/java/lib/fonts/Bookerly-Italic.ttf",
+            "/usr/java/lib/fonts/Bookerly-Bold.ttf",
+            "/usr/java/lib/fonts/Bookerly-BoldItalic.ttf",
+        ],
+    },
+    Family {
+        name: "Caecilia",
+        faces: &[
+            "/usr/java/lib/fonts/Caecilia_LT_65_Medium.ttf",
+            "/usr/java/lib/fonts/Caecilia_LT_66_Medium_Italic.ttf",
+            "/usr/java/lib/fonts/Caecilia_LT_75_Bold.ttf",
+            "/usr/java/lib/fonts/Caecilia_LT_76_Bold_Italic.ttf",
         ],
     },
 ];
@@ -416,9 +426,20 @@ fn available_by(group: Group, exists: impl Fn(&str) -> bool) -> Vec<usize> {
 }
 
 /// Where each role is drawn from, given what each group is set to.
+///
+/// A chrome role answers [`CHROME_FACES`] whatever the choices are: it is not
+/// part of any group, and nothing in the settings panel can re-point it.
 fn path_for(role: Role, region: Region, choices: Choices) -> &'static str {
+    if let Some(at) = chrome_at(role) {
+        return CHROME_FACES[at];
+    }
     let group = Group::of(role, region);
     family(group, choices.get(group)).faces[index_in(group, role)]
+}
+
+/// Where `role` sits among [`CHROME_ROLES`], or `None` if it draws a document.
+fn chrome_at(role: Role) -> Option<usize> {
+    CHROME_ROLES.iter().position(|r| *r == role)
 }
 
 /// Where `role` sits among the roles `group` covers.
@@ -450,6 +471,10 @@ const LATIN_ROLES: [Role; 4] = [
 /// The Han roles, each of which has a face **per region**.
 const HAN_ROLES: [Role; 3] = [Role::Han, Role::HanEmphasis, Role::HanBold];
 
+/// The chrome roles, in [`CHROME_FACES`] order. One face each and no regional
+/// cuts: karyll's own Latin is the same wherever it is read.
+const CHROME_ROLES: [Role; 2] = [Role::Chrome, Role::ChromeBold];
+
 const REGIONS: [Region; 3] = [Region::Simplified, Region::Traditional, Region::Japanese];
 
 /// Where `(role, region)` sits in `slots`.
@@ -463,6 +488,9 @@ const REGIONS: [Region; 3] = [Region::Simplified, Region::Traditional, Region::J
 /// that is precisely why [`Fonts::set_family`] evicts the cached advances of
 /// the slots it re-points. A width belongs to the face that measured it.
 fn slot_of(role: Role, region: Region) -> usize {
+    if let Some(at) = chrome_at(role) {
+        return CHROME_AT + at;
+    }
     let group = Group::of(role, region);
     let at = index_in(group, role);
     match group {
@@ -477,8 +505,11 @@ fn slot_of(role: Role, region: Region) -> usize {
     }
 }
 
+/// Where the chrome slots start.
+const CHROME_AT: usize = LATIN_ROLES.len() + HAN_ROLES.len() * REGIONS.len();
+
 /// Where [`FALLBACK`] starts.
-const FALLBACK_AT: usize = LATIN_ROLES.len() + HAN_ROLES.len() * REGIONS.len();
+const FALLBACK_AT: usize = CHROME_AT + CHROME_ROLES.len();
 
 /// The slots that may draw `role` under `region`, best first.
 ///
@@ -680,6 +711,11 @@ impl Fonts {
                     .iter()
                     .map(move |g| Slot::pending(path_for(*r, *g, choices)))
             }))
+            .chain(
+                CHROME_ROLES
+                    .iter()
+                    .map(|r| Slot::pending(path_for(*r, region, choices))),
+            )
             .chain(FALLBACK.iter().map(|p| Slot::pending(p)))
             .collect();
         if !slots.iter().any(|s| Path::new(s.path).is_file()) {
@@ -820,8 +856,13 @@ impl Fonts {
     /// hold either.
     ///
     /// Rows stay uniform across the page, which is the point of asking about a
-    /// set of roles rather than one line's. [`Role::Body`] is always in that
-    /// set, so a Latin row keeps the height it has.
+    /// set of roles rather than one line's. The row's own Latin role is always
+    /// in that set, so a row holding only Han keeps the height it has.
+    ///
+    /// **That anchor is [`Role::Chrome`] for a panel and [`Role::Body`] for a
+    /// page**, and mixing them would put the document's face back into the
+    /// panel's arithmetic — a settings row that grew and shrank as the writer
+    /// tried faces on, which is the coupling the chrome slots exist to cut.
     ///
     /// **The whole chain is measured, not the selected convention's face**, and
     /// the fallbacks with it: `resolve` may reach any of them, and a face that
@@ -846,7 +887,12 @@ impl Fonts {
                 gap = gap.max(v.gap * px);
             }
         };
-        for &role in roles.iter().chain(std::iter::once(&Role::Body)) {
+        let anchor = if roles.iter().any(|r| r.is_chrome()) {
+            Role::Chrome
+        } else {
+            Role::Body
+        };
+        for &role in roles.iter().chain(std::iter::once(&anchor)) {
             if role.is_han() {
                 for region in REGIONS {
                     measure(&mut self.slots[slot_of(role, region)]);
@@ -986,7 +1032,7 @@ mod tests {
     // exist. They cover the parts that do not need the files.
 
     fn all_roles() -> impl Iterator<Item = Role> {
-        LATIN_ROLES.into_iter().chain(HAN_ROLES)
+        LATIN_ROLES.into_iter().chain(HAN_ROLES).chain(CHROME_ROLES)
     }
 
     /// Every family for every group, which is what most of these check.
@@ -1004,11 +1050,9 @@ mod tests {
         let mut taken = std::collections::HashSet::new();
         for role in all_roles() {
             for region in REGIONS {
-                assert!(
-                    path_for(role, region, Choices::default()).starts_with("/usr/java/lib/fonts/")
-                );
+                assert!(!path_for(role, region, Choices::default()).is_empty());
                 let slot = slot_of(role, region);
-                assert!(slot < FALLBACK_AT);
+                assert!(slot < FALLBACK_AT, "{role:?} is past the fallbacks");
                 // A Latin role is one slot across all three conventions; a Han
                 // role is three. The advance cache is keyed on this index, so a
                 // collision would measure one face with another's widths.
@@ -1017,12 +1061,58 @@ mod tests {
                 }
             }
         }
-        let latin: std::collections::HashSet<usize> = LATIN_ROLES
+        let own: std::collections::HashSet<usize> = LATIN_ROLES
             .iter()
+            .chain(&CHROME_ROLES)
             .map(|r| slot_of(*r, Region::Simplified))
             .collect();
-        assert_eq!(latin.len(), LATIN_ROLES.len());
-        assert!(latin.iter().all(|i| !taken.contains(i)));
+        assert_eq!(own.len(), LATIN_ROLES.len() + CHROME_ROLES.len());
+        assert!(own.iter().all(|i| !taken.contains(i)));
+    }
+
+    /// Chrome draws from its own slots, and nothing the writer can set reaches
+    /// them. A chrome role sharing the body's slot would restyle the whole app
+    /// the moment a document face was picked.
+    #[test]
+    fn chrome_is_pinned_and_no_setting_can_move_it() {
+        for (at, role) in CHROME_ROLES.into_iter().enumerate() {
+            assert!(role.is_chrome());
+            assert!(!role.is_han());
+            for region in REGIONS {
+                // Whatever any group is set to, chrome answers Ember.
+                let mut choices = Choices::default();
+                for group in GROUPS {
+                    choices.set(group, families(group).len() - 1);
+                }
+                assert_eq!(path_for(role, region, choices), CHROME_FACES[at]);
+                assert!(CHROME_FACES[at].contains("Amazon-Ember"));
+                // One slot across every convention, as a Latin role is.
+                assert_eq!(slot_of(role, region), CHROME_AT + at);
+            }
+        }
+        // The document's Latin body is a different face and a different slot,
+        // which is the whole separation.
+        assert_ne!(
+            slot_of(Role::Chrome, Region::default()),
+            slot_of(Role::Body, Region::default())
+        );
+        assert_ne!(
+            path_for(Role::Chrome, Region::default(), Choices::default()),
+            path_for(Role::Body, Region::default(), Choices::default())
+        );
+        // And no group lists a chrome role, so `set_family` never re-points one.
+        for group in GROUPS {
+            assert!(group.roles().iter().all(|r| !r.is_chrome()), "{group:?}");
+        }
+    }
+
+    /// A panel row is measured against Ember, a page row against the document's
+    /// face. Sharing the anchor put the writer's face back into the panel's
+    /// arithmetic, so a settings row changed height as faces were tried on.
+    #[test]
+    fn a_panel_row_is_not_measured_against_the_document_face() {
+        assert_eq!(LATIN_ROW, &[Role::Chrome]);
+        assert!(LATIN_ROW.iter().all(|r| r.is_chrome()));
     }
 
     /// A font file carrying nothing but a `head` and an `hhea`, which is all
@@ -1255,7 +1345,13 @@ mod tests {
         }
         assert_eq!(
             path_for(Role::Body, Region::Simplified, default),
-            "/usr/java/lib/fonts/Amazon-Ember-Regular.ttf"
+            "/mnt/us/extensions/karyll/fonts/iAWriterDuoS-Regular.ttf",
+            "a page opens in the face iA Writer itself defaults to"
+        );
+        assert_eq!(
+            path_for(Role::Chrome, Region::Simplified, default),
+            "/usr/java/lib/fonts/Amazon-Ember-Regular.ttf",
+            "the app stays in the Kindle's own face"
         );
         assert_eq!(
             path_for(Role::Han, Region::Simplified, default),
@@ -1279,7 +1375,7 @@ mod tests {
         assert_eq!(Choices::parse(&choices.render()), choices);
         // By name, so inserting a family at the head of a list would not move a
         // stored choice onto the wrong face.
-        assert!(choices.render().contains("latin Bookerly"));
+        assert!(choices.render().contains("latin Mono"));
         assert!(choices.render().contains("ja 筑紫明朝"));
     }
 
@@ -1287,7 +1383,7 @@ mod tests {
     fn a_stored_line_this_build_does_not_know_leaves_the_default() {
         let stored = "latin Bookerly\nkr 바탕\nja Helvetica\nsc\n\ntc 楷體 and more\n";
         let got = Choices::parse(stored);
-        assert_eq!(got.get(Group::Latin), 1, "a line it knows still applies");
+        assert_eq!(got.get(Group::Latin), 3, "a line it knows still applies");
         assert_eq!(got.get(Group::Han(Region::Japanese)), 0, "unknown name");
         assert_eq!(got.get(Group::Han(Region::Simplified)), 0, "no name at all");
         assert_eq!(
@@ -1311,7 +1407,8 @@ mod tests {
 
     /// The three bundled faces are the ones karyll ships, so they live under
     /// the extension rather than on the firmware — and a device whose
-    /// `/mnt/us` is not mounted must offer the firmware's three, not none.
+    /// `/mnt/us` is not mounted must still offer the firmware's serifs, and
+    /// must still draw its own chrome.
     #[test]
     fn the_bundled_families_are_the_ones_karyll_ships() {
         const BUNDLED: &str = "/mnt/us/extensions/karyll/fonts/";
@@ -1321,6 +1418,9 @@ mod tests {
             .map(|f| f.name)
             .collect();
         assert_eq!(shipped, vec!["Duo", "Mono", "Quattro"]);
+        // Chrome is never bundled: the app has to draw itself on a device whose
+        // storage is away being read over USB.
+        assert!(CHROME_FACES.iter().all(|p| !p.starts_with(BUNDLED)));
         // No entry may straddle the two: a family half on the firmware and half
         // in the extension would survive `available` with /mnt/us unmounted and
         // then fail to load the half that is gone.
@@ -1334,20 +1434,20 @@ mod tests {
         }
         assert_eq!(
             available_by(Group::Latin, |path| !path.starts_with(BUNDLED)),
-            vec![0, 1, 2],
-            "the firmware's three have to stand alone"
+            vec![3, 4],
+            "the firmware's serifs have to stand alone"
         );
     }
 
     #[test]
     fn only_families_whose_every_face_is_installed_are_offered() {
         let all = available_by(Group::Latin, |_| true);
-        assert_eq!(all, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(all, vec![0, 1, 2, 3, 4]);
         assert!(available_by(Group::Latin, |_| false).is_empty());
         // One missing italic is enough: a Latin role has no second face to fall
         // back to, so emphasis would come out of the pan-Unicode fallback.
         let no_italic = available_by(Group::Latin, |path| !path.contains("Italic"));
-        assert!(!no_italic.contains(&0), "Ember offered without its italic");
+        assert!(!no_italic.contains(&0), "Duo offered without its italic");
     }
 
     #[test]
@@ -1372,6 +1472,11 @@ mod tests {
                         .iter()
                         .map(move |g| Slot::pending(path_for(*r, *g, choices)))
                 }))
+                .chain(
+                    CHROME_ROLES
+                        .iter()
+                        .map(|r| Slot::pending(path_for(*r, region, choices))),
+                )
                 .collect(),
             region,
             advances: HashMap::new(),
@@ -1381,13 +1486,14 @@ mod tests {
 
     /// The advance cache is keyed on the slot index, and a family change is the
     /// one thing that puts a different face in a slot. Left behind, the cached
-    /// widths would lay Bookerly out to Ember's metrics.
+    /// widths would lay Mono out to Duo's metrics.
     #[test]
     fn changing_a_family_drops_the_widths_measured_with_the_old_one() {
         let mut fonts = bare(Choices::default());
         let latin = slot_of(Role::Body, Region::Simplified);
         let han = slot_of(Role::Han, Region::Simplified);
-        for face in [latin, han] {
+        let chrome = slot_of(Role::Chrome, Region::Simplified);
+        for face in [latin, han, chrome] {
             fonts.advances.insert(
                 Measured {
                     face: face as u8,
@@ -1401,16 +1507,23 @@ mod tests {
         fonts.set_family(Group::Latin, 1);
 
         assert_eq!(fonts.choices().get(Group::Latin), 1);
-        assert_eq!(fonts.family(Group::Latin).name, "Bookerly");
-        assert!(fonts.slots[latin].path.contains("Bookerly"));
+        assert_eq!(fonts.family(Group::Latin).name, "Mono");
+        assert!(fonts.slots[latin].path.contains("iAWriterMonoS"));
         assert!(
             !fonts.advances.keys().any(|key| key.face as usize == latin),
-            "Ember's widths outlived Ember"
+            "Duo's widths outlived Duo"
         );
         assert!(
             fonts.advances.keys().any(|key| key.face as usize == han),
             "a group nobody touched lost its cache"
         );
+        // Chrome is not in any group, so a document face change cannot evict it
+        // — nor draw the panel in what was just picked for the page.
+        assert!(
+            fonts.advances.keys().any(|key| key.face as usize == chrome),
+            "the panel was re-measured for a change it does not follow"
+        );
+        assert!(fonts.slots[chrome].path.contains("Amazon-Ember"));
     }
 
     /// Every role of the group moves, not only the body: picking 明朝 and

@@ -54,8 +54,8 @@ pub enum Style {
     Strong,
     /// `~~cut this~~`, and the prose of a task that is done.
     ///
-    /// **Not a face.** There is no struck-through cut of Amazon Ember; the
-    /// renderer draws the body face and rules a line through it. A rule is
+    /// **Not a face.** No family carries a struck-through cut; the renderer
+    /// draws the body face and rules a line through it. A rule is
     /// orthogonal to the face under it and one `style` per span cannot say
     /// both, so this does not combine the way [`Style::StrongEmphasis`] does.
     Strikethrough,

@@ -18,8 +18,7 @@
 //! tests.
 
 use anyhow::Result;
-use karyll_core::markdown::{Block, Style};
-use karyll_core::script::{Role, role_for, script_of};
+use karyll_core::script::{Role, chrome_role_for, script_of};
 
 use crate::font::{Fonts, Metrics};
 use crate::window::{BLACK, QUIET, Rect, WHITE, Window};
@@ -1092,7 +1091,7 @@ pub fn paint_row(
 
 pub fn measure(fonts: &mut Fonts, text: &str, px: f32) -> f32 {
     text.chars()
-        .map(|c| fonts.advance(role_for(Block::Paragraph, Style::Text, script_of(c)), px, c))
+        .map(|c| fonts.advance(chrome_role_for(false, script_of(c)), px, c))
         .sum()
 }
 
@@ -1109,21 +1108,16 @@ pub fn draw_line(
     ink: u8,
 ) {
     let mut pen = x as f32;
-    let block = if bold {
-        Block::Heading(2)
-    } else {
-        Block::Paragraph
-    };
     // The baseline sits low enough for the faces this label uses. A Han label —
     // the language button, a candidate, a Chinese filename — is taller than the
     // Latin face's ascent, and that ascent would draw it above its own row.
     let roles: Vec<Role> = text
         .chars()
-        .map(|ch| role_for(block, Style::Text, script_of(ch)))
+        .map(|ch| chrome_role_for(bold, script_of(ch)))
         .collect();
     let baseline = y as f32 + fonts.ascent(px, &roles);
     for ch in text.chars() {
-        let role = role_for(block, Style::Text, script_of(ch));
+        let role = chrome_role_for(bold, script_of(ch));
         let origin = pen;
         fonts.draw(role, px, ch, |gx, gy, coverage| {
             if coverage <= 0.5 {
@@ -1236,7 +1230,7 @@ fn glyph_box(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
 fn label_roles(label: &str) -> Vec<Role> {
     label
         .chars()
-        .map(|c| role_for(Block::Paragraph, Style::Text, script_of(c)))
+        .map(|c| chrome_role_for(false, script_of(c)))
         .collect()
 }
 
@@ -1247,7 +1241,7 @@ fn label_roles(label: &str) -> Vec<Role> {
 pub fn label_width(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
     let width: f32 = label
         .chars()
-        .map(|c| fonts.advance(role_for(Block::Paragraph, Style::Text, script_of(c)), px, c))
+        .map(|c| fonts.advance(chrome_role_for(false, script_of(c)), px, c))
         .sum();
     width.round() as u16
 }
