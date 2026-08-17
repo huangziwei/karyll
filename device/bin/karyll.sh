@@ -38,6 +38,14 @@ if [ -f "$LOCK" ]; then
     OLD=$(cat "$LOCK" 2>/dev/null)
     if [ -n "$OLD" ] && [ -d "/proc/$OLD" ]; then
         log "already running (pid $OLD), replacing it"
+        # **The lock is claimed before the kill.** The launcher being replaced
+        # asks for its own origin screen as it exits, and only holds that back
+        # when the lock has stopped naming its editor. It reaches that test the
+        # instant its editor dies — sooner than the loop below, which is asleep,
+        # can notice — so a claim made after the wait is a claim made too late,
+        # and the framework's screen comes up over the editor that just replaced
+        # it. `$$` stands in until the new editor exists.
+        echo $$ > "$LOCK"
         kill "$OLD" 2>/dev/null
         # The editor catches the signal and leaves through the same door as
         # `[ Exit ]` — the document written, the daemon stopped, the screen let
