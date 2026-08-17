@@ -16,28 +16,21 @@
 //!   書いた has to break at 書|いた, which is where the okurigana starts and
 //!   very often a real morpheme boundary.
 //!
-//! **Chinese is coarse, and this is the reason.** A run of Han with no kana in
-//! it is one unit, so word movement in Chinese jumps a whole clause. Real
-//! segmentation needs a word list *and* an algorithm that consults it, and this
-//! crate is dependency-free by design.
+//! **A run of Han is cut by dictionary, and only by dictionary.** Chinese sets
+//! no spaces, so nothing in the characters themselves says where 今天天气很好
+//! comes apart; it takes a word list and an algorithm that weighs the readings
+//! against each other. The Kindle carries the list — see [`crate::dict`] — and
+//! [`crate::segment`] is the algorithm. Every function here takes the
+//! dictionary as an argument and answers without one, coarsely: a whole run of
+//! Han as a single word, which is what there is to go on when no list has been
+//! loaded.
 //!
-//! The device does have word lists — an earlier note here claimed it did not,
-//! and blamed memory, and both were wrong. What it has is the wrong shape:
-//!
-//! - **ICU 65 is on the device but its data is stubbed.** `libicuuc` is 1.5 MB
-//!   of real code, and `libicudata.so.65.1` is **4,756 bytes** — ICU's stub
-//!   data library. So `BreakIterator`, which is exactly this job and ships a
-//!   Chinese/Japanese segmentation dictionary, has no dictionary to open.
-//! - **XT9's `zh_CN.ldb` is 1.4 MB of Chinese words**, already resident because
-//!   karyll drives that engine for pinyin input. But its API is
-//!   pinyin → candidates (`ET9CPBuildSelectionList`, `ET9CPGetPhrase`); nothing
-//!   exported asks "where does this word end". Using the list would mean
-//!   reading a proprietary format.
-//!
-//! So the honest position is not "impossible" but "not reachable from here
-//! without work nobody has costed". A coarse jump is still far better than
-//! moving one character at a time, which is what there was.
+//! The same cut applies to the kanji inside Japanese, where it separates
+//! 東京 from 都庁; the kana rules above are untouched by it, because the word
+//! list holds dictionary forms and 書いた is not one of them.
 
+use crate::dict::Dict;
+use crate::segment;
 use std::ops::Range;
 
 /// What kind of character this is, for the purpose of telling words apart.
@@ -116,19 +109,55 @@ pub fn kind_at(chars: &[char], i: usize) -> Kind {
     kind
 }
 
+/// The run of Han containing `i`, when that is what is there.
+///
+/// The run is what gets segmented, rather than the line or the paragraph:
+/// Chinese punctuation classifies as [`Kind::Other`], so a run is already about
+/// a clause long, and a reading never has to reach across a full stop to be
+/// decided.
+fn han_run(chars: &[char], i: usize) -> Option<Range<usize>> {
+    if kind_at(chars, i) != Kind::Han {
+        return None;
+    }
+    let mut start = i;
+    while start > 0 && kind_at(chars, start - 1) == Kind::Han {
+        start -= 1;
+    }
+    let mut end = i + 1;
+    while end < chars.len() && kind_at(chars, end) == Kind::Han {
+        end += 1;
+    }
+    Some(start..end)
+}
+
+/// The boundaries of the Han run around `i`, in indices into `chars`.
+fn han_cuts(chars: &[char], i: usize, dict: Option<&Dict>) -> Option<(Range<usize>, Vec<usize>)> {
+    let dict = dict?;
+    let run = han_run(chars, i)?;
+    let cuts = segment::cuts(&chars[run.clone()], dict);
+    Some((run, cuts))
+}
+
 /// Where the word to the right of `idx` ends.
 ///
 /// Anything that is not part of a word is skipped first, so pressing this at
 /// the end of one word lands at the end of the next rather than at the start of
 /// the space between them. That is what Word, Pages and a browser text field
 /// all do.
-pub fn word_end(chars: &[char], idx: usize) -> usize {
+pub fn word_end(chars: &[char], idx: usize, dict: Option<&Dict>) -> usize {
     let mut i = idx.min(chars.len());
     while i < chars.len() && !kind_at(chars, i).is_word() {
         i += 1;
     }
     if i == chars.len() {
         return i;
+    }
+    if let Some((run, cuts)) = han_cuts(chars, i, dict) {
+        // The last boundary is the end of the run, so there is always one past
+        // any position inside it.
+        if let Some(&cut) = cuts.iter().find(|&&cut| run.start + cut > i) {
+            return run.start + cut;
+        }
     }
     let kind = kind_at(chars, i);
     while i < chars.len() && kind_at(chars, i) == kind {
@@ -138,13 +167,20 @@ pub fn word_end(chars: &[char], idx: usize) -> usize {
 }
 
 /// Where the word to the left of `idx` begins.
-pub fn word_start(chars: &[char], idx: usize) -> usize {
+pub fn word_start(chars: &[char], idx: usize, dict: Option<&Dict>) -> usize {
     let mut i = idx.min(chars.len());
     while i > 0 && !kind_at(chars, i - 1).is_word() {
         i -= 1;
     }
     if i == 0 {
         return 0;
+    }
+    // The first boundary is the start of the run, so there is always one before
+    // any position inside it.
+    if let Some((run, cuts)) = han_cuts(chars, i - 1, dict)
+        && let Some(&cut) = cuts.iter().rev().find(|&&cut| run.start + cut < i)
+    {
+        return run.start + cut;
     }
     let kind = kind_at(chars, i - 1);
     while i > 0 && kind_at(chars, i - 1) == kind {
@@ -159,11 +195,17 @@ pub fn word_start(chars: &[char], idx: usize) -> usize {
 /// spaces, which is what a double-click does everywhere else. An index past the
 /// end selects the last run rather than nothing, because a tap beyond the final
 /// character is a tap on that character as far as the writer is concerned.
-pub fn word_at(chars: &[char], idx: usize) -> Range<usize> {
+pub fn word_at(chars: &[char], idx: usize, dict: Option<&Dict>) -> Range<usize> {
     if chars.is_empty() {
         return 0..0;
     }
     let i = idx.min(chars.len() - 1);
+    if let Some((run, cuts)) = han_cuts(chars, i, dict) {
+        let at = i - run.start;
+        if let Some(word) = cuts.windows(2).find(|w| at < w[1]) {
+            return run.start + word[0]..run.start + word[1];
+        }
+    }
     let kind = kind_at(chars, i);
     let mut start = i;
     while start > 0 && kind_at(chars, start - 1) == kind {
@@ -179,9 +221,30 @@ pub fn word_at(chars: &[char], idx: usize) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dict::{Layout, fixture};
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()
+    }
+
+    // The three below stand in for the public functions throughout this module,
+    // which fixes what every test here is about: the answer with no dictionary
+    // loaded. The tests that are about the dictionary pass one explicitly.
+    fn word_end(chars: &[char], idx: usize) -> usize {
+        super::word_end(chars, idx, None)
+    }
+
+    fn word_start(chars: &[char], idx: usize) -> usize {
+        super::word_start(chars, idx, None)
+    }
+
+    fn word_at(chars: &[char], idx: usize) -> Range<usize> {
+        super::word_at(chars, idx, None)
+    }
+
+    fn dict(words: &[&str]) -> Dict {
+        let pairs: Vec<(&str, u16)> = words.iter().map(|w| (*w, 0u16)).collect();
+        Dict::parse(fixture::image(&pairs, Layout::Mmseg), Layout::Mmseg).expect("parses")
     }
 
     /// Walking right by word across a sentence has to land where a writer
@@ -233,13 +296,102 @@ mod tests {
         assert_eq!(word_at(&c, 3), 2..6);
     }
 
-    /// Stated coarseness, pinned so that nobody later reads it as a bug: with
-    /// no kana to break on, a Chinese clause is one unit.
+    /// What a run of Han comes to without a dictionary: one unit, because
+    /// nothing in the characters says otherwise.
     #[test]
-    fn chinese_moves_a_whole_run_at_a_time() {
+    fn chinese_moves_a_whole_run_at_a_time_with_no_dictionary() {
         let c = chars("今天天氣很好");
         assert_eq!(word_end(&c, 0), 6);
         assert_eq!(word_start(&c, 6), 0);
+        assert_eq!(word_at(&c, 3), 0..6);
+    }
+
+    #[test]
+    fn a_dictionary_cuts_the_same_run_into_words() {
+        let d = dict(&["今天", "天气", "很", "好"]);
+        let c = chars("今天天气很好");
+        assert_eq!(super::word_at(&c, 0, Some(&d)), 0..2, "今天");
+        assert_eq!(super::word_at(&c, 3, Some(&d)), 2..4, "天气");
+        assert_eq!(super::word_at(&c, 5, Some(&d)), 5..6, "好");
+    }
+
+    #[test]
+    fn word_movement_follows_the_dictionary_through_a_run() {
+        let d = dict(&["今天", "天气", "很", "好"]);
+        let c = chars("今天天气很好");
+        let mut at = 0;
+        let mut stops = vec![];
+        while at < c.len() {
+            at = super::word_end(&c, at, Some(&d));
+            stops.push(at);
+        }
+        assert_eq!(stops, vec![2, 4, 5, 6]);
+
+        let mut at = c.len();
+        let mut back = vec![];
+        while at > 0 {
+            at = super::word_start(&c, at, Some(&d));
+            back.push(at);
+        }
+        assert_eq!(back, vec![5, 4, 2, 0], "the mirror of the walk forward");
+    }
+
+    /// The run is what gets segmented, so the words on either side of a full
+    /// stop are decided apart from each other and the punctuation is skipped
+    /// exactly as it is in Latin text.
+    #[test]
+    fn punctuation_ends_the_run_the_dictionary_sees() {
+        let d = dict(&["今天", "很好"]);
+        let c = chars("今天，很好");
+        assert_eq!(super::word_at(&c, 1, Some(&d)), 0..2);
+        assert_eq!(
+            super::word_at(&c, 2, Some(&d)),
+            2..3,
+            "the comma is its own run"
+        );
+        assert_eq!(super::word_at(&c, 3, Some(&d)), 3..5);
+        assert_eq!(super::word_end(&c, 0, Some(&d)), 2);
+        assert_eq!(super::word_end(&c, 2, Some(&d)), 5, "over the comma");
+    }
+
+    /// Japanese gets the same cut through its kanji, and the kana rules are
+    /// left alone — the word list holds 東京 and 都庁 but no inflected forms.
+    #[test]
+    fn japanese_kanji_runs_are_cut_and_kana_is_not() {
+        let d = dict(&["東京", "都庁", "書"]);
+        let c = chars("東京都庁");
+        assert_eq!(super::word_at(&c, 0, Some(&d)), 0..2);
+        assert_eq!(super::word_at(&c, 2, Some(&d)), 2..4);
+
+        let c = chars("書いた");
+        assert_eq!(super::word_at(&c, 0, Some(&d)), 0..1, "書 alone, as before");
+        assert_eq!(
+            super::word_at(&c, 1, Some(&d)),
+            1..3,
+            "いた, untouched by the list"
+        );
+    }
+
+    /// A dictionary that knows none of the characters must not change the
+    /// answer, so that a wrong or empty word list cannot make selection worse
+    /// than having none at all.
+    #[test]
+    fn an_unhelpful_dictionary_falls_back_to_one_character_at_a_time() {
+        let d = dict(&["東京"]);
+        let c = chars("今天天气");
+        assert_eq!(super::word_at(&c, 0, Some(&d)), 0..1);
+        assert_eq!(super::word_end(&c, 0, Some(&d)), 1);
+        assert_eq!(super::word_start(&c, 4, Some(&d)), 3);
+    }
+
+    #[test]
+    fn the_ends_of_a_han_run_are_fixed_points_with_a_dictionary_too() {
+        let d = dict(&["今天", "天气"]);
+        let c = chars("今天天气");
+        assert_eq!(super::word_end(&c, 4, Some(&d)), 4);
+        assert_eq!(super::word_start(&c, 0, Some(&d)), 0);
+        assert_eq!(super::word_at(&c, 99, Some(&d)), 2..4);
+        assert_eq!(super::word_at(&[], 0, Some(&d)), 0..0);
     }
 
     #[test]

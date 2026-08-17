@@ -12,6 +12,7 @@
 use std::ops::Range;
 
 use crate::buffer::Buffer;
+use crate::dict::Dict;
 use crate::undo::{Edit, History};
 use crate::word;
 
@@ -397,51 +398,51 @@ impl Document {
     /// the renderer already pays on every paint, against a keystroke that
     /// happens at most a few times a second, so it is not worth a cleverer
     /// arrangement.
-    fn word_boundary(&self, forward: bool) -> usize {
+    fn word_boundary(&self, forward: bool, dict: Option<&Dict>) -> usize {
         let chars = self.chars();
         if forward {
-            word::word_end(&chars, self.cursor)
+            word::word_end(&chars, self.cursor, dict)
         } else {
-            word::word_start(&chars, self.cursor)
+            word::word_start(&chars, self.cursor, dict)
         }
     }
 
-    pub fn move_word_left(&mut self) {
-        self.set_cursor(self.word_boundary(false));
+    pub fn move_word_left(&mut self, dict: Option<&Dict>) {
+        self.set_cursor(self.word_boundary(false, dict));
     }
 
-    pub fn move_word_right(&mut self) {
-        self.set_cursor(self.word_boundary(true));
+    pub fn move_word_right(&mut self, dict: Option<&Dict>) {
+        self.set_cursor(self.word_boundary(true, dict));
     }
 
-    pub fn extend_word_left(&mut self) {
-        self.extend_to(self.word_boundary(false));
+    pub fn extend_word_left(&mut self, dict: Option<&Dict>) {
+        self.extend_to(self.word_boundary(false, dict));
     }
 
-    pub fn extend_word_right(&mut self) {
-        self.extend_to(self.word_boundary(true));
+    pub fn extend_word_right(&mut self, dict: Option<&Dict>) {
+        self.extend_to(self.word_boundary(true, dict));
     }
 
     /// Delete back to the start of the word — or the selection, if one is up.
     ///
     /// A selection wins because that is what the writer is pointing at; only
     /// with nothing selected does this mean "the word behind me".
-    pub fn delete_word_back(&mut self) {
+    pub fn delete_word_back(&mut self, dict: Option<&Dict>) {
         if self.delete_selection() {
             return;
         }
-        let start = self.word_boundary(false);
+        let start = self.word_boundary(false, dict);
         if start < self.cursor {
             self.select(start..self.cursor);
             self.delete_selection();
         }
     }
 
-    pub fn delete_word_forward(&mut self) {
+    pub fn delete_word_forward(&mut self, dict: Option<&Dict>) {
         if self.delete_selection() {
             return;
         }
-        let end = self.word_boundary(true);
+        let end = self.word_boundary(true, dict);
         if end > self.cursor {
             self.select(self.cursor..end);
             self.delete_selection();
@@ -472,8 +473,8 @@ impl Document {
     }
 
     /// Select the word at `idx` — what a double-tap asks for.
-    pub fn select_word_at(&mut self, idx: usize) {
-        let range = word::word_at(&self.chars(), idx);
+    pub fn select_word_at(&mut self, idx: usize, dict: Option<&Dict>) {
+        let range = word::word_at(&self.chars(), idx, dict);
         self.select(range);
     }
 }
@@ -868,11 +869,11 @@ mod tests {
         fn the_cursor_moves_a_word_at_a_time_in_both_directions() {
             let mut d = Document::from_text("the quick brown fox");
             d.set_cursor(0);
-            d.move_word_right();
+            d.move_word_right(None);
             assert_eq!(d.cursor(), 3);
-            d.move_word_right();
+            d.move_word_right(None);
             assert_eq!(d.cursor(), 9);
-            d.move_word_left();
+            d.move_word_left(None);
             assert_eq!(d.cursor(), 4);
         }
 
@@ -880,7 +881,7 @@ mod tests {
         fn extending_by_word_selects_it() {
             let mut d = Document::from_text("the quick brown fox");
             d.set_cursor(4);
-            d.extend_word_right();
+            d.extend_word_right(None);
             assert_eq!(d.selected_text().as_deref(), Some("quick"));
         }
 
@@ -888,7 +889,7 @@ mod tests {
         fn deleting_a_word_back_takes_the_whole_word() {
             let mut d = Document::from_text("the quick brown");
             d.set_cursor(9);
-            d.delete_word_back();
+            d.delete_word_back(None);
             assert_eq!(d.text(), "the  brown");
             assert_eq!(d.cursor(), 4);
         }
@@ -897,7 +898,7 @@ mod tests {
         fn deleting_a_word_forward_takes_the_whole_word() {
             let mut d = Document::from_text("the quick brown");
             d.set_cursor(4);
-            d.delete_word_forward();
+            d.delete_word_forward(None);
             assert_eq!(d.text(), "the  brown");
         }
 
@@ -907,7 +908,7 @@ mod tests {
         fn deleting_a_word_with_a_selection_takes_the_selection() {
             let mut d = Document::from_text("the quick brown");
             d.select(0..3);
-            d.delete_word_back();
+            d.delete_word_back(None);
             assert_eq!(d.text(), " quick brown");
         }
 
@@ -915,7 +916,7 @@ mod tests {
         fn a_word_delete_undoes_in_one_step() {
             let mut d = Document::from_text("the quick brown");
             d.set_cursor(9);
-            d.delete_word_back();
+            d.delete_word_back(None);
             d.undo();
             assert_eq!(d.text(), "the quick brown");
         }
@@ -923,7 +924,7 @@ mod tests {
         #[test]
         fn double_tapping_selects_the_word_under_the_finger() {
             let mut d = Document::from_text("the quick brown");
-            d.select_word_at(6);
+            d.select_word_at(6, None);
             assert_eq!(d.selected_text().as_deref(), Some("quick"));
         }
 
@@ -932,12 +933,12 @@ mod tests {
         #[test]
         fn japanese_selects_by_run_rather_than_by_space() {
             let mut d = Document::from_text("私は書いた");
-            d.select_word_at(2);
+            d.select_word_at(2, None);
             assert_eq!(d.selected_text().as_deref(), Some("書"));
             d.set_cursor(2);
-            d.extend_word_right();
+            d.extend_word_right(None);
             assert_eq!(d.selected_text().as_deref(), Some("書"));
-            d.extend_word_right();
+            d.extend_word_right(None);
             assert_eq!(d.selected_text().as_deref(), Some("書いた"));
         }
 
@@ -945,13 +946,13 @@ mod tests {
         fn word_movement_stops_at_the_ends_rather_than_looping() {
             let mut d = Document::from_text("word");
             d.set_cursor(4);
-            d.move_word_right();
+            d.move_word_right(None);
             assert_eq!(d.cursor(), 4);
             d.set_cursor(0);
-            d.move_word_left();
+            d.move_word_left(None);
             assert_eq!(d.cursor(), 0);
             // And deleting at an end is a no-op rather than a panic.
-            d.delete_word_back();
+            d.delete_word_back(None);
             assert_eq!(d.text(), "word");
         }
     }

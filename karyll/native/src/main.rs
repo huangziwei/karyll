@@ -5,6 +5,7 @@ mod font;
 mod hid;
 mod ime;
 mod keymap;
+mod lexicon;
 mod orientation;
 mod pen;
 mod power;
@@ -17,7 +18,8 @@ mod window;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use karyll_core::Document;
+use karyll_core::script::Region;
+use karyll_core::{Dict, Document};
 
 use font::Metrics as _;
 use keymap::{Action, Mods};
@@ -195,6 +197,8 @@ fn main() -> Result<()> {
 
     Editor {
         doc,
+        dict: None,
+        dict_region: None,
         path,
         window,
         fonts,
@@ -573,6 +577,11 @@ enum Sink {
 
 struct Editor {
     doc: Document,
+    /// The word list for the current regional convention, when the device has
+    /// one and a convention has been chosen. Selection in Han falls back to
+    /// whole runs without it.
+    dict: Option<Dict>,
+    dict_region: Option<Region>,
     path: Option<PathBuf>,
     window: window::Window,
     fonts: font::Fonts,
@@ -1684,7 +1693,7 @@ impl Editor {
             .last_tap
             .is_some_and(|(when, at)| when.elapsed() < DOUBLE_TAP && !far(at, (x, y)));
         if again {
-            self.doc.select_word_at(index);
+            self.doc.select_word_at(index, self.dict.as_ref());
             self.last_tap = None;
         } else {
             self.doc.set_cursor(index);
@@ -2615,7 +2624,7 @@ impl Editor {
         let span = self
             .doc
             .selection()
-            .unwrap_or_else(|| karyll_core::word_at(&chars, self.doc.cursor()));
+            .unwrap_or_else(|| karyll_core::word_at(&chars, self.doc.cursor(), self.dict.as_ref()));
         if span.is_empty() {
             return;
         }
@@ -3771,16 +3780,16 @@ impl Editor {
             Action::Indent => self.doc.insert(INDENT),
             Action::Backspace => self.doc.backspace(),
             Action::Delete => self.doc.delete(),
-            Action::DeleteWordBack => self.doc.delete_word_back(),
-            Action::DeleteWordForward => self.doc.delete_word_forward(),
+            Action::DeleteWordBack => self.doc.delete_word_back(self.dict.as_ref()),
+            Action::DeleteWordForward => self.doc.delete_word_forward(self.dict.as_ref()),
             Action::DeleteToLineStart => self.doc.delete_to_line_start(),
             Action::DeleteToLineEnd => self.doc.delete_to_line_end(),
             Action::Left => self.doc.move_left(),
             Action::Right => self.doc.move_right(),
             Action::LineStart => self.doc.move_to_line_start(),
             Action::LineEnd => self.doc.move_to_line_end(),
-            Action::WordLeft => self.doc.move_word_left(),
-            Action::WordRight => self.doc.move_word_right(),
+            Action::WordLeft => self.doc.move_word_left(self.dict.as_ref()),
+            Action::WordRight => self.doc.move_word_right(self.dict.as_ref()),
             Action::DocStart => self.doc.move_to_start(),
             Action::DocEnd => self.doc.move_to_end(),
             Action::ExtendDocStart => self.doc.extend_to_start(),
@@ -3789,8 +3798,8 @@ impl Editor {
             Action::ExtendRight => self.doc.extend_right(),
             Action::ExtendLineStart => self.doc.extend_to_line_start(),
             Action::ExtendLineEnd => self.doc.extend_to_line_end(),
-            Action::ExtendWordLeft => self.doc.extend_word_left(),
-            Action::ExtendWordRight => self.doc.extend_word_right(),
+            Action::ExtendWordLeft => self.doc.extend_word_left(self.dict.as_ref()),
+            Action::ExtendWordRight => self.doc.extend_word_right(self.dict.as_ref()),
             Action::SelectAll => self.doc.select_all(),
             // Copying nothing leaves the clipboard alone rather than emptying
             // it: a stray Ctrl+C must not lose what was already in there.
@@ -3923,6 +3932,22 @@ impl Editor {
         self
     }
 
+    /// Load the word list the Han faces are set for, unless it is already the
+    /// one loaded.
+    ///
+    /// **It follows the faces rather than the keyboard**, which puts a list
+    /// behind Han from the first tap even when the writer never leaves the
+    /// English keyboard — they may be editing Chinese they typed yesterday.
+    /// A language that names no convention leaves both alone.
+    fn set_lexicon(&mut self) {
+        let region = self.fonts.region();
+        if self.dict_region == Some(region) {
+            return;
+        }
+        self.dict = lexicon::load(region);
+        self.dict_region = self.dict.is_some().then_some(region);
+    }
+
     fn set_language(&mut self, language: Language) {
         self.abandon_composition();
         self.language = language;
@@ -3931,6 +3956,7 @@ impl Editor {
         if let Some(region) = language.region() {
             self.fonts.set_region(region);
         }
+        self.set_lexicon();
 
         self.cjk = match language.script() {
             Some(script) => self.load_engine(script),

@@ -708,6 +708,11 @@ impl Fonts {
         self.region = region;
     }
 
+    /// Which convention the Han slots are loaded for.
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
     /// Faces this device actually has, in chain order. Worth logging at
     /// startup: a firmware that moved a face otherwise shows up only as text
     /// that draws in the wrong style.

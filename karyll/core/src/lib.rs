@@ -4,10 +4,12 @@
 //! `cargo test` on a development machine rather than only on the device.
 
 pub mod buffer;
+pub mod dict;
 pub mod doc;
 pub mod find;
 pub mod markdown;
 pub mod script;
+pub mod segment;
 pub mod sentence;
 pub mod undo;
 pub mod word;
@@ -15,6 +17,7 @@ pub mod words;
 pub mod wrap;
 
 pub use buffer::Buffer;
+pub use dict::{Dict, Layout};
 pub use doc::Document;
 pub use markdown::{
     Block, Continue, LineMarkup, Span, Style, analyze, continues, toggle_emphasis, toggle_heading,
