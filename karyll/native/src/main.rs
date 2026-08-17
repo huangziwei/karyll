@@ -171,10 +171,9 @@ fn main() -> Result<()> {
         }
     };
 
-    // Read but not yet acted on. Which reading means which way up has to come
-    // off the hardware — see the UI plan's rotation item — so this session logs
-    // what the sensor says and nothing more. A missing accelerometer is not
-    // worth a word to the user: nothing depends on it yet.
+    // Opened before the window, because it is what decides which way up the
+    // window opens. A missing accelerometer is not worth a word to the user:
+    // the Kindle that has none offers the choice in Config instead.
     let accel = match evdev::Accelerometer::open() {
         Ok(accel) => {
             eprintln!("accel: {}", accel.path().display());
@@ -186,8 +185,7 @@ fn main() -> Result<()> {
         }
     };
 
-    // Remembered across sessions, so a landscape writer stays in landscape.
-    let orientation = read_orientation();
+    let orientation = read_orientation(accel.as_ref());
     let mut window = window::Window::open("karyll", orientation)?;
     // Only ever narrows what the panel offered: on the two grey Kindles the
     // capability is absent and this is a no-op.
@@ -3314,10 +3312,11 @@ impl Editor {
         self.window.set_orientation(want)?;
         self.touch_orientation = want;
         self.orientation_checked = std::time::Instant::now();
-        // The starting point for the next session's first paint, before the
-        // sensor has said anything — and on a Kindle with no sensor, the whole
-        // of what is remembered.
-        write_orientation(want);
+        // Only where the orientation is a setting. A Kindle that reads its own
+        // position opens on that reading, and nothing there reads the file.
+        if !self.turns_itself {
+            write_orientation(want);
+        }
         // The window manager answers with a resize, which the loop picks up.
         // Repaint anyway: if it declines, nothing else would.
         self.frame = None;
@@ -4731,20 +4730,48 @@ fn autosave_due(idle_for: Option<std::time::Duration>, dirty_for: std::time::Dur
     idle_for.is_none_or(|idle| idle >= AUTOSAVE_IDLE) || dirty_for >= AUTOSAVE_MAX
 }
 
-/// Remembered orientation, beside the logs so it survives an update.
+/// The orientation a Kindle with no sensor was last set to, beside the logs so
+/// it survives an update.
 fn orientation_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/orientation")
 }
 
-/// The orientation to open in: what was last chosen, or whatever the framework
-/// currently has.
-fn read_orientation() -> orientation::Orientation {
-    let (orientation, from) = match std::fs::read_to_string(orientation_file()) {
-        Ok(letter) => (
-            orientation::Orientation::from_letter(letter.trim()),
-            "remembered",
-        ),
-        Err(_) => (orientation::Orientation::detect(), "asked winmgr"),
+/// Which way up to open.
+///
+/// **Where there is a sensor, the way the device is being held wins, and
+/// nothing is remembered.** Sessions are minutes apart and the device is put
+/// down between them, so the orientation the last one ended in says nothing
+/// about the one starting: a writer who reaches for a Kindle lying flat on a
+/// stand and gets a portrait page has to turn it a full ninety degrees the
+/// wrong way and back before the page follows. The sensor already knows, and
+/// [`evdev::Accelerometer::position`] asks it without waiting for a movement
+/// that may not come.
+///
+/// The framework's own orientation is the answer when the sensor gives none —
+/// lying flat, or nothing reported since boot. It has been following this same
+/// sensor all along, so it holds the last position that did name an
+/// orientation, which is the best available reading of a device that is not
+/// currently telling anyone which way up it is.
+///
+/// Only a Kindle with no sensor remembers, because there the orientation is a
+/// setting a writer chose rather than a fact about the room, and forgetting it
+/// would mean choosing it again every session.
+fn read_orientation(accel: Option<&evdev::Accelerometer>) -> orientation::Orientation {
+    let (orientation, from) = match accel {
+        Some(accel) => match accel
+            .position()
+            .and_then(orientation::Orientation::from_tilt)
+        {
+            Some(held) => (held, "held"),
+            None => (orientation::Orientation::detect(), "flat, asked winmgr"),
+        },
+        None => match std::fs::read_to_string(orientation_file()) {
+            Ok(letter) => (
+                orientation::Orientation::from_letter(letter.trim()),
+                "remembered",
+            ),
+            Err(_) => (orientation::Orientation::detect(), "asked winmgr"),
+        },
     };
     eprintln!("orientation: {orientation:?} ({from})");
     orientation

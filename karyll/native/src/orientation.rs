@@ -8,9 +8,7 @@
 //!   states including both landscapes, and it is readable from
 //!   `/dev/input/eventN` like any other input device. Turning the Scribe on its
 //!   side does nothing in the stock reader because the reader is portrait-only,
-//!   not because the hardware cannot say. An earlier version of this comment
-//!   claimed the sensor could only tell which side the page bezel was on, and
-//!   that was wrong.
+//!   not because the hardware cannot say.
 //! - **What an app asks for.** The lab126 window manager reads the window's
 //!   name as a layout spec, ending in `_O:<letter>`. Setting `L` or `R` there is
 //!   how landscape is requested, which is why the stock reader offers it as a

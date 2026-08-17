@@ -27,6 +27,16 @@ use crate::keymap::code;
 /// `_IOW('E', 0x90, int)`: direction(W=1)<<30 | size(4)<<16 | type('E')<<8 | nr.
 const EVIOCGRAB: libc::c_int = 0x4004_4590;
 
+/// `_IOR('E', 0x40 + ABS_TILT, struct input_absinfo)`: the same arithmetic with
+/// the direction reversed, over a struct of six `__s32` — value, minimum,
+/// maximum, fuzz, flat, resolution — so 24 bytes.
+///
+/// The first of those six is what this is for. The kernel keeps the last value
+/// carried on every absolute axis and hands it back here, which is how the
+/// accelerometer can be asked where the device is instead of waited on until it
+/// moves again.
+const EVIOCGABS_TILT: u32 = 0x8018_4558;
+
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
@@ -417,6 +427,32 @@ impl Accelerometer {
         self.file.as_raw_fd()
     }
 
+    /// The position code the sensor is holding right now, without waiting for
+    /// it to report again.
+    ///
+    /// **The sensor only speaks when the device turns.** A Kindle that has been
+    /// still on a stand for an hour has said nothing for an hour, so a reader
+    /// that has only [`read_batch`](Self::read_batch) learns which way up it is
+    /// no sooner than the next time somebody picks it up. Asking the axis for
+    /// its last value is the whole of how a session can open the way the device
+    /// is being held.
+    ///
+    /// `None` when the ioctl fails. A zero — no report since boot — is a code
+    /// like any other and is left to
+    /// `orientation::Orientation::from_tilt` to reject, along with the codes
+    /// for lying flat, which name no orientation either.
+    pub fn position(&self) -> Option<i32> {
+        let mut absinfo = [0i32; 6];
+        let rc = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                EVIOCGABS_TILT as _,
+                absinfo.as_mut_ptr(),
+            )
+        };
+        (rc == 0).then_some(absinfo[0])
+    }
+
     /// Read whatever is ready and return the reports that completed.
     pub fn read_batch(&mut self) -> Result<Vec<Sample>> {
         let mut buf = [0u8; EVENT_BYTES * 16];
@@ -785,6 +821,19 @@ B: ABS=6608000 0
                 }]
             );
         }
+    }
+
+    /// An ioctl request is four fields packed into a word, and a wrong digit in
+    /// any of them is a different call the kernel answers `EINVAL` to — which
+    /// reads as a sensor that never knows where it is. Both numbers are checked
+    /// against the arithmetic, so a transposition in either is a failure here
+    /// rather than a silent one on the device.
+    #[test]
+    fn the_absinfo_request_is_the_number_the_kernel_answers() {
+        let request =
+            |dir: u32, size: u32, nr: u32| dir << 30 | size << 16 | (b'E' as u32) << 8 | nr;
+        assert_eq!(EVIOCGRAB as u32, request(1, 4, 0x90));
+        assert_eq!(EVIOCGABS_TILT, request(2, 24, 0x40 + ABS_TILT as u32));
     }
 
     #[test]
