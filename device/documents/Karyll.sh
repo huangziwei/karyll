@@ -33,4 +33,11 @@
 KARYLL_ORIGIN_VIEW=$(lipc-get-prop com.lab126.appmgrd peekHistoryView 2>/dev/null)
 export KARYLL_ORIGIN_VIEW
 
-nohup sh -c 'sleep 1; exec /mnt/us/extensions/karyll/bin/karyll.sh' >/dev/null 2>&1 &
+# **Blocking, and by `exec`.** Detaching here dates from when the editor took
+# the screen by freezing the framework, which it has not done since it became an
+# X11 client (see `window.rs`); all it buys now is the framework closing this
+# tile's book the moment the tap returns, so the writer watches the home screen
+# come up before the editor does. `exec` makes this process *become* the
+# launcher, so the landing stays on the one EXIT trap that knows whether the
+# lock is still ours.
+exec /mnt/us/extensions/karyll/bin/karyll.sh
