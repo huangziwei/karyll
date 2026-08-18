@@ -21,7 +21,7 @@
 //! **The defaults are the head of a short list, not the only option.** The
 //! stroke-thinning argument is a prediction rather than a measurement, and it is
 //! also a matter of taste once it stops being a matter of legibility, so
-//! [`families`] offers two to five per writing system and the settings panel
+//! [`families`] offers two or three per writing system and the settings panel
 //! picks between them. It is a curated list and deliberately not a browser over
 //! the faces the device carries: most of them are handwriting styles or scripts
 //! karyll does not typeset, and a list nobody can read through is not a choice.
@@ -50,28 +50,6 @@ pub trait Metrics {
     fn line_height(&mut self, px: f32, roles: &[Role]) -> f32;
     /// Top of the row to its baseline, for a row that may hold any of `roles`.
     fn ascent(&mut self, px: f32, roles: &[Role]) -> f32;
-}
-
-/// What one character of prose costs at `px`, in the face the body is set in.
-///
-/// **The measure is a line length in characters**, and a character is not one
-/// width across the three faces a writer can choose: Duo is 0.46 em with six
-/// letters widened to 0.69, Mono is 0.46 throughout, and Quattro's four widths
-/// average 0.42. An eighth between the ends is four characters on a
-/// sixty-character line, so the column is measured against the face in use —
-/// which makes choosing the narrow face buy margin rather than a longer line.
-///
-/// **A pangram rather than the alphabet**, because a line of English is about
-/// a sixth spaces and the space is the narrowest glyph in the face that varies
-/// most. Measured at `px` rather than per em so the answer comes out of the
-/// same advance cache the page is about to draw from.
-pub fn average_advance(fonts: &mut impl Metrics, px: f32) -> f32 {
-    const SAMPLE: &str = "the quick brown fox jumps over the lazy dog";
-    let total: f32 = SAMPLE
-        .chars()
-        .map(|ch| fonts.advance(Role::Body, px, ch))
-        .sum();
-    total / SAMPLE.chars().count() as f32
 }
 
 /// A row that only ever holds Latin: chrome, panel titles, anything whose text
@@ -179,25 +157,21 @@ const CHROME_FACES: [&str; 2] = [
 
 /// The Latin families a *document* can be set in, default first.
 ///
-/// **Ember is absent on purpose**: it draws the app, and a face doing both jobs
-/// makes the page look like the panel. What is left is the two firmware serifs
-/// and the three writing faces karyll ships, which is a list of things to write
-/// in rather than an inventory.
+/// **The three faces karyll ships, and nothing off the firmware.** The device's
+/// own faces draw the device — a page set in one looks like the reader it was
+/// taken from, and the app's chrome is already in Ember. These three were drawn
+/// to be written in, and shipping them is what makes one editor read the same
+/// on every Kindle.
 ///
-/// **The three iA faces lead, and are bundled because no Kindle carries a
-/// monospace text face.** Every device this was built against ships the same
-/// firmware faces, and the only one named for the word is a symbol font — so a
-/// fenced block or a table has nothing to line its columns up in. They are cut
-/// from one design at a shared 0.6 em base and differ in how many widths they
-/// allow: Mono holds one, so it is the only one whose columns align; **Duo**
-/// widens six letters by half and is the writing face iA itself defaults to,
-/// which is why it is the default here; Quattro allows four widths and sets some
-/// 9% narrower than Duo, buying back the line length a fixed pitch costs.
-///
-/// The firmware pair follow. Baskerville and Palatino are on the device too and
-/// are left out on the argument that picked the Han body — they are
-/// high-contrast serifs whose hairlines thin further under a one-bit cut, where
-/// Bookerly was drawn for this screen and Caecilia holds an even stroke weight.
+/// **They are bundled because no Kindle carries a monospace text face.** Every
+/// device this was built against ships the same firmware faces, and the only
+/// one named for the word is a symbol font — so a fenced block or a table has
+/// nothing to line its columns up in. The three are cut from one design at a
+/// shared 0.6 em base and differ in how many widths they allow: Mono holds one,
+/// so it is the only one whose columns align; **Duo** widens six letters by
+/// half and is the writing face iA itself defaults to, which is why it is the
+/// default here; Quattro allows four widths and sets some 9% narrower than Duo,
+/// buying back the line length a fixed pitch costs.
 ///
 /// Every entry is a true four-face family, so emphasis and strong are real
 /// italics and bolds rather than synthetic slants — which is what [`available`]
@@ -228,24 +202,6 @@ const LATIN_FAMILIES: &[Family] = &[
             "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-Italic.ttf",
             "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-Bold.ttf",
             "/mnt/us/extensions/karyll/fonts/iAWriterQuattroS-BoldItalic.ttf",
-        ],
-    },
-    Family {
-        name: "Bookerly",
-        faces: &[
-            "/usr/java/lib/fonts/Bookerly-Regular.ttf",
-            "/usr/java/lib/fonts/Bookerly-Italic.ttf",
-            "/usr/java/lib/fonts/Bookerly-Bold.ttf",
-            "/usr/java/lib/fonts/Bookerly-BoldItalic.ttf",
-        ],
-    },
-    Family {
-        name: "Caecilia",
-        faces: &[
-            "/usr/java/lib/fonts/Caecilia_LT_65_Medium.ttf",
-            "/usr/java/lib/fonts/Caecilia_LT_66_Medium_Italic.ttf",
-            "/usr/java/lib/fonts/Caecilia_LT_75_Bold.ttf",
-            "/usr/java/lib/fonts/Caecilia_LT_76_Bold_Italic.ttf",
         ],
     },
 ];
@@ -431,7 +387,8 @@ fn family(group: Group, chosen: usize) -> &'static Family {
 /// would not fall back to another italic — a Latin role has one face and then
 /// the pan-Unicode fallback, so emphasis would come out in code2000. Declining
 /// the whole entry is the honest answer, and every family listed here ships
-/// complete on the firmware this was built against.
+/// complete — the Han faces on the firmware this was built against, the Latin
+/// three in the extension.
 pub fn available(group: Group) -> Vec<usize> {
     available_by(group, |path| Path::new(path).is_file())
 }
@@ -1403,9 +1360,9 @@ mod tests {
 
     #[test]
     fn a_stored_line_this_build_does_not_know_leaves_the_default() {
-        let stored = "latin Bookerly\nkr 바탕\nja Helvetica\nsc\n\ntc 楷體 and more\n";
+        let stored = "latin Quattro\nkr 바탕\nja Helvetica\nsc\n\ntc 楷體 and more\n";
         let got = Choices::parse(stored);
-        assert_eq!(got.get(Group::Latin), 3, "a line it knows still applies");
+        assert_eq!(got.get(Group::Latin), 2, "a line it knows still applies");
         assert_eq!(got.get(Group::Han(Region::Japanese)), 0, "unknown name");
         assert_eq!(got.get(Group::Han(Region::Simplified)), 0, "no name at all");
         assert_eq!(
@@ -1427,10 +1384,10 @@ mod tests {
         );
     }
 
-    /// The three bundled faces are the ones karyll ships, so they live under
-    /// the extension rather than on the firmware — and a device whose
-    /// `/mnt/us` is not mounted must still offer the firmware's serifs, and
-    /// must still draw its own chrome.
+    /// Every face a document can be set in ships with karyll and lives under
+    /// the extension. The chrome does not: the app has to be able to draw
+    /// itself on a device whose storage is away being read over USB, where a
+    /// page falls through to [`FALLBACK`] and the panels stay in Ember.
     #[test]
     fn the_bundled_families_are_the_ones_karyll_ships() {
         const BUNDLED: &str = "/mnt/us/extensions/karyll/fonts/";
@@ -1454,17 +1411,16 @@ mod tests {
                 family.name
             );
         }
-        assert_eq!(
-            available_by(Group::Latin, |path| !path.starts_with(BUNDLED)),
-            vec![3, 4],
-            "the firmware's serifs have to stand alone"
+        assert!(
+            available_by(Group::Latin, |path| !path.starts_with(BUNDLED)).is_empty(),
+            "the writing faces are the extension's, all of them"
         );
     }
 
     #[test]
     fn only_families_whose_every_face_is_installed_are_offered() {
         let all = available_by(Group::Latin, |_| true);
-        assert_eq!(all, vec![0, 1, 2, 3, 4]);
+        assert_eq!(all, vec![0, 1, 2]);
         assert!(available_by(Group::Latin, |_| false).is_empty());
         // One missing italic is enough: a Latin role has no second face to fall
         // back to, so emphasis would come out of the pan-Unicode fallback.
