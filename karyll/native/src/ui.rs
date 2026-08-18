@@ -250,18 +250,28 @@ const CHIP_PAD: u16 = 24;
 /// Between one chip and the next.
 const CHIP_GAP: u16 = 20;
 
-/// Where the chips of *every* choice row start.
+/// Where the second column of *every* row starts — the chips, the swatches and
+/// a row's detail alike.
 ///
 /// One column across the whole panel, from the widest label on it, so the
 /// values line up down the page instead of stepping in and out behind labels
 /// of different lengths — which is most of what makes a settings page read as
 /// a table rather than as a pile.
 ///
-/// **Capped at a third of the width**, because one label is not karyll's to
-/// choose: a Bluetooth keyboard is named by whoever made it, and a long enough
-/// name would push the chips past the right margin, where [`chip_bounds`] drops
-/// them — leaving a keyboard that cannot be forgotten. A label running under
-/// its own chips is a cosmetic fault; a control that is not on the page is not.
+/// **Measured against the panel it is drawn on, not against a fixed fraction of
+/// it.** The column is pulled back far enough that the widest thing in the
+/// second column — a detail, a run of chips, a row of swatches — still finishes
+/// inside the right margin, so a page is given whatever width its own content
+/// leaves it. The same list therefore lays itself out differently on a 1272 px
+/// portrait panel and a 1696 px landscape one, which on Help is the difference
+/// between two columns and one column written over another.
+///
+/// **Between a third and half of the line.** Past half, a page has stopped
+/// being a table and the label gives way instead — [`elided`] cuts it, which
+/// matters for the labels karyll does not choose: a Bluetooth keyboard is named
+/// by whoever made it and a document by whoever wrote it. The floor is the same
+/// rule from the other side: one long detail may not squeeze every label on the
+/// page.
 pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str) -> u16) -> u16 {
     let widest = items
         .iter()
@@ -275,7 +285,150 @@ pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str
         })
         .max()
         .unwrap_or(0);
-    (ROW_INSET + widest + CHIP_GAP * 3).min(width / 3)
+    let wanted = ROW_INSET
+        .saturating_add(widest)
+        .saturating_add(CHIP_GAP * 3);
+    let room = items
+        .iter()
+        .map(|item| second_column_room(item, width, &mut measure_text))
+        .min()
+        .unwrap_or(u16::MAX);
+    wanted.min(room.max(width / 3).min(width / 2))
+}
+
+/// The furthest right this row's second column may start and still finish
+/// inside the right margin.
+///
+/// [`u16::MAX`] for a row with no second column at all: it constrains nothing,
+/// and a page of them lets the labels have the whole band.
+fn second_column_room(item: &Item, width: u16, measure_text: &mut impl FnMut(&str) -> u16) -> u16 {
+    let right = width.saturating_sub(MARGIN_X);
+    match item {
+        Item::Heading(_) => u16::MAX,
+        Item::Row { detail, action, .. } => {
+            if detail.is_empty() {
+                return u16::MAX;
+            }
+            // The action chip holds the right margin whatever the row is
+            // called, so the detail's room ends a gap short of it.
+            let right = match action {
+                Some(label) => right
+                    .saturating_sub(action_width(label, measure_text))
+                    .saturating_sub(CHIP_GAP),
+                None => right,
+            };
+            right.saturating_sub(measure_text(detail))
+        }
+        Item::Choice { options, .. } => {
+            right.saturating_sub(run_width(chip_widths(options, measure_text)))
+        }
+        Item::Swatches { inks, .. } => {
+            right.saturating_sub(run_width(std::iter::repeat_n(SWATCH_W, inks.len())))
+        }
+    }
+}
+
+/// How wide each chip of a row is: its own text, and the blank either side.
+fn chip_widths(options: &[String], measure_text: &mut impl FnMut(&str) -> u16) -> Vec<u16> {
+    options
+        .iter()
+        .map(|option| measure_text(option).saturating_add(CHIP_PAD * 2))
+        .collect()
+}
+
+/// How wide a row of cells is once tiled, the gaps between them included.
+///
+/// The one place that arithmetic lives, because [`chip_column`] has to know
+/// what [`chip_bounds`] and [`swatch_bounds`] are about to lay out: a second
+/// copy of it would leave room for a run of a different length than the one
+/// drawn.
+fn run_width(widths: impl IntoIterator<Item = u16>) -> u16 {
+    let mut total = 0u16;
+    let mut cells = 0u16;
+    for w in widths {
+        total = total.saturating_add(w);
+        cells = cells.saturating_add(1);
+    }
+    total.saturating_add(CHIP_GAP.saturating_mul(cells.saturating_sub(1)))
+}
+
+/// How much of its line a row's label may be drawn on before it runs into its
+/// own value — a gap short of it, so the two columns read as two even on the
+/// panel that only just has room for both.
+///
+/// **Drawing and press feedback both come through here**, for the reason
+/// [`chip_bounds`] is shared between drawing and hit-testing: a label cut at
+/// rest and drawn whole under the finger would change length as it is touched.
+pub fn label_room(
+    item: &Item,
+    column: u16,
+    width: u16,
+    measure_text: &mut impl FnMut(&str) -> u16,
+) -> u16 {
+    let right = width.saturating_sub(MARGIN_X);
+    let gap = |start: u16| start.saturating_sub(ROW_INSET + CHIP_GAP);
+    match item {
+        // Not a label: it starts at the margin and owns its whole line.
+        Item::Heading(_) => right.saturating_sub(MARGIN_X),
+        Item::Row { detail, action, .. } => {
+            if !detail.is_empty() {
+                return gap(column);
+            }
+            // Nothing in the second column: the whole line, up to its own
+            // action chip.
+            match action {
+                Some(text) => right
+                    .saturating_sub(action_width(text, measure_text))
+                    .saturating_sub(CHIP_GAP),
+                None => right,
+            }
+            .saturating_sub(ROW_INSET)
+        }
+        // Its own chips rather than the column, because a row that could not
+        // afford the column keeps them just past its label.
+        Item::Choice { label, options, .. } => {
+            gap(chip_bounds(column, width, label, options, measure_text)
+                .first()
+                .map_or(column, |(x, _)| *x))
+        }
+        Item::Swatches { .. } => gap(column),
+    }
+}
+
+/// `text`, cut to `room` with an ellipsis, or whole when it fits.
+///
+/// **What a label runs into is its own value** — a filename over its word
+/// count, a keyboard's name over the button that forgets it — so a label too
+/// long for its column is cut rather than drawn on top of the thing it names.
+/// Nothing else on a panel is drawn past its bounds either: a chip too wide for
+/// the margin is dropped, and a candidate bar too wide for the panel is paged.
+///
+/// Cut by character, so a label in Chinese loses characters rather than bytes.
+pub fn elided(text: &str, room: u16, mut measure_text: impl FnMut(&str) -> u16) -> String {
+    if measure_text(text) <= room {
+        return text.to_string();
+    }
+    let mark = "…";
+    let mut used = measure_text(mark);
+    if used > room {
+        return String::new();
+    }
+    let mut kept = String::new();
+    for ch in text.chars() {
+        let mut buf = [0u8; 4];
+        let w = measure_text(ch.encode_utf8(&mut buf));
+        if used.saturating_add(w) > room {
+            break;
+        }
+        used += w;
+        kept.push(ch);
+    }
+    // A space before the mark reads as a gap rather than as a cut.
+    while kept.ends_with(' ') {
+        kept.pop();
+    }
+    kept.push_str(mark);
+    kept
 }
 
 /// Where each chip of one choice row sits, in window x.
@@ -287,13 +440,13 @@ pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str
 /// the rule the candidate bar follows in [`candidate_pages`].
 ///
 /// **The shared column is a courtesy, and a row that cannot afford it keeps its
-/// own.** Seven type sizes need 722 px of chips and a 7″ panel leaves 788 from
-/// the column — eight per cent, which is not a margin, it is a coincidence. A
-/// row whose chips do not all fit therefore starts them just past its own
-/// label instead, which on a short label like `Size` is 240 px further left. It
-/// steps that row out of the table, and that is the trade the whole page is
-/// laid out under: a label running under its own chips is a cosmetic fault, a
-/// control that is not on the page is not.
+/// own.** [`chip_column`] leaves room for the widest run on the page, so this
+/// is the case where a row is not that one and still cannot fit — the column
+/// having been floored at a third of the line to keep the labels readable. Such
+/// a row starts its chips just past its own label instead, which on a short
+/// label like `Size` is a long way further left. It steps that row out of the
+/// table, and that is the trade the page is laid out under: a control that is
+/// not on the page is worse than a row that is not in line with its neighbours.
 pub fn chip_bounds(
     column: u16,
     width: u16,
@@ -302,14 +455,8 @@ pub fn chip_bounds(
     mut measure_text: impl FnMut(&str) -> u16,
 ) -> Vec<(u16, u16)> {
     let right = width.saturating_sub(MARGIN_X);
-    let widths: Vec<u16> = options
-        .iter()
-        .map(|option| measure_text(option).saturating_add(CHIP_PAD * 2))
-        .collect();
-    let wanted = widths
-        .iter()
-        .fold(0u16, |sum, w| sum.saturating_add(*w))
-        .saturating_add(CHIP_GAP * widths.len().saturating_sub(1) as u16);
+    let widths = chip_widths(options, &mut measure_text);
+    let wanted = run_width(widths.iter().copied());
     // Its own label only when that is further left than the column: a row with
     // the longest label on the page is the one the column was measured from,
     // and starting after it again would gain nothing.
@@ -370,9 +517,15 @@ pub fn action_rect(
     label: &str,
     mut measure_text: impl FnMut(&str) -> u16,
 ) -> Rect {
-    let w = measure_text(label).saturating_add(CHIP_PAD * 2);
+    let w = action_width(label, &mut measure_text);
     let x = width.saturating_sub(MARGIN_X).saturating_sub(w);
     chip_slot(layout, item, x, w)
+}
+
+/// How wide an action chip is, which is how much of the right margin it takes
+/// away from the detail beside it.
+fn action_width(label: &str, measure_text: &mut impl FnMut(&str) -> u16) -> u16 {
+    measure_text(label).saturating_add(CHIP_PAD * 2)
 }
 
 fn chip_slot(layout: Layout, item: usize, x: u16, width: u16) -> Rect {
@@ -501,7 +654,13 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                 on,
                 action,
             } => {
-                draw_line(window, fonts, label, ROW_INSET, middle, TEXT_PX, *on, BLACK);
+                let room = label_room(item, column, width, &mut |s| {
+                    measure(fonts, s, TEXT_PX) as u16
+                });
+                let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
+                draw_line(
+                    window, fonts, &label, ROW_INSET, middle, TEXT_PX, *on, BLACK,
+                );
                 if !detail.is_empty() {
                     draw_line(window, fonts, detail, column, middle, TEXT_PX, false, BLACK);
                 }
@@ -523,12 +682,16 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                 on,
                 inert,
             } => {
-                draw_line(
-                    window, fonts, label, ROW_INSET, middle, TEXT_PX, false, BLACK,
-                );
                 let bounds = chip_bounds(column, width, label, options, |s| {
                     measure(fonts, s, TEXT_PX) as u16
                 });
+                let room = label_room(item, column, width, &mut |s| {
+                    measure(fonts, s, TEXT_PX) as u16
+                });
+                let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
+                draw_line(
+                    window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
+                );
                 for (o, _) in bounds.iter().enumerate() {
                     let rect = chip_rect(layout, i, &bounds, o);
                     draw_chip(
@@ -543,8 +706,12 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                 }
             }
             Item::Swatches { label, inks, on } => {
+                let room = label_room(item, column, width, &mut |s| {
+                    measure(fonts, s, TEXT_PX) as u16
+                });
+                let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
                 draw_line(
-                    window, fonts, label, ROW_INSET, middle, TEXT_PX, false, BLACK,
+                    window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
                 );
                 let bounds = swatch_bounds(column, width, inks.len());
                 for (o, _) in bounds.iter().enumerate() {
@@ -1095,16 +1262,24 @@ pub fn paint_row(
     };
     window.fill(rect, ground);
     let baseline = rect.y as i32 + (layout.row_h as i32 - TEXT_PX as i32) / 2 - 2;
-    if let Some(Item::Row {
-        label,
-        detail,
-        on,
-        action,
-    }) = items.get(index)
+    if let Some(
+        item @ Item::Row {
+            label,
+            detail,
+            on,
+            action,
+        },
+    ) = items.get(index)
     {
-        draw_line(window, fonts, label, ROW_INSET, baseline, TEXT_PX, *on, ink);
+        let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
+        let room = label_room(item, column, width, &mut |s| {
+            measure(fonts, s, TEXT_PX) as u16
+        });
+        let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
+        draw_line(
+            window, fonts, &label, ROW_INSET, baseline, TEXT_PX, *on, ink,
+        );
         if !detail.is_empty() {
-            let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
             draw_line(window, fonts, detail, column, baseline, TEXT_PX, false, ink);
         }
         // Drawn at rest even while the row around it is inverted, which is the
@@ -1795,10 +1970,94 @@ mod tests {
         assert!(chip_column(&longer, WIDTH, stub) > column);
     }
 
+    /// **The same list is laid out differently on different panels.** A wide one
+    /// has room to put the column where the labels want it; a narrow one has to
+    /// pull it back until the second column finishes inside the right margin.
+    /// Nothing about the list changes — only how much of the panel is left.
+    #[test]
+    fn a_column_is_placed_from_what_the_panel_has_left() {
+        let items = vec![Item::Row {
+            label: "Press at one end of the run and lift at the other".into(),
+            detail: "Places the cursor where you tapped, and never writes a mark on it.".into(),
+            action: None,
+            on: false,
+        }];
+        let wide = chip_column(&items, WIDE, stub);
+        let narrow = chip_column(&items, NARROW, stub);
+        assert!(
+            narrow < wide,
+            "the narrow panel took no less room: {narrow}"
+        );
+        for (panel, column) in [(WIDE, wide), (NARROW, narrow)] {
+            let Item::Row { label, detail, .. } = &items[0] else {
+                unreachable!()
+            };
+            assert!(
+                column + stub(detail) <= panel - MARGIN_X,
+                "{panel} px panel: the detail runs off the right margin"
+            );
+            let room = label_room(&items[0], column, panel, &mut stub);
+            let drawn = elided(label, room, stub);
+            assert!(
+                ROW_INSET + stub(&drawn) < column,
+                "{panel} px panel: {drawn:?} runs under its own detail"
+            );
+        }
+    }
+
+    /// A run of chips is what a settings row has instead of a detail, and it
+    /// binds the column the same way: the seven type sizes are the widest run
+    /// karyll draws, and on the narrow panel they are what decides where the
+    /// labels stop.
+    #[test]
+    fn a_row_of_chips_leaves_the_column_as_much_room_as_a_detail_does() {
+        let sizes: Vec<String> = crate::render::SIZES
+            .iter()
+            .map(|px| format!("{px:.0}"))
+            .collect();
+        let items = vec![Item::Choice {
+            label: "A Long Bluetooth Keyboard Name".into(),
+            options: sizes.clone(),
+            on: vec![],
+            inert: Vec::new(),
+        }];
+        for panel in [WIDE, NARROW] {
+            let column = chip_column(&items, panel, stub);
+            let bounds = chip_bounds(column, panel, "Size", &sizes, stub);
+            assert_eq!(
+                bounds.len(),
+                sizes.len(),
+                "{panel} px panel: a size fell off"
+            );
+            let (x, w) = bounds[bounds.len() - 1];
+            assert!(
+                x + w <= panel - MARGIN_X,
+                "{panel} px panel: 80 is past the margin"
+            );
+        }
+    }
+
+    /// **A label is cut rather than drawn over its own value.** Nothing else on
+    /// a panel is drawn past its bounds either: a chip too wide for the margin
+    /// is dropped and a candidate bar too wide for the panel is paged.
+    #[test]
+    fn a_label_too_long_for_its_room_is_cut_at_the_mark() {
+        assert_eq!(elided("draft.md", 200, stub), "draft.md", "it fits, whole");
+        // Ten pixels a character, the mark included: five characters and the
+        // mark are 60, so 65 keeps five.
+        assert_eq!(elided("a-long-filename.md", 65, stub), "a-lon…");
+        // Cut by character, so a Chinese name loses characters and not bytes.
+        assert_eq!(elided("第一章的草稿", 45, stub), "第一章…");
+        // A space before the mark reads as a gap rather than as a cut.
+        assert_eq!(elided("Focus on this", 75, stub), "Focus…");
+        // Not even the mark fits, and half a mark is worse than none.
+        assert_eq!(elided("draft.md", 5, stub), "");
+    }
+
     /// One label on this page is not karyll's to choose — a Bluetooth keyboard
-    /// carries whatever name its maker gave it. Uncapped, a long one pushes the
+    /// carries whatever name its maker gave it. Unbounded, a long one pushes the
     /// chips past the right margin, `chip_bounds` drops them, and the writer is
-    /// left with a keyboard they cannot forget.
+    /// left with a keyboard they cannot forget. The name gives way instead.
     #[test]
     fn a_label_nobody_chose_cannot_push_its_own_controls_off_the_page() {
         let items = vec![Item::Choice {
@@ -1807,16 +2066,26 @@ mod tests {
             on: vec![false, false],
             inert: Vec::new(),
         }];
-        let column = chip_column(&items, WIDTH, stub);
-        assert!(column <= WIDTH / 3, "the column ran away with the label");
         let Item::Choice { label, options, .. } = &items[0] else {
             unreachable!()
         };
-        assert_eq!(
-            chip_bounds(column, WIDTH, label, options, stub).len(),
-            2,
-            "Forget must still be on the page"
-        );
+        for panel in [WIDE, NARROW] {
+            let column = chip_column(&items, panel, stub);
+            assert!(column <= panel / 2, "the column ran away with the label");
+            let bounds = chip_bounds(column, panel, label, options, stub);
+            assert_eq!(bounds.len(), 2, "{panel} px panel: Forget must still be on");
+            let room = label_room(&items[0], column, panel, &mut stub);
+            let drawn = elided(label, room, stub);
+            assert!(
+                ROW_INSET + stub(&drawn) < bounds[0].0,
+                "{panel} px panel: {drawn:?} reaches its own Connect chip"
+            );
+        }
+        // The 7″ panel is the one with no room for the whole name, and there it
+        // is the name that gives way rather than the buttons.
+        let column = chip_column(&items, NARROW, stub);
+        let room = label_room(&items[0], column, NARROW, &mut stub);
+        assert!(elided(label, room, stub).ends_with('…'));
     }
 
     #[test]

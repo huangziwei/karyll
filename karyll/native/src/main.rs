@@ -6329,18 +6329,18 @@ nine words in this one under the third level
         }
     }
 
-    /// **A row's detail is drawn, not fitted**: it starts at the shared column
-    /// and runs as far as it runs, so a line too long for the panel is cut off
-    /// by the edge of the screen rather than wrapped or shortened. Help is
-    /// where the long ones are — a whole gesture described in a phrase — and it
-    /// is the page a writer reads when something is already not working.
+    /// Help is where the long lines are — a whole gesture described in a phrase
+    /// — and it is the page a writer reads when something is already not
+    /// working, so neither column may run into anything on any panel karyll
+    /// draws on. Both orientations of all three, because a portrait panel is a
+    /// third narrower than the landscape one beside it.
     #[test]
-    fn no_help_line_runs_off_a_narrow_panel() {
+    fn no_help_line_runs_into_another_on_any_panel() {
         use crate::font::Proportional;
         let items = help_items();
-        for panel in [1264u16, 1272, 1860] {
-            let measure = |s: &str| ui::label_width(&mut Proportional, s, ui::TEXT_PX);
-            let column = ui::chip_column(&items, panel, measure);
+        for panel in [1264u16, 1272, 1680, 1696, 1860, 2480] {
+            let mut measure = |s: &str| ui::label_width(&mut Proportional, s, ui::TEXT_PX);
+            let column = ui::chip_column(&items, panel, &mut measure);
             for item in &items {
                 let ui::Item::Row { label, detail, .. } = item else {
                     continue;
@@ -6348,7 +6348,13 @@ nine words in this one under the third level
                 let end = column + measure(detail);
                 assert!(
                     end <= panel - ui::MARGIN_X,
-                    "on a {panel} px panel, {label:?} runs to {end}"
+                    "on a {panel} px panel, the detail of {label:?} runs to {end}"
+                );
+                let room = ui::label_room(item, column, panel, &mut measure);
+                let drawn = ui::elided(label, room, &mut measure);
+                assert!(
+                    ui::ROW_INSET + measure(&drawn) < column,
+                    "on a {panel} px panel, {drawn:?} runs under its own detail"
                 );
             }
         }
