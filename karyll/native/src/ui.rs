@@ -151,6 +151,13 @@ pub enum Item {
         /// language row is a set with several on, the type rows are a single
         /// pick, and a control that navigates has none.
         on: Vec<bool>,
+        /// Options that say where the row stands rather than offering to change
+        /// it. Drawn in [`QUIET`] and not tappable — the word stays so the rows
+        /// read as one column, and the grey is what says it is not a control.
+        ///
+        /// Short is fine and empty is the common case: an option past the end
+        /// of this is live, the way one past the end of `on` is off.
+        inert: Vec<bool>,
     },
     /// A colour setting: the same row, with the values drawn *as* themselves.
     ///
@@ -426,10 +433,17 @@ pub fn hit(
             }
             Some(Hit::Row(index))
         }
-        Item::Choice { label, options, .. } => {
+        Item::Choice {
+            label,
+            options,
+            inert,
+            ..
+        } => {
             let column = chip_column(items, width, &mut measure_text);
             let bounds = chip_bounds(column, width, label, options, &mut measure_text);
-            cell_at(&bounds, x).map(|option| Hit::Option(index, option))
+            cell_at(&bounds, x)
+                .filter(|option| !inert.get(*option).copied().unwrap_or(false))
+                .map(|option| Hit::Option(index, option))
         }
         Item::Swatches { inks, .. } => {
             let column = chip_column(items, width, &mut measure_text);
@@ -498,12 +512,17 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                     // Never filled at rest. A chip that removes something must
                     // not look like the marked, current, on thing — filled is
                     // what this page says "yes, this one" with.
-                    draw_chip(window, fonts, rect, text, false, false);
+                    draw_chip(window, fonts, rect, text, false, false, false);
                 }
             }
             // No rule: the chips are visibly bounded already, and a line under
             // every setting buries the structure of the page.
-            Item::Choice { label, options, on } => {
+            Item::Choice {
+                label,
+                options,
+                on,
+                inert,
+            } => {
                 draw_line(
                     window, fonts, label, ROW_INSET, middle, TEXT_PX, false, BLACK,
                 );
@@ -519,6 +538,7 @@ pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items
                         &options[o],
                         on.get(o).copied().unwrap_or(false),
                         false,
+                        inert.get(o).copied().unwrap_or(false),
                     );
                 }
             }
@@ -593,12 +613,18 @@ fn draw_chip(
     label: &str,
     on: bool,
     pressed: bool,
+    inert: bool,
 ) {
     // A press inverts whatever the chip already was, so the feedback reads the
     // same on a chip that is on as on one that is off.
     let filled = on != pressed;
     let (ground, ink) = if filled {
         (BLACK, WHITE)
+    } else if inert {
+        // Border and word both recede. A chip that cannot be pressed drawn in
+        // the same black as one that can is the page offering an action it does
+        // not have.
+        (WHITE, QUIET)
     } else {
         (WHITE, BLACK)
     };
@@ -618,7 +644,7 @@ fn draw_chip(
                 ..rect
             },
         ] {
-            window.fill(edge, BLACK);
+            window.fill(edge, ink);
         }
     }
     let w = measure(fonts, label, TEXT_PX) as u16;
@@ -647,10 +673,15 @@ pub fn paint_chip(
             let rect = action_rect(layout, item, width, label, |s| {
                 measure(fonts, s, TEXT_PX) as u16
             });
-            draw_chip(window, fonts, rect, label, false, pressed);
+            draw_chip(window, fonts, rect, label, false, pressed, false);
             rect
         }
-        Some(Item::Choice { label, options, on }) => {
+        Some(Item::Choice {
+            label,
+            options,
+            on,
+            inert,
+        }) => {
             let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
             let bounds = chip_bounds(column, width, label, options, |s| {
                 measure(fonts, s, TEXT_PX) as u16
@@ -666,6 +697,7 @@ pub fn paint_chip(
                 label,
                 on.get(option).copied().unwrap_or(false),
                 pressed,
+                inert.get(option).copied().unwrap_or(false),
             );
             rect
         }
@@ -1083,7 +1115,7 @@ pub fn paint_row(
             let chip = action_rect(layout, index, width, text, |s| {
                 measure(fonts, s, TEXT_PX) as u16
             });
-            draw_chip(window, fonts, chip, text, false, false);
+            draw_chip(window, fonts, chip, text, false, false, false);
         }
     }
     rect
@@ -1717,6 +1749,7 @@ mod tests {
                 label: "Languages".into(),
                 options: strings(&["EN", "DE", "简体"]),
                 on: vec![true, true, false],
+                inert: Vec::new(),
             },
             Item::Row {
                 label: "draft.md".into(),
@@ -1729,6 +1762,7 @@ mod tests {
                 label: "Latin".into(),
                 options: strings(&["Ember", "Bookerly"]),
                 on: vec![true, false],
+                inert: Vec::new(),
             },
         ]
     }
@@ -1771,6 +1805,7 @@ mod tests {
             label: "A Very Long Bluetooth Keyboard Name Indeed, 2024 Edition".into(),
             options: strings(&["Connect", "Forget"]),
             on: vec![false, false],
+            inert: Vec::new(),
         }];
         let column = chip_column(&items, WIDTH, stub);
         assert!(column <= WIDTH / 3, "the column ran away with the label");
@@ -1910,6 +1945,70 @@ mod tests {
             hit(&items, l, WIDTH, ROW_INSET, on_row(2), stub),
             Some(Hit::Row(2)),
             "a plain row is tappable across its width"
+        );
+    }
+
+    /// An inert chip is a word in grey, and the tap has to stop at [`hit`].
+    /// Nothing downstream can tell it apart: the action list a Config row
+    /// carries is index-parallel to the options, so an inert option that
+    /// reported a hit would fire whatever sits at its index.
+    #[test]
+    fn a_chip_marked_inert_is_a_state_and_not_a_target() {
+        let l = layout();
+        let items = vec![Item::Choice {
+            label: "Keyboard".into(),
+            options: strings(&["Connect", "Forget"]),
+            on: vec![false, false],
+            inert: vec![true, false],
+        }];
+        let middle = l.rows_top + 10;
+        let bounds = chip_bounds(
+            chip_column(&items, WIDTH, stub),
+            WIDTH,
+            "Keyboard",
+            &["Connect".to_string(), "Forget".to_string()],
+            stub,
+        );
+        let centre = |o: usize| bounds[o].0 + bounds[o].1 / 2;
+        assert_eq!(
+            hit(&items, l, WIDTH, centre(0), middle, stub),
+            None,
+            "the inert chip swallows the tap"
+        );
+        assert_eq!(
+            hit(&items, l, WIDTH, centre(1), middle, stub),
+            Some(Hit::Option(0, 1)),
+            "its live neighbour still answers, at its own index"
+        );
+    }
+
+    /// Short is fine and empty is the common case, the way it is for `on`.
+    #[test]
+    fn an_option_past_the_end_of_inert_is_live() {
+        let l = layout();
+        let items = vec![Item::Choice {
+            label: "Size".into(),
+            options: strings(&["38", "44"]),
+            on: vec![true, false],
+            inert: Vec::new(),
+        }];
+        let bounds = chip_bounds(
+            chip_column(&items, WIDTH, stub),
+            WIDTH,
+            "Size",
+            &["38".to_string(), "44".to_string()],
+            stub,
+        );
+        assert_eq!(
+            hit(
+                &items,
+                l,
+                WIDTH,
+                bounds[1].0 + bounds[1].1 / 2,
+                l.rows_top + 10,
+                stub
+            ),
+            Some(Hit::Option(0, 1))
         );
     }
 
@@ -2094,6 +2193,7 @@ mod tests {
             label: "A Long Bluetooth Keyboard Name".into(),
             options: sizes.clone(),
             on: vec![],
+            inert: Vec::new(),
         }];
         for panel in [WIDE, NARROW] {
             let measure = |s: &str| label_width(&mut Proportional, s, TEXT_PX);

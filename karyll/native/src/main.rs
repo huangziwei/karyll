@@ -233,6 +233,7 @@ fn main() -> Result<()> {
         scroll: 0,
         keyboard_present: false,
         paired: Vec::new(),
+        connected: None,
         last_edit: None,
         dirty_since: None,
         engines: Vec::new(),
@@ -688,6 +689,10 @@ struct Editor {
     /// after anything changes them. Kept here rather than fetched per tap,
     /// because working out what a finger is on must not make an HTTP request.
     paired: Vec<hid::Device>,
+    /// Which of `paired` holds the link, from [`hid::Hid::connected`] and
+    /// refreshed with it. `keyboard_present` says a keyboard is attached; this
+    /// says which row it is.
+    connected: Option<String>,
     /// When the document was last changed, and when it first went unsaved.
     /// Both drive autosave; see [`Editor::poll_autosave`].
     last_edit: Option<std::time::Instant>,
@@ -1004,6 +1009,10 @@ impl Editor {
                         report_keyboard(&found, " (appeared)");
                         keyboard = Some(found);
                         self.keyboard_present = true;
+                        // Which of the remembered keyboards this node belongs
+                        // to. The node is all evdev knows; the daemon names it,
+                        // and the Keyboard section marks that row and no other.
+                        self.connected = self.bluetooth.connected();
                         // Config stays open rather than being dismissed:
                         // pairing succeeded, and its Keyboard section is where
                         // that shows.
@@ -2569,7 +2578,6 @@ impl Editor {
             // scan goes on repainting for the ten seconds it runs.
             Some(ConfigRow::Keyboard(actions)) => {
                 return match actions.get(option) {
-                    Some(KeyAction::Connect(device)) => self.reconnect(&device.clone()),
                     Some(KeyAction::Disconnect(device)) => self.disconnect(&device.clone()),
                     Some(KeyAction::Forget(device)) => self.forget(&device.clone()),
                     Some(KeyAction::Pair(device)) => self.pair_with(&device.clone()),
@@ -2726,6 +2734,7 @@ impl Editor {
                 label: "Languages".into(),
                 options: languages.iter().map(|l| l.label().to_string()).collect(),
                 on: languages.iter().map(|l| self.enabled.contains(l)).collect(),
+                inert: Vec::new(),
             },
             ConfigRow::Languages(languages),
         ));
@@ -2758,6 +2767,7 @@ impl Editor {
                                     .map(|at| font::families(group)[*at].name.to_string())
                                     .collect(),
                                 on: part.iter().map(|at| *at == chosen).collect(),
+                                inert: Vec::new(),
                             },
                             ConfigRow::Font(group, part),
                         )
@@ -2776,6 +2786,7 @@ impl Editor {
                     .iter()
                     .map(|px| *px == self.theme.body_px)
                     .collect(),
+                inert: Vec::new(),
             },
             ConfigRow::Size,
         ));
@@ -2793,6 +2804,7 @@ impl Editor {
                     .iter()
                     .map(|chars| *chars == self.theme.chars)
                     .collect(),
+                inert: Vec::new(),
             },
             ConfigRow::LineLength,
         ));
@@ -2809,6 +2821,7 @@ impl Editor {
                     label: "Caret and highlights".into(),
                     options: vec!["Grey".into(), "Colour".into()],
                     on: vec![!on, on],
+                    inert: Vec::new(),
                 },
                 ConfigRow::Colour,
             ));
@@ -2842,6 +2855,7 @@ impl Editor {
                     label: "Hold it".into(),
                     options: SCREENS.iter().map(|(name, _)| (*name).into()).collect(),
                     on: SCREENS.iter().map(|(_, way)| *way == now).collect(),
+                    inert: Vec::new(),
                 },
                 ConfigRow::Screen,
             ));
@@ -2864,15 +2878,18 @@ impl Editor {
             .paired
             .iter()
             .map(|device| {
-                // **A real toggle, because the chip was never inert.** It read
-                // `Connected` and was documented as doing nothing, but the
-                // action list beside it said `Connect` in both states — so
-                // tapping a keyboard that was already connected asked the
-                // daemon to connect it *again*, which tears the link down and
-                // builds it back up. That is the worst of the three readings:
-                // it looks like a status, it says it does nothing, and it
-                // disconnects you. The daemon has had `/disconnect` all along.
-                let connected = self.keyboard_present;
+                // **The first chip answers for this keyboard, not for the
+                // radio.** With several remembered only one of them holds the
+                // link, so a row reading the attached-or-not flag calls every
+                // one of them the keyboard being typed on.
+                //
+                // **`Connect` is grey and does nothing**, because there is no
+                // request behind it: the daemon is already waiting on every
+                // remembered keyboard at once and takes the first that answers,
+                // so the way to reach this one is to wake it — and, if another
+                // holds the link, to Disconnect that one. Keeping the word in
+                // grey holds the column steady while saying it is a state.
+                let connected = self.is_connected(device);
                 (
                     ui::Item::Choice {
                         label: device.name.clone(),
@@ -2881,13 +2898,10 @@ impl Editor {
                             "Forget".into(),
                         ],
                         on: vec![connected, false],
+                        inert: vec![!connected, false],
                     },
                     ConfigRow::Keyboard(vec![
-                        if connected {
-                            KeyAction::Disconnect(device.clone())
-                        } else {
-                            KeyAction::Connect(device.clone())
-                        },
+                        KeyAction::Disconnect(device.clone()),
                         KeyAction::Forget(device.clone()),
                     ]),
                 )
@@ -2897,13 +2911,19 @@ impl Editor {
         items.extend(
             self.found
                 .iter()
-                .filter(|d| !self.paired.iter().any(|p| p.address == d.address))
+                .filter(|d| {
+                    !self
+                        .paired
+                        .iter()
+                        .any(|p| hid::same_address(&p.address, &d.address))
+                })
                 .map(|device| {
                     (
                         ui::Item::Choice {
                             label: format!("{}  ({})", device.name, device.protocol),
                             options: vec!["Pair".into()],
                             on: vec![false],
+                            inert: Vec::new(),
                         },
                         ConfigRow::Keyboard(vec![KeyAction::Pair(device.clone())]),
                     )
@@ -2933,6 +2953,7 @@ impl Editor {
                     (_, None) => "Scan for keyboards".to_string(),
                 }],
                 on: vec![self.scanning.is_some()],
+                inert: Vec::new(),
             },
             ConfigRow::Keyboard(vec![KeyAction::Scan]),
         ));
@@ -2947,6 +2968,7 @@ impl Editor {
                 label: "When karyll closes".into(),
                 options: vec!["Turn Bluetooth off".into(), "Keep it on".into()],
                 on: vec![!keep, keep],
+                inert: Vec::new(),
             },
             ConfigRow::KeepBluetooth,
         ));
@@ -3651,18 +3673,23 @@ impl Editor {
         self.paint()
     }
 
-    /// Re-read what the daemon has paired.
+    /// Re-read what the daemon has paired, and which one it is on.
     fn refresh_paired(&mut self) {
         self.paired = self.bluetooth.devices().unwrap_or_default();
+        self.connected = self.bluetooth.connected();
     }
 
-    /// Ask the daemon to reconnect a keyboard it already knows.
-    fn reconnect(&mut self, device: &hid::Device) -> Result<()> {
-        self.show_status(&format!("Connecting to {}…", device.name))?;
-        match self.bluetooth.connect(device) {
-            Ok(()) => self.show_status(&format!("Asked {} to connect.", device.name)),
-            Err(err) => self.show_status(&format!("Could not connect: {err:#}")),
-        }
+    /// Whether `device` is the keyboard being typed on.
+    ///
+    /// Both halves are needed. The daemon names the keyboard it has a link to,
+    /// and the evdev node is what a keystroke actually arrives on — a link
+    /// whose node has gone is not something to offer Disconnect for.
+    fn is_connected(&self, device: &hid::Device) -> bool {
+        self.keyboard_present
+            && self
+                .connected
+                .as_deref()
+                .is_some_and(|address| hid::same_address(address, &device.address))
     }
 
     /// Ask the daemon to drop the link, keeping the pairing.
@@ -3672,8 +3699,19 @@ impl Editor {
     /// link would leave the app holding a dead descriptor for good.
     fn disconnect(&mut self, device: &hid::Device) -> Result<()> {
         self.show_status(&format!("Disconnecting {}…", device.name))?;
+        let others = self.paired.len() > 1;
         match self.bluetooth.disconnect(device) {
-            Ok(()) => self.show_status(&format!("Asked {} to disconnect.", device.name)),
+            // What happens next is the whole of how a writer changes keyboard,
+            // and nothing on the page says it: the daemon comes back in a few
+            // seconds and takes whichever is awake.
+            Ok(()) if others => self.show_status(&format!(
+                "Dropped {}. Switch on the keyboard you want — it reconnects in a few seconds.",
+                device.name
+            )),
+            Ok(()) => self.show_status(&format!(
+                "Dropped {}. It reconnects in a few seconds.",
+                device.name
+            )),
             Err(err) => self.show_status(&format!("Could not disconnect: {err:#}")),
         }
     }
@@ -3770,7 +3808,9 @@ impl Editor {
             match self.bluetooth.pair_done(&device.address) {
                 Ok(None) => continue,
                 Ok(Some(true)) => {
-                    let _ = self.bluetooth.connect(device);
+                    // The daemon takes a fresh pairing into run mode itself,
+                    // and says it is done before the link is up.
+                    // [`hid::Hid::connect`] on top of that drops it.
                     self.refresh_paired();
                     self.show_status("Paired. Start typing.")?;
                     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -4737,11 +4777,9 @@ fn pair() -> Result<()> {
         match bluetooth.pair_done(&device.address)? {
             None => continue,
             Some(true) => {
-                // Connect straight away so the keyboard is usable now rather
-                // than after the next reconnect cycle.
-                if let Err(err) = bluetooth.connect(device) {
-                    eprintln!("Paired, but connecting now failed ({err:#}).");
-                }
+                // The daemon takes a fresh pairing into run mode itself, and
+                // says it is done before the link is up. Nothing else is asked
+                // of it here.
                 eprintln!("Paired. Tap the karyll tile; it brings the keyboard up itself.");
                 return Ok(());
             }
@@ -5951,8 +5989,6 @@ impl Bar {
 /// up forgetting a keyboard it meant to connect.
 #[derive(Debug, Clone)]
 enum KeyAction {
-    /// Reconnect a keyboard the daemon already knows.
-    Connect(hid::Device),
     /// Drop the link, keeping the pairing.
     Disconnect(hid::Device),
     /// Remove it, and its saved link key, so it can be paired afresh.

@@ -74,6 +74,20 @@ pub struct Device {
     pub protocol: String,
 }
 
+/// Whether two addresses name one keyboard.
+///
+/// **The two endpoints spell one address differently.** `/devices` stores it
+/// bare; `/scan-status` appends the address type. Compared as strings, a paired
+/// keyboard looks like a stranger.
+pub fn same_address(a: &str, b: &str) -> bool {
+    bare(a).eq_ignore_ascii_case(bare(b))
+}
+
+/// The address without the address type appended to it.
+fn bare(address: &str) -> &str {
+    address.split('/').next().unwrap_or(address)
+}
+
 /// What the Bluetooth stack can do right now.
 ///
 /// **Starting is not failing**, and the difference is the whole of what a
@@ -391,9 +405,23 @@ impl Hid {
         }
     }
 
-    /// Devices the daemon has paired.
+    /// Every keyboard the daemon has paired, connected or not.
+    ///
+    /// The daemon's config read back, so the list holds across restarts and is
+    /// as long as the writer has paired keyboards.
     pub fn devices(&self) -> Result<Vec<Device>> {
         parse_devices(&self.get("/devices")?)
+    }
+
+    /// Which of them has a link right now, if any.
+    ///
+    /// **One at a time**, whichever answers first: the daemon waits on all of
+    /// them at once and keeps the first connection, behind a single uhid node.
+    /// [`Hid::devices`] cannot tell them apart.
+    pub fn connected(&self) -> Option<String> {
+        let body = self.get("/status").ok()?;
+        let address = field(&body, "connected_device")?;
+        (!address.is_empty() && address != "null").then_some(address)
     }
 
     /// Begin a scan. Results arrive through [`Hid::scan_results`].
@@ -454,7 +482,7 @@ impl Hid {
             .devices()
             .unwrap_or_default()
             .iter()
-            .any(|d| d.address.eq_ignore_ascii_case(address));
+            .any(|d| same_address(&d.address, address));
         Ok(Some(paired))
     }
 
@@ -495,21 +523,13 @@ impl Hid {
         Some(String::from_utf8_lossy(&raw).into_owned())
     }
 
-    pub fn connect(&self, device: &Device) -> Result<()> {
-        self.get(&format!(
-            "/connect?addr={}&protocol={}",
-            escape(&device.address),
-            escape(&device.protocol)
-        ))
-        .map(|_| ())
-    }
-
-    /// Drop the link without forgetting the device.
+    /// Drop the link, leaving the pairing and the link key.
     ///
-    /// The daemon has had this endpoint all along and karyll never called it,
-    /// which is why the Config page had no way to disconnect — and why tapping
-    /// a keyboard that was already connected asked it to connect *again*, which
-    /// tears the link down and builds it back up.
+    /// **The way to reach one of several paired keyboards.** The daemon waits
+    /// on all of them at once and keeps the first that answers, so it is the
+    /// dropping of the current link — not any request naming another keyboard —
+    /// that lets a different one take it. It reconnects on its own afterwards,
+    /// five seconds later, to whichever is awake.
     pub fn disconnect(&self, device: &Device) -> Result<()> {
         self.get(&format!(
             "/disconnect?addr={}&protocol={}",
@@ -823,6 +843,34 @@ mod tests {
         let body = r#"{"devices": [{"address": "AA:BB:CC:DD:EE:FF", "protocol": "ble"}]}"#;
         let devices = parse_devices(body).unwrap();
         assert_eq!(devices[0].name, "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn a_scan_result_and_a_paired_device_are_one_keyboard() {
+        // The suffix is the address type, and only one of the two endpoints
+        // prints it. Left in, a paired keyboard is offered Pair a second time.
+        assert!(same_address("AA:BB:CC:DD:EE:FF/P", "AA:BB:CC:DD:EE:FF"));
+        assert!(same_address("aa:bb:cc:dd:ee:ff", "AA:BB:CC:DD:EE:FF/P"));
+        assert!(!same_address("AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66"));
+    }
+
+    /// What [`Hid::connected`] reads out of a `/status` reply.
+    fn connected_in(body: &str) -> Option<String> {
+        let address = field(body, "connected_device")?;
+        (!address.is_empty() && address != "null").then_some(address)
+    }
+
+    #[test]
+    fn a_daemon_with_no_link_names_no_keyboard() {
+        // Every remembered keyboard is in `devices`; none of them is the one
+        // being typed on until this field names it.
+        let idle = r#"{"ok": true, "connected": false, "connected_device": null,
+            "devices": [{"address": "AA:BB:CC:DD:EE:FF", "protocol": "ble"}]}"#;
+        assert_eq!(connected_in(idle), None);
+
+        let live = r#"{"ok": true, "connected": true,
+            "connected_device": "11:22:33:44:55:66", "connected_protocol": "classic"}"#;
+        assert_eq!(connected_in(live).as_deref(), Some("11:22:33:44:55:66"));
     }
 
     #[test]
