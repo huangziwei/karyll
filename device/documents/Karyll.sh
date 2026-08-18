@@ -17,4 +17,4 @@ restore_view_on_exit() {
 }
 trap restore_view_on_exit EXIT
 
-nohup sh -c 'sleep 1; exec /mnt/us/extensions/karyll/bin/karyll.sh' >/dev/null 2>&1 &
+exec /mnt/us/extensions/karyll/bin/karyll.sh
