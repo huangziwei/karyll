@@ -172,6 +172,43 @@ pub enum Item {
     },
 }
 
+/// Which line of a panel the keyboard is on, and which of that line's chips.
+///
+/// **Page-relative, like everything else that draws**: the row indexes the
+/// items handed to the paint rather than the whole list, so a focus mark cannot
+/// land a page away from the row it belongs to.
+///
+/// `chip` means nothing on a row that has none, and is left at zero there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Focus {
+    pub row: usize,
+    pub chip: usize,
+}
+
+/// The chips of `item` a press can actually take, in the order they are drawn.
+///
+/// A row's own action chip is not among them: it is reached by the key that
+/// names what it does rather than by arrowing onto it, which keeps a
+/// destructive control off the path between one setting and the next.
+pub fn takeable(item: &Item) -> Vec<usize> {
+    match item {
+        Item::Choice { options, inert, .. } => (0..options.len())
+            .filter(|o| !inert.get(*o).copied().unwrap_or(false))
+            .collect(),
+        Item::Swatches { inks, .. } => (0..inks.len()).collect(),
+        Item::Heading(_) | Item::Row { .. } => Vec::new(),
+    }
+}
+
+/// The chip `item` is currently on, when it is on one.
+pub fn current(item: &Item) -> Option<usize> {
+    let on = match item {
+        Item::Choice { on, .. } | Item::Swatches { on, .. } => on,
+        Item::Heading(_) | Item::Row { .. } => return None,
+    };
+    on.iter().position(|set| *set)
+}
+
 /// A full-screen panel: a title, a status line, a list, and a bottom strip.
 pub struct Panel<'a> {
     pub title: &'a str,
@@ -187,6 +224,8 @@ pub struct Panel<'a> {
     /// same box the page has. Empty whenever nothing is being composed, which
     /// is every panel but Naming and most of the time on that one.
     pub overlay: Overlay<'a>,
+    /// Which line the keyboard is on, when a keyboard is being used on it.
+    pub focus: Option<Focus>,
 }
 
 impl Panel<'_> {
@@ -216,7 +255,7 @@ impl Panel<'_> {
                 BLACK,
             );
         }
-        paint_items(window, fonts, layout, self.items);
+        paint_items(window, fonts, layout, self.items, self.focus);
         paint_strip(window, fonts, layout, self.strip);
         // Last, over everything, and hung off the status line — which on the
         // Naming panel *is* the field, the same way the caret is the field on
@@ -244,6 +283,18 @@ impl Panel<'_> {
 
 /// Where a row's own text starts, inside the margin.
 pub const ROW_INSET: u16 = MARGIN_X + 24;
+
+/// How wide the bar marking the line the keyboard is on.
+const FOCUS_BAR: u16 = 8;
+
+/// The gap between a chip and the ring marking it, and how thick that ring is.
+///
+/// Outside the chip rather than inside it, because a chip has two states of its
+/// own already — filled when it is what the setting is on, outlined when it is
+/// merely available — and a mark drawn *in* one of them would have to compete
+/// with both. The row's own bar says which line; this says which chip on it.
+const RING_GAP: u16 = 5;
+const RING: u16 = 3;
 
 /// Blank space either side of a chip's text.
 const CHIP_PAD: u16 = 24;
@@ -607,119 +658,223 @@ pub fn hit(
 }
 
 /// Draw the list. Separated so a selection change can repaint just these.
-pub fn paint_items(window: &mut Window, fonts: &mut Fonts, layout: Layout, items: &[Item]) {
+pub fn paint_items(
+    window: &mut Window,
+    fonts: &mut Fonts,
+    layout: Layout,
+    items: &[Item],
+    focus: Option<Focus>,
+) {
     let width = window.width();
     window.fill(layout.rows_rect(width), WHITE);
     let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
     // `capacity` rather than a break inside the loop, because that is the
     // number the caller pages by. Two ways of saying where the list stops is
     // two ways for them to disagree, and this one would hide a document.
-    for (i, item) in items.iter().take(layout.capacity()).enumerate() {
-        let top = layout.rows_top + i as u16 * layout.row_h;
-        let middle = top as i32 + (layout.row_h as i32 - TEXT_PX as i32) / 2;
-        match item {
-            // The text sits at the foot of its row and the rule directly under
-            // it, so the empty half above reads as the gap between sections.
-            // Rows are a uniform height — `row_at` divides by one number — so
-            // the air has to come from inside the row rather than from a taller
-            // one.
-            Item::Heading(text) => {
-                let baseline = top + layout.row_h.saturating_sub(TEXT_PX as u16 + 20);
-                draw_line(
+    for i in 0..items.len().min(layout.capacity()) {
+        let chip = focus.filter(|f| f.row == i).map(|f| f.chip);
+        draw_item(window, fonts, layout, items, i, column, chip);
+    }
+}
+
+/// Redraw one line of the list, with whatever focus mark it now carries.
+///
+/// **The rest of the page is left alone.** Moving the keyboard down a list
+/// touches the line it left and the line it arrived on; a panel-wide repaint
+/// for a mark that moves on every press is half a second of ink to change two
+/// rows of it. Full width, so a ring drawn outside the last chip is inside what
+/// this erases.
+pub fn paint_focus_row(
+    window: &mut Window,
+    fonts: &mut Fonts,
+    layout: Layout,
+    items: &[Item],
+    index: usize,
+    chip: Option<usize>,
+) -> Rect {
+    let width = window.width();
+    let rect = Rect {
+        x: 0,
+        width,
+        ..row_rect(layout, width, index)
+    };
+    window.fill(rect, WHITE);
+    let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
+    draw_item(window, fonts, layout, items, index, column, chip);
+    rect
+}
+
+/// One line of the list, and the chip the keyboard is on if it is on this line.
+fn draw_item(
+    window: &mut Window,
+    fonts: &mut Fonts,
+    layout: Layout,
+    items: &[Item],
+    i: usize,
+    column: u16,
+    focus: Option<usize>,
+) {
+    let width = window.width();
+    let Some(item) = items.get(i) else {
+        return;
+    };
+    let top = layout.rows_top + i as u16 * layout.row_h;
+    let middle = top as i32 + (layout.row_h as i32 - TEXT_PX as i32) / 2;
+    if focus.is_some() {
+        // In the air [`ROW_INSET`] leaves, so the mark sits beside the label
+        // rather than pushing it along: a line that shifts when it takes focus
+        // is a list that shuffles as you walk down it.
+        let height = layout.row_h / 2;
+        window.fill(
+            Rect {
+                x: MARGIN_X,
+                y: top + (layout.row_h - height) / 2,
+                width: FOCUS_BAR,
+                height,
+            },
+            BLACK,
+        );
+    }
+    match item {
+        // The text sits at the foot of its row and the rule directly under
+        // it, so the empty half above reads as the gap between sections.
+        // Rows are a uniform height — `row_at` divides by one number — so
+        // the air has to come from inside the row rather than from a taller
+        // one.
+        Item::Heading(text) => {
+            let baseline = top + layout.row_h.saturating_sub(TEXT_PX as u16 + 20);
+            draw_line(
+                window,
+                fonts,
+                text,
+                MARGIN_X,
+                baseline as i32,
+                TEXT_PX,
+                true,
+                BLACK,
+            );
+            window.fill(
+                Rect {
+                    x: MARGIN_X,
+                    y: top + layout.row_h - 3,
+                    width: width - MARGIN_X * 2,
+                    height: 3,
+                },
+                BLACK,
+            );
+        }
+        // No rule of its own: a rule above every entry is a stack of
+        // identical bars saying nothing. What separates one line from the
+        // next is the detail beside it, which is the part worth reading.
+        Item::Row {
+            label,
+            detail,
+            on,
+            action,
+        } => {
+            let room = label_room(item, column, width, &mut |s| {
+                measure(fonts, s, TEXT_PX) as u16
+            });
+            let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
+            draw_line(
+                window, fonts, &label, ROW_INSET, middle, TEXT_PX, *on, BLACK,
+            );
+            if !detail.is_empty() {
+                draw_line(window, fonts, detail, column, middle, TEXT_PX, false, BLACK);
+            }
+            if let Some(text) = action {
+                let rect = action_rect(layout, i, width, text, |s| {
+                    measure(fonts, s, TEXT_PX) as u16
+                });
+                // Never filled at rest. A chip that removes something must
+                // not look like the marked, current, on thing — filled is
+                // what this page says "yes, this one" with.
+                draw_chip(window, fonts, rect, text, ChipState::default());
+            }
+        }
+        // No rule: the chips are visibly bounded already, and a line under
+        // every setting buries the structure of the page.
+        Item::Choice {
+            label,
+            options,
+            on,
+            inert,
+        } => {
+            let bounds = chip_bounds(column, width, label, options, |s| {
+                measure(fonts, s, TEXT_PX) as u16
+            });
+            let room = label_room(item, column, width, &mut |s| {
+                measure(fonts, s, TEXT_PX) as u16
+            });
+            let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
+            draw_line(
+                window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
+            );
+            for (o, _) in bounds.iter().enumerate() {
+                let rect = chip_rect(layout, i, &bounds, o);
+                draw_chip(
                     window,
                     fonts,
-                    text,
-                    MARGIN_X,
-                    baseline as i32,
-                    TEXT_PX,
-                    true,
-                    BLACK,
-                );
-                window.fill(
-                    Rect {
-                        x: MARGIN_X,
-                        y: top + layout.row_h - 3,
-                        width: width - MARGIN_X * 2,
-                        height: 3,
+                    rect,
+                    &options[o],
+                    ChipState {
+                        on: on.get(o).copied().unwrap_or(false),
+                        inert: inert.get(o).copied().unwrap_or(false),
+                        focused: focus == Some(o),
+                        ..ChipState::default()
                     },
-                    BLACK,
                 );
             }
-            // No rule of its own: a rule above every entry is a stack of
-            // identical bars saying nothing. What separates one line from the
-            // next is the detail beside it, which is the part worth reading.
-            Item::Row {
-                label,
-                detail,
-                on,
-                action,
-            } => {
-                let room = label_room(item, column, width, &mut |s| {
-                    measure(fonts, s, TEXT_PX) as u16
-                });
-                let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
-                draw_line(
-                    window, fonts, &label, ROW_INSET, middle, TEXT_PX, *on, BLACK,
-                );
-                if !detail.is_empty() {
-                    draw_line(window, fonts, detail, column, middle, TEXT_PX, false, BLACK);
-                }
-                if let Some(text) = action {
-                    let rect = action_rect(layout, i, width, text, |s| {
-                        measure(fonts, s, TEXT_PX) as u16
-                    });
-                    // Never filled at rest. A chip that removes something must
-                    // not look like the marked, current, on thing — filled is
-                    // what this page says "yes, this one" with.
-                    draw_chip(window, fonts, rect, text, false, false, false);
-                }
-            }
-            // No rule: the chips are visibly bounded already, and a line under
-            // every setting buries the structure of the page.
-            Item::Choice {
-                label,
-                options,
-                on,
-                inert,
-            } => {
-                let bounds = chip_bounds(column, width, label, options, |s| {
-                    measure(fonts, s, TEXT_PX) as u16
-                });
-                let room = label_room(item, column, width, &mut |s| {
-                    measure(fonts, s, TEXT_PX) as u16
-                });
-                let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
-                draw_line(
-                    window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
-                );
-                for (o, _) in bounds.iter().enumerate() {
-                    let rect = chip_rect(layout, i, &bounds, o);
-                    draw_chip(
-                        window,
-                        fonts,
-                        rect,
-                        &options[o],
-                        on.get(o).copied().unwrap_or(false),
-                        false,
-                        inert.get(o).copied().unwrap_or(false),
-                    );
-                }
-            }
-            Item::Swatches { label, inks, on } => {
-                let room = label_room(item, column, width, &mut |s| {
-                    measure(fonts, s, TEXT_PX) as u16
-                });
-                let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
-                draw_line(
-                    window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
-                );
-                let bounds = swatch_bounds(column, width, inks.len());
-                for (o, _) in bounds.iter().enumerate() {
-                    let rect = chip_rect(layout, i, &bounds, o);
-                    draw_swatch(window, rect, inks[o], on.get(o).copied().unwrap_or(false));
+        }
+        Item::Swatches { label, inks, on } => {
+            let room = label_room(item, column, width, &mut |s| {
+                measure(fonts, s, TEXT_PX) as u16
+            });
+            let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
+            draw_line(
+                window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
+            );
+            let bounds = swatch_bounds(column, width, inks.len());
+            for (o, _) in bounds.iter().enumerate() {
+                let rect = chip_rect(layout, i, &bounds, o);
+                draw_swatch(window, rect, inks[o], on.get(o).copied().unwrap_or(false));
+                if focus == Some(o) {
+                    draw_ring(window, rect);
                 }
             }
         }
+    }
+}
+
+/// The ring around the chip the keyboard is on.
+fn draw_ring(window: &mut Window, rect: Rect) {
+    let outer = Rect {
+        x: rect.x.saturating_sub(RING_GAP + RING),
+        y: rect.y.saturating_sub(RING_GAP + RING),
+        width: rect.width + 2 * (RING_GAP + RING),
+        height: rect.height + 2 * (RING_GAP + RING),
+    };
+    for edge in [
+        Rect {
+            height: RING,
+            ..outer
+        },
+        Rect {
+            y: outer.y + outer.height - RING,
+            height: RING,
+            ..outer
+        },
+        Rect {
+            width: RING,
+            ..outer
+        },
+        Rect {
+            x: outer.x + outer.width - RING,
+            width: RING,
+            ..outer
+        },
+    ] {
+        window.fill(edge, BLACK);
     }
 }
 
@@ -767,27 +922,37 @@ fn disc(window: &mut Window, cx: u16, cy: u16, radius: u16, value: u8) {
     }
 }
 
+/// What a chip is, and what is happening to it. Every one of these is off by
+/// default: a chip that says nothing about itself is one the setting is not on,
+/// nothing is touching, and the keyboard is elsewhere.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChipState {
+    /// What the setting is currently on.
+    on: bool,
+    /// Held under a finger.
+    pressed: bool,
+    /// Saying where the row stands rather than offering to change it.
+    inert: bool,
+    /// Where the keyboard is.
+    focused: bool,
+}
+
 /// One chip: filled when it is what the setting is currently on, outlined when
 /// it is merely available.
 ///
 /// **Filled, not ticked.** The renderer cuts coverage to one bit, so a tick or
 /// a grey wash is a smudge at this size; an inverted block is unambiguous
 /// across the room, and it is the idiom the strip already uses for a press.
-fn draw_chip(
-    window: &mut Window,
-    fonts: &mut Fonts,
-    rect: Rect,
-    label: &str,
-    on: bool,
-    pressed: bool,
-    inert: bool,
-) {
+fn draw_chip(window: &mut Window, fonts: &mut Fonts, rect: Rect, label: &str, state: ChipState) {
+    if state.focused {
+        draw_ring(window, rect);
+    }
     // A press inverts whatever the chip already was, so the feedback reads the
     // same on a chip that is on as on one that is off.
-    let filled = on != pressed;
+    let filled = state.on != state.pressed;
     let (ground, ink) = if filled {
         (BLACK, WHITE)
-    } else if inert {
+    } else if state.inert {
         // Border and word both recede. A chip that cannot be pressed drawn in
         // the same black as one that can is the page offering an action it does
         // not have.
@@ -840,7 +1005,16 @@ pub fn paint_chip(
             let rect = action_rect(layout, item, width, label, |s| {
                 measure(fonts, s, TEXT_PX) as u16
             });
-            draw_chip(window, fonts, rect, label, false, pressed, false);
+            draw_chip(
+                window,
+                fonts,
+                rect,
+                label,
+                ChipState {
+                    pressed,
+                    ..ChipState::default()
+                },
+            );
             rect
         }
         Some(Item::Choice {
@@ -862,9 +1036,12 @@ pub fn paint_chip(
                 fonts,
                 rect,
                 label,
-                on.get(option).copied().unwrap_or(false),
-                pressed,
-                inert.get(option).copied().unwrap_or(false),
+                ChipState {
+                    on: on.get(option).copied().unwrap_or(false),
+                    pressed,
+                    inert: inert.get(option).copied().unwrap_or(false),
+                    ..ChipState::default()
+                },
             );
             rect
         }
@@ -1290,7 +1467,7 @@ pub fn paint_row(
             let chip = action_rect(layout, index, width, text, |s| {
                 measure(fonts, s, TEXT_PX) as u16
             });
-            draw_chip(window, fonts, chip, text, false, false, false);
+            draw_chip(window, fonts, chip, text, ChipState::default());
         }
     }
     rect
@@ -1672,6 +1849,46 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A settings row with `n` values, the first of them the one it is on.
+    fn choice(n: usize) -> Item {
+        Item::Choice {
+            label: "Size".into(),
+            options: (0..n).map(|o| o.to_string()).collect(),
+            on: (0..n).map(|o| o == 0).collect(),
+            inert: Vec::new(),
+        }
+    }
+
+    /// A row that opens something, as every line of the Files list does.
+    fn opener() -> Item {
+        Item::Row {
+            label: "draft.md".into(),
+            detail: "300 words".into(),
+            on: false,
+            action: Some("Delete".into()),
+        }
+    }
+
+    /// The chips the arrows walk are the ones a finger could press, and a row's
+    /// own action chip is not among them: Delete is reached by the key that
+    /// says so, not by arrowing past it on the way to the next document.
+    #[test]
+    fn the_keyboard_walks_the_chips_a_press_could_take() {
+        assert_eq!(takeable(&choice(3)), vec![0, 1, 2]);
+        assert!(takeable(&opener()).is_empty());
+        assert_eq!(
+            takeable(&Item::Choice {
+                label: "Keyboard".into(),
+                options: strings(&["Connected", "Forget"]),
+                on: vec![false, false],
+                inert: vec![true, false],
+            }),
+            vec![1]
+        );
+        assert_eq!(current(&choice(3)), Some(0));
+        assert_eq!(current(&opener()), None);
     }
 
     /// Buttons take the width their own text needs, packed from the left. Even

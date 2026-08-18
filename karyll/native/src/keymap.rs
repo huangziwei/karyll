@@ -185,6 +185,8 @@ pub enum Action {
     /// Set the page a size larger or smaller. `Ctrl`/`⌘` + `+` and `-`, which
     /// is zoom in every application either writer of this has used.
     Resize(bool),
+    /// Take the next margin along. `Ctrl`/`⌘` + `M`, for the setting it moves.
+    CycleMargins,
     /// The document list. `Ctrl`/`⌘` + `O`, which is Open everywhere.
     Files,
     /// Start one. `Ctrl`/`⌘` + `N`, likewise — and it skips the list, which is
@@ -475,6 +477,11 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
             // nobody looks at the legend before pressing it.
             Some('-') => Some(Action::Resize(false)),
             Some('=' | '+') => Some(Action::Resize(true)),
+            // The page's other half. Zoom's own keys are a two-ended step and
+            // there are three margins, so this cycles instead — the letter the
+            // setting is named for, unshifted and in the same place on both
+            // layouts.
+            Some('m') => Some(Action::CycleMargins),
             // Open a document, and — shifted — a place inside the open one.
             Some('o') if mods.shift => Some(Action::Outline),
             Some('o') => Some(Action::Files),
@@ -708,6 +715,23 @@ mod tests {
             assert!(matches!(
                 action(code, plain(), Layout::Us),
                 Some(Action::Insert(_))
+            ));
+        }
+    }
+
+    /// The page has two settings and both are on the keyboard. `M` is
+    /// unshifted and in the same place on either layout, which is what this arm
+    /// needs — it resolves the character with shift forced off.
+    #[test]
+    fn the_margins_cycle_from_either_chord_on_either_layout() {
+        for layout in [Layout::Us, Layout::German] {
+            for mods in [ctrl(), meta()] {
+                assert_eq!(action(50, mods, layout), Some(Action::CycleMargins));
+            }
+            // And still types its letter with no chord held.
+            assert!(matches!(
+                action(50, plain(), layout),
+                Some(Action::Insert('m'))
             ));
         }
     }

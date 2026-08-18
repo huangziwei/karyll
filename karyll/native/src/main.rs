@@ -215,6 +215,7 @@ fn main() -> Result<()> {
         scanning: None,
         found: Vec::new(),
         panel_page: 0,
+        panel_focus: None,
         find: None,
         polled: None,
         holding: None,
@@ -620,6 +621,13 @@ struct Editor {
     /// opens, because arriving on page 3 of a list you have not seen is not
     /// where anybody wants to start.
     panel_page: usize,
+    /// Which line of the open panel the keyboard is on.
+    ///
+    /// **`None` until a key is pressed on the panel**, so a list opened with a
+    /// finger and worked with a finger never grows a mark that means nothing to
+    /// it. A tap sets it to what was touched, which is what keeps the two ways
+    /// of working on one place in the list rather than two.
+    panel_focus: Option<PanelFocus>,
     /// The search, while one is open.
     find: Option<Find>,
     /// When it was last asked about. The loop ticks five times a second, and
@@ -1069,10 +1077,12 @@ impl Editor {
                 }
                 continue;
             }
-            // The other panels take a few keys, because each has a shortcut
-            // that opens it: a screen reachable from the keyboard and escapable
-            // only by putting a hand on the glass is a trap. Esc is the way out
-            // of each, the arrows page, and a shortcut for another panel goes
+            // **A panel is worked from the keyboard or from the glass, and the
+            // two reach the same rows.** A screen a shortcut opens and only a
+            // finger can act on is half a binding. Up and down walk the lines
+            // that do something, left and right move along a line's chips or
+            // turn the page where it has none, Enter takes what the mark is on,
+            // and Esc is the way out. A shortcut for another panel goes
             // straight there.
             if !matches!(self.mode, Mode::Writing) {
                 for event in batch {
@@ -1085,18 +1095,19 @@ impl Editor {
                             self.leave_panel()?;
                             break;
                         }
-                        // **The arrows, and not only `PageUp`/`PageDown`.** The
-                        // keyboard this is used with is a compact one with no
-                        // page keys on it at all, so binding those alone left
-                        // the strip saying `Previous` and `Next` with no way to
-                        // reach either from the keys. Left and right, because
-                        // turning a page is what they do on this device.
-                        Action::Left | Action::PageUp if self.pages() > 1 => {
-                            self.turn_page(true)?;
-                        }
-                        Action::Right | Action::PageDown if self.pages() > 1 => {
-                            self.turn_page(false)?;
-                        }
+                        Action::Up => self.move_focus(false)?,
+                        Action::Down => self.move_focus(true)?,
+                        // **These do the work of the page keys**, which a
+                        // compact Bluetooth keyboard does not have: a list that
+                        // could only be paged with `PageUp`/`PageDown` could
+                        // not be paged at all on the keyboard this is used
+                        // with.
+                        Action::Left => self.move_chip(false)?,
+                        Action::Right => self.move_chip(true)?,
+                        Action::PageUp => self.page_or_nothing(true)?,
+                        Action::PageDown => self.page_or_nothing(false)?,
+                        Action::Newline => self.take_focus()?,
+                        Action::Backspace => self.delete_focus()?,
                         Action::Files
                         | Action::Config
                         | Action::Help
@@ -1942,51 +1953,93 @@ impl Editor {
             Target::Row(row) => self.page_window().start + row,
             Target::Option(item, option) => {
                 let item = self.page_window().start + item;
-                match self.mode {
-                    Mode::Config => self.config_action(item, option)?,
-                    // A file row's only chip is Delete.
-                    Mode::Files(_) => self.arm_or_delete(item)?,
-                    Mode::Help | Mode::Outline(_) | Mode::Writing | Mode::Naming { .. } => {}
-                }
+                self.focus_at(item, option);
+                self.take_chip(item, option)?;
                 return Ok(false);
             }
         };
+        self.focus_at(row, 0);
+        self.take_row(row)?;
+        Ok(false)
+    }
+
+    /// Put the keyboard where the finger just was.
+    ///
+    /// **One place in the list, however it is being worked.** A writer who taps
+    /// a document and then reaches for the arrows carries on from the row they
+    /// touched, and a mark left somewhere else would be the panel remembering
+    /// a place they have moved away from.
+    fn focus_at(&mut self, row: usize, chip: usize) {
+        if self.takes_focus().get(row) == Some(&true) {
+            self.panel_focus = Some(PanelFocus { row, chip });
+        }
+    }
+
+    /// Open what a line of the list stands for.
+    ///
+    /// **Absolute indices**: a row is dispatched against the whole list, not
+    /// against the page of it that was drawn.
+    fn take_row(&mut self, row: usize) -> Result<()> {
         match &self.mode {
-            // Every row is a document now, so a tap on one opens it. There is
-            // no arithmetic past the end of the list to get wrong, because
-            // there is nothing past the end of it.
+            // Every row is a document, so taking one opens it. There is no
+            // arithmetic past the end of the list to get wrong, because there
+            // is nothing past the end of it.
             Mode::Files(files) => {
                 if let Some(listing) = files.get(row) {
                     let path = listing.path.clone();
                     self.open(path)?;
                 }
             }
-            // Every row is a heading, and tapping one goes there. The list a
-            // tap dispatches against is the list that was drawn — the panel
-            // holds it rather than reading the document again, so a jump cannot
-            // land on a heading that has moved since.
+            // Every row is a heading, and taking one goes there. The list this
+            // dispatches against is the list that was drawn — the panel holds
+            // it rather than reading the document again, so a jump cannot land
+            // on a heading that has moved since.
             Mode::Outline(sections) => {
                 if let Some(at) = sections.get(row).map(|s| s.at) {
                     self.jump_to(at)?;
                 }
             }
-            // Every line of Config is a chip, so a bare row tap is a heading or
-            // a label — nothing to run. Every line of Help is a fact, and a
-            // fact does nothing when you press it.
+            // Every line of Config is a chip, so a bare row is a heading or a
+            // label — nothing to run. Every line of Help is a fact, and a fact
+            // does nothing when you press it.
             Mode::Config | Mode::Help | Mode::Writing | Mode::Naming { .. } => {}
         }
-        Ok(false)
+        Ok(())
     }
 
-    /// A tap on a document's Delete chip: arm it, or carry it out.
+    /// Take one chip of a line.
+    fn take_chip(&mut self, item: usize, option: usize) -> Result<()> {
+        match self.mode {
+            Mode::Config => self.config_action(item, option),
+            // A file row's only chip is Delete.
+            Mode::Files(_) => self.arm_or_delete(item),
+            Mode::Help | Mode::Outline(_) | Mode::Writing | Mode::Naming { .. } => Ok(()),
+        }
+    }
+
+    /// Remove the document the keyboard is on.
     ///
-    /// **Two taps, because there is no undo and no bin.** The chip says which
-    /// tap it is on, so the confirmation is where the finger already is rather
-    /// than in a panel covering the name being read off the list.
+    /// Twice, the rule the chip follows — and it is the chip that asks, so the
+    /// confirmation appears where a finger would have been told the same thing.
+    fn delete_focus(&mut self) -> Result<()> {
+        let Some(focus) = self
+            .panel_focus
+            .filter(|_| matches!(self.mode, Mode::Files(_)))
+        else {
+            return Ok(());
+        };
+        self.arm_or_delete(focus.row)
+    }
+
+    /// A document's Delete: arm it, or carry it out.
+    ///
+    /// **Two presses, because there is no undo and no bin.** The chip says
+    /// which press it is on, so the confirmation is where the finger already is
+    /// rather than in a panel covering the name being read off the list.
     ///
     /// Arming another document disarms the first, which is what makes a stray
-    /// tap harmless: the only way to reach the second tap is to aim at the same
-    /// chip twice.
+    /// press harmless: the only way to reach the second is to aim at the same
+    /// document twice.
     fn arm_or_delete(&mut self, row: usize) -> Result<()> {
         let Mode::Files(files) = &self.mode else {
             return Ok(());
@@ -2037,6 +2090,7 @@ impl Editor {
         // them may be the document just opened in place of this.
         self.mode = Mode::Files(list_documents());
         self.panel_page = 0;
+        self.panel_focus = None;
         self.paint()
     }
 
@@ -2044,6 +2098,7 @@ impl Editor {
     fn open_help(&mut self) -> Result<()> {
         self.mode = Mode::Help;
         self.panel_page = 0;
+        self.panel_focus = None;
         self.paint()
     }
 
@@ -2059,6 +2114,7 @@ impl Editor {
         self.mode = Mode::Outline(sections);
         let capacity = self.layout().capacity().max(1);
         self.panel_page = here / capacity;
+        self.panel_focus = None;
         self.paint()
     }
 
@@ -2169,6 +2225,7 @@ impl Editor {
         // chip still reading `Delete?` on a list opened afresh would be the
         // page remembering something the writer has moved on from.
         self.arming = None;
+        self.panel_focus = None;
         self.mode = Mode::Writing;
         self.paint()
     }
@@ -3054,6 +3111,7 @@ impl Editor {
             Bar::Files => {
                 self.mode = Mode::Files(list_documents());
                 self.panel_page = 0;
+                self.panel_focus = None;
                 self.arming = None;
                 self.paint()?;
             }
@@ -3072,6 +3130,7 @@ impl Editor {
                 self.refresh_paired();
                 self.found.clear();
                 self.panel_page = 0;
+                self.panel_focus = None;
                 self.paint()?;
             }
         }
@@ -3150,6 +3209,175 @@ impl Editor {
         }
     }
 
+    /// Move the keyboard to the next line of the panel that can take it.
+    ///
+    /// **The page follows the keyboard.** Walking off the foot of a page turns
+    /// to the next one, which is what makes a long list of documents reachable
+    /// without a hand on the glass. Where no line takes focus at all — Help is
+    /// a page of facts — the arrows turn the page instead, which is the only
+    /// thing left for them to mean.
+    fn move_focus(&mut self, down: bool) -> Result<()> {
+        let next = match self.panel_focus {
+            Some(focus) => next_focusable(&self.takes_focus(), Some(focus.row), down),
+            None => self.first_focus(down),
+        };
+        let Some(row) = next else {
+            return self.page_or_nothing(down);
+        };
+        let was = self.panel_focus;
+        self.panel_focus = Some(PanelFocus {
+            row,
+            chip: self.chip_on(row),
+        });
+        let page = row / self.layout().capacity().max(1);
+        if page != self.panel_page {
+            self.panel_page = page;
+            return self.paint();
+        }
+        self.repaint_focus(was)
+    }
+
+    /// Where the keyboard lands the first time it is used on a panel: the
+    /// nearest line of the page **on screen**.
+    ///
+    /// The page rather than the head of the list, because the outline opens at
+    /// the section being written and a first press that jumped to the top of
+    /// the document would undo the one thing that panel is for.
+    fn first_focus(&mut self, down: bool) -> Option<usize> {
+        let takes = self.takes_focus();
+        let window = self.page_window();
+        let on_page: Vec<usize> = (window.start..window.end.min(takes.len()))
+            .filter(|at| takes[*at])
+            .collect();
+        let first = if down {
+            on_page.first()
+        } else {
+            on_page.last()
+        };
+        first
+            .copied()
+            .or_else(|| next_focusable(&takes, None, down))
+    }
+
+    /// Which lines of the open panel the keyboard can land on.
+    ///
+    /// **What a line means is the editor's to say, not the panel's.** A row
+    /// with no chips is a document to open in the Files list, a heading to go
+    /// to in the outline, and a fact on the Help page; nothing about the row
+    /// itself separates the three, and a mark on the last of them would offer
+    /// something that is not there.
+    fn takes_focus(&self) -> Vec<bool> {
+        self.panel_items()
+            .iter()
+            .map(|item| line_takes_focus(&self.mode, item))
+            .collect()
+    }
+
+    /// Which chip the keyboard sits on when it arrives at `row`: the value the
+    /// setting is already on, so the arrows move from where it stands.
+    fn chip_on(&self, row: usize) -> usize {
+        let items = self.panel_items();
+        let Some(item) = items.get(row) else {
+            return 0;
+        };
+        let takeable = ui::takeable(item);
+        ui::current(item)
+            .filter(|at| takeable.contains(at))
+            .or_else(|| takeable.first().copied())
+            .unwrap_or(0)
+    }
+
+    /// Move along the chips of the line the keyboard is on.
+    ///
+    /// A line with no chips has nothing to move along, and on those panels the
+    /// left and right keys go on turning the page — which is what the strip
+    /// says they do and what the two margins do on the document.
+    fn move_chip(&mut self, right: bool) -> Result<()> {
+        let items = self.panel_items();
+        let takeable = self
+            .panel_focus
+            .and_then(|focus| items.get(focus.row))
+            .map(ui::takeable)
+            .unwrap_or_default();
+        let (Some(focus), false) = (self.panel_focus, takeable.is_empty()) else {
+            return self.page_or_nothing(!right);
+        };
+        let at = takeable
+            .iter()
+            .position(|chip| *chip == focus.chip)
+            .unwrap_or(0);
+        let next = if right {
+            (at + 1) % takeable.len()
+        } else {
+            (at + takeable.len() - 1) % takeable.len()
+        };
+        let was = self.panel_focus;
+        self.panel_focus = Some(PanelFocus {
+            chip: takeable[next],
+            ..focus
+        });
+        self.repaint_focus(was)
+    }
+
+    /// Turn a page, or do nothing when there is only the one.
+    fn page_or_nothing(&mut self, back: bool) -> Result<()> {
+        if self.pages() > 1 {
+            return self.turn_page(back);
+        }
+        Ok(())
+    }
+
+    /// Carry out whatever the keyboard is on: a chip if the line has any, and
+    /// the line itself if it has none.
+    ///
+    /// **The same two calls a tap makes.** A second path to the same rows is
+    /// how a panel ends up opening one document from the glass and another from
+    /// the keys.
+    fn take_focus(&mut self) -> Result<()> {
+        let Some(focus) = self.panel_focus else {
+            return Ok(());
+        };
+        let items = self.panel_items();
+        let Some(item) = items.get(focus.row) else {
+            return Ok(());
+        };
+        if ui::takeable(item).is_empty() {
+            self.take_row(focus.row)
+        } else {
+            self.take_chip(focus.row, focus.chip)
+        }
+    }
+
+    /// Redraw the line the keyboard left and the line it arrived on, and
+    /// nothing else.
+    ///
+    /// A mark that moves on every press may not cost a page-wide update: the
+    /// list is otherwise unchanged, and two rows of ink is what actually
+    /// changed.
+    fn repaint_focus(&mut self, was: Option<PanelFocus>) -> Result<()> {
+        let window = self.page_window();
+        let items = self.visible_items();
+        let layout = self.layout();
+        let now = self.panel_focus;
+        let mut plan: Vec<(usize, Option<usize>)> = Vec::new();
+        if let Some(focus) = was.filter(|focus| window.contains(&focus.row)) {
+            plan.push((focus.row - window.start, None));
+        }
+        if let Some(focus) = now.filter(|focus| window.contains(&focus.row)) {
+            let row = focus.row - window.start;
+            // The arrival wins where the two are the same line, which is every
+            // move along a row of chips.
+            plan.retain(|(at, _)| *at != row);
+            plan.push((row, Some(focus.chip)));
+        }
+        for (row, chip) in plan {
+            let rect =
+                ui::paint_focus_row(&mut self.window, &mut self.fonts, layout, &items, row, chip);
+            self.window.present(rect)?;
+        }
+        Ok(())
+    }
+
     /// Which slice of the current panel's list is on screen.
     ///
     /// **The one place the page offset is turned into indices**, so drawing,
@@ -3166,6 +3394,21 @@ impl Editor {
         self.panel_page = self.panel_page.min(pages - 1);
         let start = self.panel_page * capacity;
         start..start + capacity
+    }
+
+    /// Where the keyboard is on the page being drawn, if it is on that page.
+    ///
+    /// The list is what the focus indexes and a page of it is what gets drawn,
+    /// so this is the one place the two are reconciled — and a row that has
+    /// gone since (a document deleted, a keyboard forgotten) simply stops
+    /// being marked.
+    fn visible_focus(&mut self) -> Option<ui::Focus> {
+        let focus = self.panel_focus?;
+        let window = self.page_window();
+        window.contains(&focus.row).then_some(ui::Focus {
+            row: focus.row - window.start,
+            chip: focus.chip,
+        })
     }
 
     /// The lines of the current panel that are actually on screen.
@@ -3831,6 +4074,7 @@ impl Editor {
     /// Repaint the current panel with `status` under its title.
     fn show_status(&mut self, status: &str) -> Result<()> {
         let layout = self.layout();
+        let focus = self.visible_focus();
         let items = self.visible_items();
         let strip = self.strip_labels();
         let title = match self.mode {
@@ -3852,6 +4096,7 @@ impl Editor {
                 self.announcing,
                 self.language,
             ),
+            focus,
         }
         .paint(&mut self.window, &mut self.fonts, layout)
     }
@@ -3962,6 +4207,7 @@ impl Editor {
             Action::Resize(larger) => {
                 self.set_size(render::step_size(self.theme.body_px, larger))?
             }
+            Action::CycleMargins => self.set_margin(render::step_margin(self.theme.margin))?,
             // Only means anything mid-composition, where `compose_key` has
             // already taken it. Reaching here is Shift+Enter with nothing being
             // converted, which is a line break like any other.
@@ -4450,7 +4696,7 @@ impl Editor {
                 // Its own arm, or it falls through to whatever the last one
                 // says. There is no Save on this page and nothing to confirm,
                 // so that is what it says.
-                Mode::Config => "Changes apply as you tap.".to_string(),
+                Mode::Config => "Changes apply at once.".to_string(),
                 // The two keys that are not in the list below, because a list
                 // of what the keys do cannot name the key that opened it or the
                 // key that closes it — by then it is too late to read either.
@@ -5499,6 +5745,7 @@ fn help_items() -> Vec<ui::Item> {
         row("Heading level", "Ctrl/⌘ + 1 … 6"),
         row("Focus on this sentence", "Ctrl/⌘ + D"),
         row("Larger, smaller type", "Ctrl/⌘ + +,  Ctrl/⌘ + -"),
+        row("Margins", "Ctrl/⌘ + M"),
         heading("Getting around"),
         row("Find, then step through", "Ctrl/⌘ + F,  Enter"),
         row("Step back through matches", "Shift + Enter"),
@@ -5510,7 +5757,9 @@ fn help_items() -> Vec<ui::Item> {
         row("Select as you go", "Shift + any move"),
         row("Documents, new document", "Ctrl/⌘ + O,  Ctrl/⌘ + N"),
         row("Settings", "Ctrl/⌘ + ,"),
-        row("Turn a page of a list", "← →"),
+        row("Through a list, and take one", "↑ ↓,  Enter"),
+        row("Values on a setting, pages on a list", "← →"),
+        row("Delete the document you are on", "Backspace, twice"),
         row("Clear the screen", "Ctrl/⌘ + R"),
         // The rule, said once rather than repeated on every row above.
         row("Close it again", "The same shortcut, or Esc"),
@@ -5620,6 +5869,45 @@ fn outline_items(sections: &[Section], cursor: usize) -> Vec<ui::Item> {
             action: None,
         })
         .collect()
+}
+
+/// Whether one line of the panel `mode` is showing can take the keyboard.
+///
+/// **What a line means is the mode's to say, not the row's.** A row with no
+/// chips is a document to open in the Files list, a heading to go to in the
+/// outline, and a fact on the Help page; nothing about the row itself separates
+/// the three, and a mark on the last of them would offer something that is not
+/// there.
+fn line_takes_focus(mode: &Mode, item: &ui::Item) -> bool {
+    match mode {
+        Mode::Files(_) | Mode::Outline(_) => matches!(item, ui::Item::Row { .. }),
+        Mode::Config => !ui::takeable(item).is_empty(),
+        Mode::Help | Mode::Writing | Mode::Naming { .. } => false,
+    }
+}
+
+/// The next line that can take the keyboard, `down` or up from `from`, wrapping
+/// at the ends. `None` when no line can take it at all.
+///
+/// **Over the whole list rather than over the page on screen**, because the
+/// page follows the keyboard: stepping off the foot of one page is how the next
+/// is reached, which is what makes a long list workable without a hand on the
+/// glass. `from` is `None` before the first press.
+fn next_focusable(takes: &[bool], from: Option<usize>, down: bool) -> Option<usize> {
+    let n = takes.len();
+    if n == 0 {
+        return None;
+    }
+    let start = from.unwrap_or(if down { n - 1 } else { 0 });
+    (1..=n)
+        .map(|step| {
+            if down {
+                (start + step) % n
+            } else {
+                (start + n - step % n) % n
+            }
+        })
+        .find(|at| takes[*at])
 }
 
 /// A strip label as it is drawn.
@@ -6018,6 +6306,18 @@ enum ConfigRow {
     HighlightColour,
 }
 
+/// Where the keyboard is in a panel: which line of the whole list, and which
+/// of that line's chips.
+///
+/// **Absolute, where [`ui::Focus`] is page-relative.** The list is what the
+/// keyboard walks and the page follows it, so a step off the foot of one page
+/// is how the next is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PanelFocus {
+    row: usize,
+    chip: usize,
+}
+
 /// Something a finger can be on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -6053,6 +6353,58 @@ const SPECIMEN: &str = include_str!("../../../device/share/Welcome.md");
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// **A line takes the keyboard when taking it would do something**, which
+    /// is a question about the panel rather than about the row: the outline's
+    /// rows carry no chip and go somewhere, Help's carry none and do not.
+    #[test]
+    fn what_takes_the_keyboard_depends_on_the_panel() {
+        let row = ui::Item::Row {
+            label: "draft.md".into(),
+            detail: String::new(),
+            on: false,
+            action: None,
+        };
+        let heading = ui::Item::Heading("Type".into());
+        let choice = ui::Item::Choice {
+            label: "Size".into(),
+            options: vec!["46".into()],
+            on: vec![true],
+            inert: Vec::new(),
+        };
+        for mode in [Mode::Files(Vec::new()), Mode::Outline(Vec::new())] {
+            assert!(line_takes_focus(&mode, &row));
+            assert!(!line_takes_focus(&mode, &heading));
+        }
+        assert!(line_takes_focus(&Mode::Config, &choice));
+        assert!(!line_takes_focus(&Mode::Config, &heading));
+        assert!(
+            !line_takes_focus(&Mode::Config, &row),
+            "a bare row on Config is a label"
+        );
+        assert!(
+            !line_takes_focus(&Mode::Help, &row),
+            "Help is a page of facts"
+        );
+    }
+
+    /// Walking the list steps over the lines that do nothing and comes round
+    /// rather than stopping — a list whose last line is a dead end is one the
+    /// writer has to work out the shape of before they can leave it.
+    #[test]
+    fn walking_a_list_skips_the_lines_that_do_nothing() {
+        let takes = [false, true, false, true, false];
+        assert_eq!(next_focusable(&takes, None, true), Some(1));
+        assert_eq!(next_focusable(&takes, Some(1), true), Some(3));
+        assert_eq!(next_focusable(&takes, Some(3), true), Some(1), "wraps");
+        assert_eq!(next_focusable(&takes, None, false), Some(3));
+        assert_eq!(next_focusable(&takes, Some(3), false), Some(1));
+        assert_eq!(next_focusable(&takes, Some(1), false), Some(3), "wraps");
+        // A page where nothing can be taken — Help — says so rather than
+        // picking a line that does nothing.
+        assert_eq!(next_focusable(&[false, false], None, true), None);
+        assert_eq!(next_focusable(&[], None, true), None);
+    }
 
     /// **The specimen has a job, and this is it.** It is the document a fresh
     /// install opens onto and the one thing looked at when the type is wrong on

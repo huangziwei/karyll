@@ -83,6 +83,19 @@ pub fn step_size(px: f32, larger: bool) -> f32 {
     SIZES.get(next).copied().unwrap_or(SIZES[at])
 }
 
+/// The next margin along, wrapping at the end.
+///
+/// A cycle rather than the two-ended step [`step_size`] is, because three
+/// levels put every one of them within two presses of any other — where seven
+/// sizes wrapped would send a writer at the top of the ladder to the bottom.
+pub fn step_margin(percent: u16) -> u16 {
+    let at = MARGINS
+        .iter()
+        .position(|(offered, _)| *offered == nearest_margin(percent))
+        .unwrap_or(0);
+    MARGINS[(at + 1) % MARGINS.len()].0
+}
+
 /// Page geometry and type sizes, in pixels.
 pub struct Theme {
     pub body_px: f32,
@@ -1337,6 +1350,23 @@ mod tests {
             assert!(measure > left, "{percent}% leaves more margin than page");
             last = left;
         }
+    }
+
+    /// Three levels, so the cycle reaches any of them from any other and comes
+    /// back where it started.
+    #[test]
+    fn the_margin_cycle_visits_every_level_and_closes() {
+        let mut at = DEFAULT_MARGIN;
+        let mut seen = vec![at];
+        for _ in 1..MARGINS.len() {
+            at = step_margin(at);
+            assert!(!seen.contains(&at), "{at}% came round twice");
+            seen.push(at);
+        }
+        assert_eq!(step_margin(at), DEFAULT_MARGIN, "the cycle closes");
+        // A margin stored by a build with another ladder lands on this one
+        // before it steps.
+        assert_eq!(step_margin(0), step_margin(MARGINS[0].0));
     }
 
     /// A page of `text`, laid out at the default size on a Colorsoft-shaped
