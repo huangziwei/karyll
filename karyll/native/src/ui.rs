@@ -898,10 +898,12 @@ fn draw_swatch(window: &mut Window, rect: Rect, ink: u8, on: bool) {
 
 /// A filled circle, scanline by scanline.
 ///
+/// Shared with the page, which marks Han emphasis with one.
+///
 /// Coverage is one bit everywhere else on this panel and it is one bit here:
 /// the edge is hard, which at this size reads as a circle and not as a
 /// staircase.
-fn disc(window: &mut Window, cx: u16, cy: u16, radius: u16, value: u8) {
+pub fn disc(window: &mut Window, cx: u16, cy: u16, radius: u16, value: u8) {
     let r = radius as i32;
     for dy in -r..=r {
         let half = ((r * r - dy * dy) as f32).sqrt() as i32;

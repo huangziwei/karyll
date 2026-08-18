@@ -208,16 +208,15 @@ const LATIN_FAMILIES: &[Family] = &[
 
 /// Simplified Chinese, default first.
 ///
-/// Han marks emphasis with a family change rather than a slant, so each entry
-/// is a pairing rather than a single face: 黑体 sets its emphasis in 宋体, and
-/// choosing 宋体 for the body turns the same pair the other way up. The device
-/// carries no Simplified 楷体 or 圆体, so these two are all there is.
+/// A body face and its bold, and nothing between them: emphasis is a 着重号
+/// against each character and leaves the face alone, so a family is one design
+/// at two weights. The device carries no Simplified 楷体 or 圆体, so these two
+/// are all there is.
 const SIMPLIFIED_FAMILIES: &[Family] = &[
     Family {
         name: "黑体",
         faces: &[
             "/usr/java/lib/fonts/STHeitiMedium.ttf",
-            "/usr/java/lib/fonts/STSongMedium.ttf",
             "/usr/java/lib/fonts/STHeitiBold.ttf",
         ],
     },
@@ -225,7 +224,6 @@ const SIMPLIFIED_FAMILIES: &[Family] = &[
         name: "宋体",
         faces: &[
             "/usr/java/lib/fonts/STSongMedium.ttf",
-            "/usr/java/lib/fonts/STHeitiMedium.ttf",
             "/usr/java/lib/fonts/STSongBold.ttf",
         ],
     },
@@ -241,7 +239,6 @@ const TRADITIONAL_FAMILIES: &[Family] = &[
         name: "黑體",
         faces: &[
             "/usr/java/lib/fonts/STHeitiTC.ttf",
-            "/usr/java/lib/fonts/STSongTC.ttf",
             "/usr/java/lib/fonts/STHeitiTCBold.ttf",
         ],
     },
@@ -249,9 +246,6 @@ const TRADITIONAL_FAMILIES: &[Family] = &[
         name: "楷體",
         faces: &[
             "/var/local/font/mnt/zh-Hant_font/fonts/STKaitiTC.ttf",
-            // A brush hand is already as far from upright as a Han face gets,
-            // so its emphasis goes to the sans rather than to another serif.
-            "/usr/java/lib/fonts/STHeitiTC.ttf",
             "/var/local/font/mnt/zh-Hant_font/fonts/STKaitiTCBold.ttf",
         ],
     },
@@ -259,7 +253,6 @@ const TRADITIONAL_FAMILIES: &[Family] = &[
         name: "圓體",
         faces: &[
             "/var/local/font/mnt/zh-Hant_font/fonts/STYuanTC.ttf",
-            "/usr/java/lib/fonts/STSongTC.ttf",
             "/var/local/font/mnt/zh-Hant_font/fonts/STYuanTCBold.ttf",
         ],
     },
@@ -272,7 +265,6 @@ const JAPANESE_FAMILIES: &[Family] = &[
         name: "ゴシック",
         faces: &[
             "/usr/java/lib/fonts/TBGothicMed_213.ttf",
-            "/usr/java/lib/fonts/TBMinchoMedium_213.ttf",
             "/usr/java/lib/fonts/TBGothicBold_213.ttf",
         ],
     },
@@ -280,7 +272,6 @@ const JAPANESE_FAMILIES: &[Family] = &[
         name: "明朝",
         faces: &[
             "/usr/java/lib/fonts/TBMinchoMedium_213.ttf",
-            "/usr/java/lib/fonts/TBGothicMed_213.ttf",
             "/usr/java/lib/fonts/TBMinchoBold_213.ttf",
         ],
     },
@@ -288,7 +279,6 @@ const JAPANESE_FAMILIES: &[Family] = &[
         name: "筑紫明朝",
         faces: &[
             "/var/local/font/mnt/ja_font/fonts/TsukuMinPr5-Medium.ttf",
-            "/usr/java/lib/fonts/TBGothicMed_213.ttf",
             "/var/local/font/mnt/ja_font/fonts/TsukuMinPr5-Bold.ttf",
         ],
     },
@@ -448,7 +438,7 @@ const LATIN_ROLES: [Role; 4] = [
 ];
 
 /// The Han roles, each of which has a face **per region**.
-const HAN_ROLES: [Role; 3] = [Role::Han, Role::HanEmphasis, Role::HanBold];
+const HAN_ROLES: [Role; 2] = [Role::Han, Role::HanBold];
 
 /// The chrome roles, in [`CHROME_FACES`] order. One face each and no regional
 /// cuts: karyll's own Latin is the same wherever it is read.
@@ -1000,7 +990,7 @@ impl Metrics for Proportional {
 
 #[cfg(test)]
 fn is_han(role: &Role) -> bool {
-    matches!(role, Role::Han | Role::HanEmphasis | Role::HanBold)
+    matches!(role, Role::Han | Role::HanBold)
 }
 
 #[cfg(test)]
@@ -1228,30 +1218,32 @@ mod tests {
         }
     }
 
-    /// In every family on the list, because emphasis is a family change in Han
-    /// — it never slants, so an entry whose emphasis is its own body face marks
-    /// emphasis with nothing at all.
+    /// **A Han family is one design at two weights**, because emphasis is a
+    /// mark against the character rather than a second face — an entry that
+    /// reached outside its own design for the bold would set a bold word in a
+    /// family the writer did not choose.
     #[test]
-    fn han_emphasis_is_a_different_family_from_han_body() {
+    fn a_han_family_is_one_design_bodied_and_bolded() {
         for (group, _, family) in all_families() {
             if matches!(group, Group::Latin) {
                 continue;
             }
             let body = index_in(group, Role::Han);
-            let emphasis = index_in(group, Role::HanEmphasis);
+            let bold = index_in(group, Role::HanBold);
             assert_ne!(
-                family.faces[body], family.faces[emphasis],
-                "{} marks emphasis with its own body face",
+                family.faces[body], family.faces[bold],
+                "{} sets bold in its own body face",
                 family.name
             );
+            assert_eq!(family.faces.len(), 2, "{} is not a pair", family.name);
         }
-        // Sans body against serif emphasis by default, in each convention's own
-        // families — 黑体/宋体 for Chinese, ゴシック/明朝 for Japanese.
+        // The sans by default in each convention's own families — 黑体 for
+        // Chinese, ゴシック for Japanese.
         let default = Choices::default();
         assert!(path_for(Role::Han, Region::Simplified, default).contains("STHeiti"));
-        assert!(path_for(Role::HanEmphasis, Region::Simplified, default).contains("STSong"));
+        assert!(path_for(Role::HanBold, Region::Simplified, default).contains("STHeitiBold"));
         assert!(path_for(Role::Han, Region::Japanese, default).contains("TBGothic"));
-        assert!(path_for(Role::HanEmphasis, Region::Japanese, default).contains("TBMincho"));
+        assert!(path_for(Role::HanBold, Region::Japanese, default).contains("TBGothicBold"));
     }
 
     /// Traditional Chinese and Japanese must not be drawn from the Simplified
@@ -1526,9 +1518,9 @@ mod tests {
                 .contains("TBMincho")
         );
         assert!(
-            fonts.slots[slot_of(Role::HanEmphasis, Region::Japanese)]
+            fonts.slots[slot_of(Role::HanBold, Region::Japanese)]
                 .path
-                .contains("TBGothic")
+                .contains("TBMinchoBold")
         );
         // And the other conventions are untouched: they are chosen separately.
         assert!(

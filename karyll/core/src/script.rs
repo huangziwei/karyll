@@ -12,11 +12,12 @@
 //! run, which is what keeps Han unification from setting one paragraph in two
 //! conventions.
 //!
-//! **Chinese emphasis is a face change, not a slant.** Chinese type marks
-//! emphasis by switching family — 宋体 body against 黑体 emphasis — or with
-//! emphasis dots. It never slants: an oblique Han glyph is a synthetic
-//! distortion, not a style the script has. So [`Role`] gives Latin real italics
-//! and gives Han a different family for the same meaning.
+//! **Han emphasis is a mark, not a slant.** An oblique Han glyph is a
+//! synthetic distortion rather than a style the script has, so emphasis is set
+//! the way the writing systems themselves set it: a dot against each character
+//! — 着重号 under it in Chinese, 圏点 over it in Japanese. The face does not
+//! change, which is what lets one sentence carry both — [`role_for`] gives
+//! Latin a real italic and leaves Han upright for [`takes_mark`] to point at.
 
 use crate::markdown::{Block, Style};
 
@@ -54,10 +55,8 @@ pub enum Role {
     BodyItalic,
     BodyBold,
     BodyBoldItalic,
-    /// Han body.
+    /// Han body. Emphasis is set in it too, and marked rather than slanted.
     Han,
-    /// Han emphasis: a different family, never a slant.
-    HanEmphasis,
     HanBold,
     /// karyll's own Latin text — a panel label, the action strip, a filename.
     Chrome,
@@ -66,7 +65,7 @@ pub enum Role {
 
 impl Role {
     pub fn is_han(self) -> bool {
-        matches!(self, Role::Han | Role::HanEmphasis | Role::HanBold)
+        matches!(self, Role::Han | Role::HanBold)
     }
 
     /// Whether this role draws karyll's own text rather than the document's.
@@ -120,6 +119,41 @@ pub enum Region {
     Japanese,
 }
 
+impl Region {
+    /// Which side of a character its emphasis mark sits on, writing across the
+    /// page.
+    ///
+    /// **Japanese sets 圏点 over the character and Chinese sets 着重号 under
+    /// it.** The same code point takes both, so the side is read from the
+    /// convention rather than from the character — which is the one thing about
+    /// emphasis that cannot be settled per run, and the same reason this
+    /// setting exists at all.
+    pub fn mark_above(self) -> bool {
+        matches!(self, Region::Japanese)
+    }
+}
+
+/// Whether an emphasised character carries a mark of its own.
+///
+/// **A mark per character, and only where a character is what it is against.**
+/// Han is written without spaces and every glyph is the same width, so a mark
+/// under each one reads as a run; a mark under the space or the comma between
+/// two of them reads as a mistake. Latin inside the same emphasis is set in a
+/// real italic instead and is never marked.
+pub fn takes_mark(c: char) -> bool {
+    if script_of(c) != Script::Han || c.is_whitespace() {
+        return false;
+    }
+    // The CJK punctuation block, and the fullwidth forms of the ASCII marks —
+    // the fullwidth *letters* and digits between them are text and take a mark.
+    !matches!(c as u32,
+        0x3000..=0x303F
+        | 0xFF01..=0xFF0F
+        | 0xFF1A..=0xFF20
+        | 0xFF3B..=0xFF40
+        | 0xFF5B..=0xFF65)
+}
+
 /// The face for a run, given what it is and where it sits.
 ///
 /// Headings are set bold throughout, so emphasis inside one has to reach for
@@ -129,11 +163,13 @@ pub fn role_for(block: Block, style: Style, script: Script) -> Role {
     let emphasis = matches!(style, Style::Emphasis | Style::StrongEmphasis);
     let strong = matches!(style, Style::Strong | Style::StrongEmphasis);
 
+    // Han emphasis does not appear here at all: it is a mark beside the
+    // character, drawn by the renderer, and the face stays where it is.
     if script == Script::Han {
-        return match (heading || strong, emphasis) {
-            (true, _) => Role::HanBold,
-            (false, true) => Role::HanEmphasis,
-            (false, false) => Role::Han,
+        return if heading || strong {
+            Role::HanBold
+        } else {
+            Role::Han
         };
     }
 
@@ -257,12 +293,42 @@ mod tests {
         );
     }
 
+    /// **Emphasis leaves the Han face alone**, because the mark carries it.
+    /// There is no italic Han role to reach for and no second family to swap
+    /// to — an emphasised run is the body face with a dot against each
+    /// character.
     #[test]
-    fn han_emphasis_is_a_face_change_never_a_slant() {
-        let role = role_for(Block::Paragraph, Style::Emphasis, Script::Han);
-        assert_eq!(role, Role::HanEmphasis);
-        // There is no italic Han role to reach for at all.
-        assert!(role.is_han());
+    fn han_emphasis_is_a_mark_never_a_slant_or_a_swap() {
+        let body = role_for(Block::Paragraph, Style::Text, Script::Han);
+        let emphasised = role_for(Block::Paragraph, Style::Emphasis, Script::Han);
+        assert_eq!(emphasised, body);
+        assert!(emphasised.is_han());
+        // Latin in the same sentence still gets a real italic, which is what
+        // makes `*これ*は*difficult*そうです` come out in two conventions.
+        assert_eq!(
+            role_for(Block::Paragraph, Style::Emphasis, Script::Latin),
+            Role::BodyItalic
+        );
+    }
+
+    /// The mark goes on the characters and not on what sits between them.
+    #[test]
+    fn what_carries_an_emphasis_mark() {
+        for c in ['世', 'あ', 'ア', '漢', 'Ａ', '１'] {
+            assert!(takes_mark(c), "{c} should carry a mark");
+        }
+        for c in ['。', '、', '，', '「', ' ', '\u{3000}', 'a', '.', '·'] {
+            assert!(!takes_mark(c), "{c} should not carry a mark");
+        }
+    }
+
+    /// Above for Japanese, below for Chinese — the one part of emphasis that is
+    /// the document's to say rather than the character's.
+    #[test]
+    fn the_mark_sits_where_the_convention_puts_it() {
+        assert!(Region::Japanese.mark_above());
+        assert!(!Region::Simplified.mark_above());
+        assert!(!Region::Traditional.mark_above());
     }
 
     #[test]

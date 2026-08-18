@@ -4294,7 +4294,14 @@ impl Editor {
         self.language = language;
         write_language(language);
 
+        // **A convention change repaints the page whole.** Han unification
+        // means the same characters draw differently under it and the emphasis
+        // mark changes sides, where `Frame::unchanged` compares the text — and
+        // the text has not changed at all.
         if let Some(region) = language.region() {
+            if self.fonts.region() != region {
+                self.frame = None;
+            }
             self.fonts.set_region(region);
         }
         self.set_lexicon();
@@ -5769,6 +5776,7 @@ fn help_items() -> Vec<ui::Item> {
         row("Take a candidate", "Space, or 1 … 0"),
         row("Take the letters as typed", "Shift + Enter"),
         row("Drop the half-typed word", "Esc"),
+        row("Emphasis, marked not slanted", "Ctrl/⌘ + I"),
         heading("Touch and pen"),
         // First, because it is the only way through a long document with
         // nothing paired, and the one thing here a reader needs before they

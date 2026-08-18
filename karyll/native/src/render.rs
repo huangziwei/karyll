@@ -12,13 +12,20 @@
 //! A selected run inverts — filled black, glyphs drawn white — which is what
 //! one bit has instead of a tint.
 //!
+//! **Han emphasis is a mark rather than a slant or a second face.** A dot sits
+//! against each character of an emphasised Han run — under it in Chinese, over
+//! it in Japanese — and the face stays where it is, so one sentence can set
+//! これ with dots and *difficult* in a real italic. The dot is drawn here
+//! rather than taken from a face: the firmware faces carry no sesame glyph, and
+//! a filled dot is the most legible thing a one-bit panel can put on a page.
+//!
 //! Layout runs per logical line. Each one is wrapped with real advances from
 //! the faces that will actually draw it, so the measuring pass and the drawing
 //! pass can never disagree about where a character sits.
 
 use anyhow::Result;
 use karyll_core::markdown::{Block, LineMarkup, Style};
-use karyll_core::script::{Role, role_for, script_of};
+use karyll_core::script::{Role, role_for, script_of, takes_mark};
 use karyll_core::wrap;
 
 use crate::font::{Fonts, Metrics};
@@ -141,6 +148,63 @@ impl Theme {
             heading_space: 0.75,
         }
     }
+}
+
+/// Where an emphasis mark sits on a line, and how big it is.
+///
+/// **In the air the leading leaves.** A Han glyph fills its em, so the only
+/// room for a mark is between one row's glyph box and the next — the same air
+/// on every row, which is what keeps a marked line the height of an unmarked
+/// one and a page of them evenly spaced. Nothing about the mark reaches the
+/// wrap: it takes no width, so a marked run breaks exactly where the same run
+/// unmarked would.
+struct Mark {
+    /// Baseline to the centre of the mark, positive downwards.
+    offset: f32,
+    radius: u16,
+}
+
+impl Mark {
+    /// Measured once per line, from the metrics the row is already built from.
+    fn on(fonts: &mut impl Metrics, roles: &[Role], px: f32, above: bool) -> Self {
+        // A sixteenth of the type size: 3 px against a 46 px body, which is
+        // half the width of the caret and reads as a dot rather than a bullet.
+        let radius = (px / 16.0).round().max(2.0);
+        let ascent = fonts.ascent(px, roles);
+        let box_height = fonts.line_height(px, roles);
+        Self {
+            offset: if above {
+                -(ascent + radius + 1.0)
+            } else {
+                box_height - ascent + radius + 1.0
+            },
+            radius: radius as u16,
+        }
+    }
+}
+
+/// The dot against one emphasised character, centred on its advance.
+///
+/// **Clamped inside the row.** A mark that reached past it would land against
+/// the line above or below, where it would read as belonging to that one — and
+/// the air it hangs in is the leading, which the writer can set tighter than
+/// the mark needs.
+fn emphasis_mark(
+    window: &mut Window,
+    line: &VisualLine,
+    mark: &Mark,
+    cx: f32,
+    baseline: f32,
+    ink: u8,
+) {
+    let radius = mark.radius as f32;
+    let top = line.y as f32 + radius;
+    let bottom = (line.y + line.height) as f32 - radius;
+    let cy = (baseline + mark.offset).clamp(top, bottom);
+    if cx < radius || cy < radius {
+        return;
+    }
+    crate::ui::disc(window, cx as u16, cy as u16, mark.radius, ink);
 }
 
 /// The value a glyph is drawn in: three cases, and the awkward one is the pair.
@@ -1153,6 +1217,9 @@ pub fn paint(
     let selected = selection_rects(page, fonts, &lines, selection);
     let span = selection_span(&selected);
     let fields = highlight_fields(page, fonts, &lines);
+    // Read once: the convention is the document's, and it cannot change while
+    // one page is being drawn.
+    let marks_above = fonts.region().mark_above();
 
     // Damage is clipped to the page. A rewrap extends it to the foot of the
     // surface, and without this that clears the action strip — which is drawn
@@ -1229,6 +1296,7 @@ pub fn paint(
         };
         let roles = roles_for_line(entry, page.chars);
         let styles = styles_for_line(entry);
+        let mark = Mark::on(fonts, &page.roles, line.px, marks_above);
 
         let mut pen = page.origin(line.block);
         let baseline = (line.y + line.baseline) as f32;
@@ -1254,6 +1322,12 @@ pub fn paint(
             let ink = ink(inverted, quiet);
 
             let origin_x = pen;
+            let advance = fonts.advance(role, line.px, ch);
+            // Before the glyph rather than after it, so a mark can never be
+            // drawn over the character it belongs to.
+            if matches!(style, Style::Emphasis | Style::StrongEmphasis) && takes_mark(ch) {
+                emphasis_mark(window, line, &mark, origin_x + advance / 2.0, baseline, ink);
+            }
             fonts.draw(role, line.px, ch, |gx, gy, coverage| {
                 // The rasterizer reports coverage; the panel takes ink. One bit,
                 // because a two-level waveform turns grey into mud.
@@ -1267,7 +1341,7 @@ pub fn paint(
                 }
                 window.put_pixel(x as u16, y as u16, ink);
             });
-            pen += fonts.advance(role, line.px, ch);
+            pen += advance;
             if line.underline.contains(&(i - line.range.start)) {
                 let (from, _) = rule.unwrap_or((origin_x, origin_x));
                 rule = Some((from, pen));
@@ -1367,6 +1441,47 @@ mod tests {
         // A margin stored by a build with another ladder lands on this one
         // before it steps.
         assert_eq!(step_margin(0), step_margin(MARGINS[0].0));
+    }
+
+    /// **The mark hangs in the leading and never over the glyphs.** A dot
+    /// inside the glyph box is a smudge on the character it is marking.
+    #[test]
+    fn the_emphasis_mark_sits_outside_the_glyph_box() {
+        let mut fonts = crate::font::Stub;
+        let roles = [Role::Han];
+        let ascent = fonts.ascent(DEFAULT_SIZE, &roles);
+        let box_height = fonts.line_height(DEFAULT_SIZE, &roles);
+        let above = Mark::on(&mut fonts, &roles, DEFAULT_SIZE, true);
+        let below = Mark::on(&mut fonts, &roles, DEFAULT_SIZE, false);
+        assert!(
+            above.offset + above.radius as f32 <= -ascent,
+            "the Japanese mark reaches into the glyphs"
+        );
+        assert!(
+            below.offset - below.radius as f32 >= box_height - ascent,
+            "the Chinese mark reaches into the glyphs"
+        );
+    }
+
+    /// **Every size has to leave the mark room**, or [`emphasis_mark`] clamps it
+    /// against the row's edge, where it reads as belonging to the line beside
+    /// it. The air is the leading, and the leading tightens as the type grows.
+    #[test]
+    fn every_size_leaves_the_mark_room_in_the_leading() {
+        let mut fonts = crate::font::Stub;
+        let roles = [Role::Han];
+        for px in SIZES {
+            let box_height = fonts.line_height(px, &roles);
+            let air = (box_height * Theme::at(px, DEFAULT_MARGIN).leading - box_height) / 2.0;
+            for above in [true, false] {
+                let mark = Mark::on(&mut fonts, &roles, px, above);
+                let needed = 2.0 * mark.radius as f32 + 1.0;
+                assert!(
+                    needed <= air,
+                    "{px} px leaves {air:.1} px of leading for a mark wanting {needed}"
+                );
+            }
+        }
     }
 
     /// A page of `text`, laid out at the default size on a Colorsoft-shaped

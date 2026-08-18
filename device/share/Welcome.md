@@ -57,6 +57,10 @@ Three or more dashes make a rule:
 
 **One code point can have three correct shapes**, so each writing system is drawn in a face chosen for it. Which face you get follows the input source rather than the character, because nothing in the text itself says which convention you meant.
 
+强调在中文里是*着重号*，日本語では*圏点*。同一句话里 *difficult* 这样的词仍然是斜体。
+
+**Emphasis is a mark, not a slant**, because no Han face has an italic. The dot sits under each character in Chinese and over each one in Japanese; which side follows the input source, for the same reason the face does. Latin in the same sentence keeps its real *italic*.
+
 Switch input with `Ctrl + Space`. Type pinyin or romaji, then take a candidate with the space bar or a number key.
 
 ## Getting around
