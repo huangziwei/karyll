@@ -187,10 +187,10 @@ mod tests {
 
     #[test]
     fn a_quarter_turn_maps_the_panel_across_the_long_edge() {
-        // The bug this pins: a point halfway down the panel has to arrive
-        // halfway across a landscape window. Scaling into the window's own axes
-        // first squashed this by 1860/2480, so a tap aimed at the third button
-        // of five landed on the second.
+        // A point halfway down the panel has to arrive halfway across a
+        // landscape window. Scaling into the window's own axes first squashes
+        // it by 1860/2480, which walks a tap aimed at the third button of five
+        // onto the second.
         let down_the_panel = 2480 / 2;
         let (x, _) = Orientation::Left.apply(900, down_the_panel, LANDSCAPE);
         assert_eq!(

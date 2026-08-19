@@ -257,10 +257,8 @@ mod tests {
     use super::*;
 
     /// Drive the state machine the way the kernel actually does: the tracking
-    /// id comes **first**, then the coordinates, then `SYN_REPORT`.
-    ///
-    /// The earlier version of this helper sent the position first, which is why
-    /// it never caught the press landing at the previous touch's coordinates.
+    /// id comes **first**, then the coordinates, then `SYN_REPORT`. Sending the
+    /// position first would let a press reported on the id go unnoticed.
     fn contact(t: &mut Touchscreen, x: i32, y: i32) -> Vec<Touch> {
         let mut out = Vec::new();
         t.feed(EV_ABS, ABS_MT_SLOT, 0, &mut out);
@@ -304,10 +302,9 @@ mod tests {
 
     #[test]
     fn a_press_lands_where_the_finger_actually_is() {
-        // The bug this pins: the tracking id arrives before the coordinates, so
-        // reporting the press on the id carried the *previous* touch's position
-        // — one behind every time, and (0, 0) on the very first press, which is
-        // why nothing under the first tap ever lit up.
+        // What this pins: the tracking id arrives before the coordinates, so
+        // reporting the press on the id carries the *previous* touch's position
+        // — one behind every time, and (0, 0) on the very first press.
         let mut t = detached();
         assert_eq!(
             contact(&mut t, 900, 1200),
@@ -325,7 +322,7 @@ mod tests {
 
     #[test]
     fn a_drag_lifts_where_the_finger_left() {
-        // sidle resolves on the lift position, so dragging off a key and
+        // A drag resolves on the lift position, so dragging off a key and
         // letting go acts on wherever it ended up rather than where it began.
         let mut t = detached();
         contact(&mut t, 100, 100);

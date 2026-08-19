@@ -3,7 +3,7 @@
 //! Not raw `/dev/fb0`. A window means the lab126 compositor owns the surface —
 //! it shows us fullscreen and recomposites the whole screen when we are torn
 //! down, so exiting leaves a live home screen instead of a stuck frame. This is
-//! the model kterm uses and the one `sidle/native` proved on this hardware.
+//! the model kterm uses, and the one proven on this hardware.
 //!
 //! Two consequences worth knowing before tuning refresh:
 //!
@@ -21,8 +21,7 @@
 //! shared with the framework, and it is not needed: the byte is a grey level
 //! everywhere except for the handful of [`ink`] indices, which [`Palette`] turns
 //! into colours as the band goes out on the wire. So a colour panel costs the
-//! same memory as a grey one, and the two grey Kindles run the same code paths
-//! they ran before there was a palette.
+//! same memory as a grey one, and the two grey Kindles share its code paths.
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Instant;
@@ -52,9 +51,9 @@ pub const BLACK: u8 = 0x00;
 /// request from antialiasing, which is what the two-level partial waveform
 /// genuinely cannot represent, and a 16-level panel has fifteen levels spare.
 ///
-/// It replaced a 50% ordered dither. Dither averages over an *area*, and a stem
-/// at this size is 2–4 px — about one pattern cell — so instead of lightening
-/// the mark it deleted half of it. Han would have been worse.
+/// **Not a dither.** Dither averages over an *area*, and a stem at this size is
+/// 2–4 px — about one pattern cell — so it deletes half the mark instead of
+/// lightening it, and Han fares worse still.
 pub const QUIET: u8 = 0x88;
 
 /// A field behind text, on a panel with no colour to make one with.
@@ -157,7 +156,7 @@ pub struct Inks {
 }
 
 impl Default for Inks {
-    /// iA Writer's own pair, and what karyll drew before either was a setting.
+    /// iA Writer's own pair.
     fn default() -> Self {
         Inks {
             caret: 4,
@@ -687,9 +686,8 @@ impl Window {
         // **Widened to full rows.** The panel does not reliably refresh a
         // narrow column: a quarter-width button could be inverted in the
         // backing store, sent, and never visibly change, while the full-width
-        // button next to it worked every time. `sidle/native` widens its
-        // updates to full rows for the same reason. Rows are cheap — the cost
-        // is in how many of them, not how wide.
+        // button next to it worked every time. Rows are cheap — the cost is in
+        // how many of them, not how wide.
         let rect = Rect {
             x: 0,
             width: self.width,

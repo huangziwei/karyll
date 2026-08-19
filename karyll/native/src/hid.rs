@@ -6,10 +6,10 @@
 //! therefore owns the whole Bluetooth story itself — start it, scan, pair,
 //! stop it — with no launcher script and no separate app.
 //!
-//! Shelling out was tried first and does not work: `pgrep -f` did not see the
-//! running daemon, so a second tap started a second one and it died binding an
-//! already-bound port. `/health` cannot be wrong the same way, because it is
-//! the very socket that conflicts.
+//! **Liveness is asked over the socket, not of the process table.** `pgrep -f`
+//! does not see the running daemon — see `is_daemon` for why — so a second
+//! tap starts a second one, which dies binding an already-bound port. `/health`
+//! cannot be wrong the same way, because it is the very socket that conflicts.
 //!
 //! The client here is hand-rolled rather than a crate. One `GET` over a local
 //! socket does not justify a dependency, and every dependency has to be pure
@@ -437,9 +437,9 @@ impl Hid {
         }
         // `/scan` only schedules the scan on the daemon's event loop; until it
         // actually begins there is no scan and no result, and the reply is an
-        // error. Reading that as "finished, nothing found" is what made a scan
-        // end about a second after it was asked for — before the radio had done
-        // anything at all.
+        // error. Reading that as "finished, nothing found" ends the scan about
+        // a second after it is asked for, before the radio has done anything at
+        // all.
         if field(&body, "ok") == Some("false".into()) {
             return Ok(Scan::Starting);
         }
@@ -608,13 +608,13 @@ fn is_daemon(pid: u32, base: &Path) -> bool {
 /// Kill every running copy of the daemon, by scanning `/proc` for its command
 /// line. Returns how many were signalled.
 ///
-/// **Matched on the install path, not on the program's name.** The name was
-/// tried, both here and as `pkill -f kindle-hid-passthrough` in the launcher,
-/// and matched nothing: the daemon runs as `dist/main.bin` from inside this
-/// extension, so the string "kindle-hid-passthrough" appears nowhere in its
-/// command line. That left a daemon answering on the API port that karyll could
-/// neither stop nor replace — so it never spawned its own, and never captured
-/// its log.
+/// **Matched on the install path, not on the program's name.** The daemon runs
+/// as `dist/main.bin` from inside this extension, so the string
+/// "kindle-hid-passthrough" appears nowhere in its command line and matching on
+/// it — here or as `pkill -f kindle-hid-passthrough` in the launcher — finds
+/// nothing. That leaves a daemon answering on the API port which karyll can
+/// neither stop nor replace, so it never spawns its own and never captures its
+/// log.
 /// End the daemon the way it knows how to be ended.
 ///
 /// **`SIGKILL` costs the next launch fifteen seconds.** To take the radio the
@@ -1004,7 +1004,7 @@ mod tests {
             "/mnt/us/extensions/karyll/hid/kindle-hid-passthrough --daemon",
             base
         ));
-        // The name-based match this replaced saw neither of the first form.
+        // Matching on the binary's name would see neither of the first form.
         assert!(
             !"/mnt/us/extensions/karyll/hid/dist/main.bin --daemon"
                 .contains("kindle-hid-passthrough")

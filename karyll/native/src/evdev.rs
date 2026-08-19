@@ -209,11 +209,11 @@ fn pick_keyboard(raw: &str) -> Option<String> {
 /// | `cyttsp5_mt` | `6608000 0` | **picked** |
 /// | `WacomDigitizer`, `stylus-custom` | `f000003` | rejected |
 ///
-/// This replaced a list of panel names — `pt_mt`, `cyttsp`, `zforce`, `atmel`,
-/// `focaltech`, `goodix` — which is the same mistake the accelerometer rule
-/// below already avoids: the controller varies across Kindles and the shape of
-/// the device does not. The list had no entry for `fts_ts`, so touch did not
-/// come up at all on the panel that ships it.
+/// **By capability, never by a list of panel names.** The controller varies
+/// across Kindles — `pt_mt`, `fts_ts` and `cyttsp5_mt` are three of them — and
+/// the shape of the device does not, so a name list silently leaves touch dead
+/// on the first panel it has no entry for. The accelerometer rule below is
+/// written the same way for the same reason.
 pub fn pick_touchscreen(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
@@ -781,8 +781,7 @@ B: ABS=6608000 0
 
         /// Axes arrive as separate events and only mean something together, so
         /// a report is latched at EV_SYN and never before. Reporting on a
-        /// partial set is the bug that made every touch land one position
-        /// behind.
+        /// partial set puts every touch one position behind.
         #[test]
         fn a_report_is_latched_whole_at_syn() {
             let mut stream = Vec::new();

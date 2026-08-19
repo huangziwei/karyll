@@ -3,6 +3,7 @@
 mod evdev;
 mod font;
 mod hid;
+mod hyphen;
 mod ime;
 mod keymap;
 mod lexicon;
@@ -185,7 +186,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let theme = render::Theme::at(read_size(), read_margin());
+    let theme = render::Theme::at(read_size(), read_margin()).breaking(read_rules());
 
     let orientation = read_orientation(accel.as_ref());
     let mut window = window::Window::open("karyll", orientation)?;
@@ -223,6 +224,7 @@ fn main() -> Result<()> {
         turns_itself: accel.is_some(),
         orientation_checked: std::time::Instant::now(),
         focus: read_focus(),
+        hyphenate: read_hyphenate(),
         enabled: read_languages(),
         announcing: false,
         chrome_hidden: false,
@@ -273,15 +275,14 @@ fn wait(fds: &[std::os::unix::io::RawFd], timeout_ms: i32) -> Result<Vec<bool>> 
         // **Any `revents`, not just `POLLIN`.** A Bluetooth keyboard's
         // `/dev/input/eventN` is destroyed the moment the link drops, and
         // the kernel reports that as `POLLHUP`/`POLLERR` — never as
-        // readable. Testing `POLLIN` alone meant the node was never read,
-        // so the read never failed, so the descriptor was never dropped and
-        // the search for a replacement never restarted: **the app went deaf
-        // for the rest of the session** and only a relaunch fixed it. That
-        // is one bug behind every symptom of it — reconnecting from Config,
-        // power-cycling the keyboard, forgetting and re-pairing, and even
-        // the first pairing of a session that had held a node before.
-        // Reporting the hangup lets the read fail, which is what the
-        // "lost — looking for another" path was always waiting for.
+        // readable. Testing `POLLIN` alone would never read the node, so the
+        // read would never fail, so the descriptor would never be dropped and
+        // the search for a replacement would never restart: **the app goes
+        // deaf for the rest of the session**, and nothing short of a relaunch
+        // reaches it — not reconnecting from Config, not power-cycling the
+        // keyboard, not forgetting and re-pairing. Reporting the hangup lets
+        // the read fail, which is what the "lost — looking for another" path
+        // waits for.
         return Ok(poll.iter().map(|p| p.revents != 0).collect());
     }
     let err = std::io::Error::last_os_error();
@@ -468,14 +469,12 @@ impl Language {
 ///   firmware.
 ///   The position code is the entire signal.
 /// * **The sensor reports transitions, not a stream.** It is quiet while the
-///   device is still and emits one event when it is turned. An earlier version
-///   of this warned "nothing for 10s — sensor may be powered down", which was
-///   built for a streaming sensor and would have cried wolf through every
-///   writing session. Silence here is the normal state.
-/// * **It emits a settling burst on power-up** — the same sequence appeared at
-///   the top of every session before the device had been touched. Those codes
-///   are real ones, so they cannot be filtered by value; they are harmless
-///   because turning to an orientation you are already in does nothing.
+///   device is still and emits one event when it is turned, so silence is the
+///   normal state and must not be reported as a fault.
+/// * **It emits a settling burst on power-up**, before the device has been
+///   touched. Those codes are real ones, so they cannot be filtered by value;
+///   they are harmless because turning to an orientation you are already in
+///   does nothing.
 ///
 /// What is left worth saying is an *unrecognised* code, which would mean this
 /// firmware encodes positions differently and the mapping in
@@ -655,6 +654,12 @@ struct Editor {
     /// iA Writer's signature, and the reason `window::QUIET` exists at all.
     /// Remembered across sessions, like the language and the last position.
     focus: bool,
+    /// Whether a word may be divided at the end of a line.
+    ///
+    /// Held here rather than on the theme, beside `focus` and for the same
+    /// reason: it decides what the page is drawn *with*, and the dictionary it
+    /// reaches for follows the language, which the theme knows nothing about.
+    hyphenate: bool,
     /// Which input sources `Ctrl+Space` cycles through, in `Language::ALL`'s
     /// order. Never empty — see [`read_languages`].
     enabled: Vec<Language>,
@@ -672,16 +677,15 @@ struct Editor {
     /// reach for it, in both normal and focus mode — its captures show a
     /// toolbar on a freshly opened document and none at all after typing.
     ///
-    /// **Never true without a keyboard.** An early device run left the app
-    /// unusable and inescapable with nothing paired, which is the reason the
-    /// touch UI exists at all; hiding the only way out when there is no other
-    /// way in would rebuild that trap. See [`Editor::strip_visible`].
+    /// **Never true without a keyboard.** With nothing paired the strip is the
+    /// only way out of the app, and the only way in; hiding it would leave a
+    /// writer with no control at all. See [`Editor::strip_visible`].
     chrome_hidden: bool,
     /// How far the page is scrolled down, in pixels.
     ///
-    /// **Kept, rather than derived from the cursor each paint.** Deriving it is
-    /// what made ordinary writing behave as half a focus mode: with nowhere to
-    /// remember the page's position, every paint had to place it from the
+    /// **Kept, rather than derived from the cursor each paint.** Deriving it
+    /// makes ordinary writing behave as half a focus mode: with nowhere to
+    /// remember the page's position, every paint has to place it from the
     /// cursor, and the only stable way to do that is to pin the cursor. Holding
     /// the offset is what lets the caret travel down the page while the text
     /// stays where it is.
@@ -1250,14 +1254,13 @@ impl Editor {
             };
         }
         let mut cells = match self.mode {
-            // **Three, in the left corner**, matching `sidle/native` and `steb`
-            // — a convention shared with the other apps on this device rather
-            // than an order invented here.
+            // **Three, in the left corner** — a convention shared with the
+            // other apps on this device rather than an order invented here.
             //
-            // Save came off with the status line that replaced it: a button
-            // that duplicates an autosave, next to nothing saying the autosave
-            // ran, was a redundant control paid for with an act of faith.
-            // `Ctrl`/`⌘`+`S` still works, because the habit costs nothing.
+            // No Save button: the status line says when the autosave ran, and a
+            // button duplicating it would be a redundant control paid for with
+            // an act of faith. `Ctrl`/`⌘`+`S` still works, because the habit
+            // costs nothing.
             //
             // The language button came off with UI-17's notice at the caret,
             // which names the source you land in for one keystroke. Without a
@@ -1652,7 +1655,8 @@ impl Editor {
             bottom,
         )
         .focused_on(self.focus_span(&chars))
-        .composing(preedit);
+        .composing(preedit)
+        .hyphenating(self.dictionary());
         let index = render::index_at_point(&page, &mut self.fonts, &frame, x as f32, y as f32);
         self.frame = Some(frame);
         // Back to document space: the caller is going to move the cursor with
@@ -2158,13 +2162,54 @@ impl Editor {
         self.reset_page(self.theme.body_px, percent)
     }
 
+    /// Set a stop to hang past the measure, or to push a character down.
+    ///
+    /// **The rule is kept either way** — a mark never opens a line — so this
+    /// chooses between two remedies rather than switching one on: push-out
+    /// sends the character before the mark down with it, and hanging sets the
+    /// mark in the margin and keeps the line whole.
+    fn set_hanging(&mut self, on: bool) -> Result<()> {
+        if self.theme.rules.hang == on {
+            return Ok(());
+        }
+        write_hanging(on);
+        let mut rules = self.theme.rules;
+        rules.hang = on;
+        self.theme = render::Theme::at(self.theme.body_px, self.theme.margin).breaking(rules);
+        eprintln!(
+            "page: {} punctuation",
+            if on { "hanging" } else { "push-out" }
+        );
+        // Every line below the first break can move, so there is no smaller
+        // rectangle to find.
+        self.frame = None;
+        self.paint()
+    }
+
+    /// Divide words at the end of a line, or leave every one whole.
+    ///
+    /// The dictionary is the firmware's and is read on first use, so the first
+    /// page after switching this on pays for building the automaton and every
+    /// page after it does not.
+    fn set_hyphenate(&mut self, on: bool) -> Result<()> {
+        if self.hyphenate == on {
+            return Ok(());
+        }
+        self.hyphenate = on;
+        write_hyphenate(on);
+        eprintln!("page: words {}", if on { "divided" } else { "left whole" });
+        // Every row from the first divided word down can move.
+        self.frame = None;
+        self.paint()
+    }
+
     /// Lay the page out again at `px` and `percent`, and draw it.
     ///
     /// A full repaint, and it cannot be anything else: the column, the margin
     /// and the leading all move, so every line is somewhere new. The remembered
     /// frame describes a page that no longer exists.
     fn reset_page(&mut self, px: f32, percent: u16) -> Result<()> {
-        self.theme = render::Theme::at(px, percent);
+        self.theme = render::Theme::at(px, percent).breaking(self.theme.rules);
         eprintln!("page: {px} px, {percent}% margins");
         self.frame = None;
         self.paint()
@@ -2622,6 +2667,8 @@ impl Editor {
                     None => Ok(()),
                 };
             }
+            Some(ConfigRow::Hanging) => return self.set_hanging(option == 1),
+            Some(ConfigRow::Hyphenation) => return self.set_hyphenate(option == 1),
             // These paint themselves: each reports what the daemon said, and a
             // scan goes on repainting for the ten seconds it runs.
             Some(ConfigRow::Keyboard(actions)) => {
@@ -2856,6 +2903,34 @@ impl Editor {
             },
             ConfigRow::Margins,
         ));
+        // Third of the three that decide how the column reads, and last of them
+        // because it is the only one a writer can leave alone forever: the
+        // other two are the page, this is a preference about one mark.
+        let hang = self.theme.rules.hang;
+        items.push((
+            ui::Item::Choice {
+                label: "Hanging".into(),
+                options: vec!["Off".into(), "On".into()],
+                on: vec![!hang, hang],
+                inert: Vec::new(),
+            },
+            ConfigRow::Hanging,
+        ));
+        // Only where there is a dictionary to divide by. On Chinese or
+        // Japanese the row would be a control that does nothing, and offering
+        // one is worse than offering none.
+        if hyphen::load(self.language).is_some() {
+            let on = self.hyphenate;
+            items.push((
+                ui::Item::Choice {
+                    label: "Hyphenation".into(),
+                    options: vec!["Off".into(), "On".into()],
+                    on: vec![!on, on],
+                    inert: Vec::new(),
+                },
+                ConfigRow::Hyphenation,
+            ));
+        }
         items.extend(type_rows);
 
         // Only on a Kindle that has a colour panel to switch off, the same rule
@@ -3679,6 +3754,19 @@ impl Editor {
     /// disagree with the frame on screen about where every character after the
     /// cursor is. One buffer, one index space; [`Editor::document_index`] is
     /// the only way back.
+    /// Where words may be divided right now: the writer's setting, and the
+    /// dictionary for the source they are writing in.
+    ///
+    /// **Every `Page` asks here**, for the reason every one of them is built
+    /// from [`Editor::display`]: the frame on screen and the frame a hit test
+    /// reads have to divide words in the same places, or a tap lands on a
+    /// character the writer is not looking at.
+    fn dictionary(&self) -> Option<&'static karyll_core::Hyphenator> {
+        self.hyphenate
+            .then(|| hyphen::load(self.language))
+            .flatten()
+    }
+
     fn display(&self) -> (Vec<char>, Option<std::ops::Range<usize>>) {
         let mut chars = self.doc.chars();
         let composing = self.page_preedit();
@@ -4749,7 +4837,8 @@ impl Editor {
             bottom,
         )
         .focused_on(self.focus_span(&chars))
-        .composing(preedit);
+        .composing(preedit)
+        .hyphenating(self.dictionary());
         // Kept so page movement measures the same row the page is drawn with.
         // A document with Han in it has taller rows, and paging by Latin rows
         // in one would step past a line every screen.
@@ -4906,7 +4995,8 @@ impl Editor {
             bottom,
         )
         .focused_on(self.focus_span(&chars))
-        .composing(preedit);
+        .composing(preedit)
+        .hyphenating(self.dictionary());
         let from = self.display_cursor();
         if let Some((cursor, goal)) =
             render::move_vertical(&page, &mut self.fonts, &frame, from, delta, self.goal)
@@ -5485,6 +5575,41 @@ fn read_focus() -> bool {
 
 fn write_focus(on: bool) {
     let _ = std::fs::write(focus_file(), if on { "1" } else { "0" });
+}
+
+fn hanging_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/hanging")
+}
+
+/// The line-breaking rules the writer last chose.
+///
+/// Push-out unless the file says otherwise, which is the remedy that needs no
+/// explaining: a mark never leaves the column, and a line is a character
+/// shorter where one would have.
+fn read_rules() -> karyll_core::wrap::Rules {
+    karyll_core::wrap::Rules {
+        hang: std::fs::read_to_string(hanging_file()).is_ok_and(|s| s.trim() == "1"),
+    }
+}
+
+fn write_hanging(on: bool) {
+    let _ = std::fs::write(hanging_file(), if on { "1" } else { "0" });
+}
+
+fn hyphenate_file() -> PathBuf {
+    PathBuf::from("/mnt/us/extensions/karyll/var/hyphenate")
+}
+
+/// Whether words were being divided when the last session ended.
+///
+/// Off unless the file says otherwise: a division is a mark the writer did not
+/// type, and a page that has never been configured should show what was typed.
+fn read_hyphenate() -> bool {
+    std::fs::read_to_string(hyphenate_file()).is_ok_and(|s| s.trim() == "1")
+}
+
+fn write_hyphenate(on: bool) {
+    let _ = std::fs::write(hyphenate_file(), if on { "1" } else { "0" });
 }
 
 /// Say which node the keyboard is on, and whether anything but karyll can read
@@ -6299,6 +6424,10 @@ enum ConfigRow {
     Size,
     /// The margin chips, which are [`render::MARGINS`] in order.
     Margins,
+    /// Whether a stop hangs past the measure. Option 1 hangs.
+    Hanging,
+    /// Whether words are divided at the end of a line. Option 1 divides.
+    Hyphenation,
     /// One keyboard's chips, or the scan's.
     Keyboard(Vec<KeyAction>),
     /// Whether the Bluetooth stack outlives the editor. Option 1 keeps it.

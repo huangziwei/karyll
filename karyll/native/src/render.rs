@@ -119,6 +119,11 @@ pub struct Theme {
     pub leading: f32,
     /// Extra space above a heading, as a multiple of the body line height.
     pub heading_space: f32,
+    /// How the line may be broken, over the script rules that always apply.
+    ///
+    /// A page setting like the margin rather than a document one: it changes
+    /// where the same prose breaks and nothing about what the prose is.
+    pub rules: wrap::Rules,
 }
 
 impl Default for Theme {
@@ -146,7 +151,18 @@ impl Theme {
             margin_y: (160.0 * (body_px / DEFAULT_SIZE)) as u16,
             leading: if body_px >= DEFAULT_SIZE { 1.30 } else { 1.35 },
             heading_space: 0.75,
+            rules: wrap::Rules::default(),
         }
+    }
+
+    /// The same page with `rules` over its line breaking.
+    ///
+    /// Separate from [`Theme::at`] because the two are set independently and
+    /// remembered separately: a size or a margin changed from the panel must
+    /// not quietly take the breaking back to its default.
+    pub fn breaking(mut self, rules: wrap::Rules) -> Self {
+        self.rules = rules;
+        self
     }
 }
 
@@ -361,6 +377,12 @@ pub struct Page<'a> {
     /// Text being composed by the IME, drawn underlined because it is not yet
     /// part of the document.
     pub underline: Option<std::ops::Range<usize>>,
+    /// Where words may be divided, or `None` where they may not be.
+    ///
+    /// `None` is the setting switched off, a language that does not hyphenate,
+    /// and a device without the firmware's dictionaries — three states that
+    /// draw identically and have no reason to be told apart here.
+    pub hyphen: Option<&'a karyll_core::Hyphenator>,
 }
 
 impl<'a> Page<'a> {
@@ -382,7 +404,14 @@ impl<'a> Page<'a> {
             roles: roles_in(chars, markup),
             focus: None,
             underline: None,
+            hyphen: None,
         }
+    }
+
+    /// Divide words with `hyphen`. `None` leaves every word whole.
+    pub fn hyphenating(mut self, hyphen: Option<&'a karyll_core::Hyphenator>) -> Self {
+        self.hyphen = hyphen;
+        self
     }
 
     /// Set everything back but `span`. `None` switches focus mode off.
@@ -397,6 +426,14 @@ impl<'a> Page<'a> {
         self
     }
 
+    /// The face character `at` is drawn in, on a line of this page.
+    fn roles_at(&self, line: &VisualLine, at: usize) -> Option<Role> {
+        let entry = self.markup.get(line.markup)?;
+        roles_for_line(entry, self.chars)
+            .get(at.checked_sub(entry.range.start)?)
+            .copied()
+    }
+
     /// Left edge of a block's text, past any hanging indent.
     fn origin(&self, block: Block) -> f32 {
         (self.left + block_indent(self.theme, block)) as f32
@@ -407,6 +444,13 @@ impl<'a> Page<'a> {
 pub struct VisualLine {
     /// Character range into the document.
     pub range: std::ops::Range<usize>,
+    /// True when the line ended inside a word, so a [`wrap::HYPHEN`] is drawn
+    /// after its last character.
+    ///
+    /// **The mark is not in `range` and is not in the document.** It is ink
+    /// past the end of the line, which is what lets every index below — the
+    /// caret, a selection, a hit test — stay in the buffer's own index space.
+    pub hyphenated: bool,
     /// Index of the logical line this came from, so drawing can reach its
     /// styles without searching for the entry that contains it.
     pub markup: usize,
@@ -521,10 +565,21 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
         // `wrap` indexes the slice it is given, so `roles` — built over the
         // same line — is indexed the same way.
         let text = &page.chars[line.range.clone()];
-        let broken = wrap::wrap(text, width, |i, c| {
-            let role = roles.get(i).copied().unwrap_or(Role::Body);
-            fonts.advance(role, px, c).ceil() as u32
-        });
+        let broken = wrap::wrap_with(
+            text,
+            width,
+            theme.rules,
+            |i, c| {
+                let role = roles.get(i).copied().unwrap_or(Role::Body);
+                fonts.advance(role, px, c).ceil() as u32
+            },
+            // Asked once per wrapped row, for the one word the overflow landed
+            // inside, rather than once per word of the document.
+            |word| match page.hyphen {
+                Some(dictionary) => dictionary.breaks_in(&text[word]),
+                None => Vec::new(),
+            },
+        );
 
         for vl in broken {
             let range = base + vl.range.start..base + vl.range.end;
@@ -532,6 +587,7 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
             let underline = span_within(&page.underline, &range);
             out.push(VisualLine {
                 range,
+                hyphenated: vl.hyphenated,
                 markup: index,
                 block: line.block,
                 y,
@@ -983,6 +1039,15 @@ fn run_rect(
     }
     let left = pen_at(page, fonts, line, start)?;
     let mut right = pen_at(page, fonts, line, end)?;
+    // A division mark is drawn past the last character, so a run that reaches
+    // the end of a divided row has to reach over it as well — otherwise the
+    // mark is the one glyph left unlit in the middle of a selection.
+    if line.hyphenated && end == line.range.end {
+        let role = page
+            .roles_at(line, end.saturating_sub(1))
+            .unwrap_or(Role::Body);
+        right += fonts.advance(role, line.px, wrap::HYPHEN);
+    }
     if nub && run.end > line.range.end {
         right += fonts.advance(Role::Body, line.px, ' ');
     }
@@ -1082,6 +1147,7 @@ impl Frame {
             && old.block == line.block
             && old.focus == line.focus
             && old.underline == line.underline
+            && old.hyphenated == line.hyphenated
             && self.chars.get(old.range.clone()) == chars.get(line.range.clone())
     }
 }
@@ -1307,6 +1373,11 @@ pub fn paint(
         // hold two struck phrases with prose between them, and one span from
         // the first to the last would rule through the prose.
         let mut struck: Option<(f32, f32)> = None;
+        // The face and the ink of the last character drawn, so a division mark
+        // is set in the same ones. Collected as the pen passes rather than
+        // worked out again afterwards, for the reason the rules above are: it
+        // has to match the glyph it follows, whatever decided that glyph.
+        let mut tail: Option<(Role, u8)> = None;
 
         for i in line.range.clone() {
             let at = i - entry.range.start;
@@ -1342,6 +1413,7 @@ pub fn paint(
                 window.put_pixel(x as u16, y as u16, ink);
             });
             pen += advance;
+            tail = Some((role, ink));
             if line.underline.contains(&(i - line.range.start)) {
                 let (from, _) = rule.unwrap_or((origin_x, origin_x));
                 rule = Some((from, pen));
@@ -1352,6 +1424,26 @@ pub fn paint(
             } else if let Some((from, to)) = struck.take() {
                 strikethrough(window, line, from, to);
             }
+        }
+        // **Past the end of the line, and past the measure with it.** The
+        // margin is at least 8 per cent of the surface, wider than any glyph
+        // on the size ladder, so there is room; `put_pixel` clips at the
+        // surface edge whatever happens.
+        if line.hyphenated
+            && let Some((role, ink)) = tail
+        {
+            let origin_x = pen;
+            fonts.draw(role, line.px, wrap::HYPHEN, |gx, gy, coverage| {
+                if coverage <= 0.5 {
+                    return;
+                }
+                let x = origin_x as i32 + gx;
+                let y = baseline as i32 + gy;
+                if x < 0 || y < 0 {
+                    return;
+                }
+                window.put_pixel(x as u16, y as u16, ink);
+            });
         }
         if let Some((from, to)) = rule {
             underline(window, line, from, to);
@@ -1811,6 +1903,7 @@ mod tests {
         let focus = 0..range.end - range.start;
         VisualLine {
             range,
+            hyphenated: false,
             markup: 0,
             block: Block::Paragraph,
             y,
@@ -1965,6 +2058,76 @@ mod tests {
         assert!(line.baseline <= line.inset + glyph_box);
     }
 
+    /// A stand-in dictionary that divides one word, so that the wiring from
+    /// `wrap` through `layout` to the mark on the row can be tested without
+    /// the firmware's files.
+    fn dividing() -> karyll_core::Hyphenator {
+        karyll_core::Hyphenator::from_patterns("UTF-8\nLEFTHYPHENMIN 2\nRIGHTHYPHENMIN 2\nn1a\n")
+            .expect("a dictionary of one pattern")
+    }
+
+    #[test]
+    fn a_divided_row_says_so_and_an_undivided_one_does_not() {
+        let theme = Theme::default();
+        let chars: Vec<char> = "the hyphenation".chars().collect();
+        let markup = karyll_core::markdown::analyze(&chars);
+        let dictionary = dividing();
+
+        // Wide enough for the whole line: nothing is divided.
+        let page =
+            Page::new(&chars, &markup, &theme, (1860, 2480), 2360).hyphenating(Some(&dictionary));
+        let lines = layout(&page, &mut Stub, 0);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].hyphenated);
+
+        // Narrow enough to break inside the word — `Stub` gives every glyph
+        // ten units, so this is eleven characters to the line — and the
+        // dictionary allows a division there, so the row carries the mark.
+        let narrow = Theme::at(DEFAULT_SIZE, 22);
+        let page =
+            Page::new(&chars, &markup, &narrow, (200, 2480), 2360).hyphenating(Some(&dictionary));
+        let lines = layout(&page, &mut Stub, 0);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].hyphenated, "the first row was not divided");
+        assert_eq!(
+            chars[lines[0].range.clone()].iter().collect::<String>(),
+            "the hyphen"
+        );
+        assert!(!lines[1].hyphenated, "the last row took a mark");
+
+        // The same page with no dictionary divides nothing, and the rows still
+        // tile the text either way.
+        let plain = Page::new(&chars, &markup, &narrow, (200, 2480), 2360);
+        let plain_lines = layout(&plain, &mut Stub, 0);
+        assert!(plain_lines.iter().all(|l| !l.hyphenated));
+        for set in [&lines, &plain_lines] {
+            let mut cursor = 0usize;
+            for l in set.iter() {
+                assert_eq!(l.range.start, cursor);
+                cursor = l.range.end;
+            }
+            assert_eq!(cursor, chars.len());
+        }
+    }
+
+    /// A row that gains or loses its mark has changed, even where its
+    /// characters and its geometry have not.
+    #[test]
+    fn a_row_that_gains_a_division_is_not_unchanged() {
+        let chars: Vec<char> = "hyphenation".chars().collect();
+        let mut row = line(0..11, 0);
+        let frame = Frame {
+            chars: chars.clone(),
+            lines: vec![line(0..11, 0)],
+            caret: None,
+            selection: None,
+            candidates: None,
+        };
+        assert!(frame.unchanged(0, &chars, &row));
+        row.hyphenated = true;
+        assert!(!frame.unchanged(0, &chars, &row));
+    }
+
     #[test]
     fn the_caret_stands_where_the_text_does() {
         let theme = Theme::default();
@@ -2061,6 +2224,7 @@ mod tests {
         let focus = 0..range.end - range.start;
         VisualLine {
             range,
+            hyphenated: false,
             markup,
             block: Block::Paragraph,
             y,
