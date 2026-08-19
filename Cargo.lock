@@ -52,11 +52,11 @@ dependencies = [
 
 [[package]]
 name = "karyll-core"
-version = "0.2.2"
+version = "0.2.3"
 
 [[package]]
 name = "karyll-native"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ab_glyph",
  "anyhow",
