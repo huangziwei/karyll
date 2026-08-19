@@ -17,6 +17,12 @@
 //! caller asks for, and as the last resort when a line holds no legal break at
 //! all and push-out has nowhere to go.
 //!
+//! Line breaking is not all of it. Mixed Japanese and Chinese prose also takes
+//! a quarter em between a Han character and Latin beside it — 四分アキ, which
+//! [`aki`] decides and [`Rules::aki`] gives a width to. It is charged here
+//! rather than by the caller because it is space *between* two characters, and
+//! space between two characters vanishes when a line breaks there.
+//!
 //! This is a deliberately small subset of UAX #14 — the part that matters for
 //! prose. Widths come from a caller-supplied measure function so that nothing
 //! here depends on a font.
@@ -110,6 +116,28 @@ pub fn can_break_between(a: char, b: char) -> bool {
     }
 }
 
+/// Whether a quarter em belongs between `a` and the `b` that follows it.
+///
+/// **四分アキ** (JLREQ §3.2). Japanese and Chinese setting puts a quarter of an
+/// em between a Han or kana character and Latin letters or digits beside it, in
+/// either order. Without it `karyllはRustで書いた` runs the two scripts together
+/// at a boundary a reader of either one expects to see marked, and a CJK reader
+/// reads its absence as an error rather than as a style.
+///
+/// **Letters and digits only on the Latin side.** [`Class::Other`] is
+/// everything that is not CJK or punctuation, so it holds `*`, `#` and `~` as
+/// well as words — and a gap opened between `*` and 世 would push the emphasis
+/// marker off the character it marks.
+///
+/// **Nothing against punctuation on either side.** A mark carries its own
+/// sidebearing inside its em box, and a quarter em on top of that reads as two
+/// spaces rather than as one.
+pub fn aki(a: char, b: char) -> bool {
+    let han = |c| classify(c) == Class::Ideograph;
+    let latin = |c: char| classify(c) == Class::Other && c.is_alphanumeric();
+    han(a) && latin(b) || latin(a) && han(b)
+}
+
 /// The mark a word broken across two lines takes.
 ///
 /// Never a character of the document: it is drawn past the end of the line, and
@@ -130,13 +158,19 @@ pub struct Line {
     pub hyphenated: bool,
 }
 
-/// How a line may be broken, beyond the script rules that always apply.
+/// How a line is set, beyond the script rules that always apply.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rules {
     /// Whether a stop is set past the measure rather than pushing the character
     /// before it onto the next line. See [`hangable`] for which marks this
     /// covers, and the module note for why it is off by default.
     pub hang: bool,
+    /// The width of 四分アキ, in the same unit as `max_width`. Zero sets none.
+    ///
+    /// A width rather than a flag because a quarter em is a quarter of *this
+    /// line's* em: a heading takes a wider one than the body it heads, and
+    /// nothing here knows a type size. See [`aki`] for where it is set.
+    pub aki: u32,
 }
 
 /// Break `chars` into lines no wider than `max_width`.
@@ -154,7 +188,7 @@ pub fn wrap(chars: &[char], max_width: u32, measure: impl FnMut(usize, char) -> 
 }
 
 /// Break `chars` into lines, with `rules` over the script rules that always
-/// apply. [`wrap`] is this with nothing asked for.
+/// apply. [`wrap()`] is this with nothing asked for.
 ///
 /// `hyphenate(word)` is asked where a word may be divided, and answers with
 /// character offsets **within** the range it was given. It is consulted only
@@ -196,7 +230,15 @@ pub fn wrap_with(
         }
 
         let w = measure(i, c);
-        if width + w > max_width && i > start {
+        // Space set before this character, and none at the start of a line:
+        // 四分アキ sits between two characters, so a break at that boundary
+        // takes it away with the boundary.
+        let g = if i > start {
+            space(chars, rules, start, i)
+        } else {
+            0
+        };
+        if width + g + w > max_width && i > start {
             // The last position on this line a break is allowed at, if any.
             // An opportunity is never recorded before a closing mark, so one
             // that exists is always safe to take.
@@ -204,7 +246,15 @@ pub fn wrap_with(
 
             // A division inside the word that overflowed, where the dictionary
             // allows one and the mark still fits on the line.
-            let soft = soft_break(chars, start, i, max_width, &mut measure, &mut hyphenate);
+            let soft = soft_break(
+                chars,
+                rules,
+                start,
+                i,
+                max_width,
+                &mut measure,
+                &mut hyphenate,
+            );
 
             // **The division wins by being later**, which inside the
             // overflowing word it always is: the last space on the line is
@@ -246,11 +296,13 @@ pub fn wrap_with(
                 opportunity = None;
                 hung = false;
                 // Re-measure the tail that moved onto the new line.
-                width = (start..i).map(|j| measure(j, chars[j])).sum();
+                width = (start..i)
+                    .map(|j| measure(j, chars[j]) + space(chars, rules, start, j))
+                    .sum();
             }
         }
 
-        width += w;
+        width += g + w;
         if i + 1 < chars.len() && can_break_between(c, chars[i + 1]) {
             opportunity = Some(i + 1);
         }
@@ -263,6 +315,20 @@ pub fn wrap_with(
         hyphenated: false,
     });
     lines
+}
+
+/// The space set before character `at` on a line that began at `start`.
+///
+/// Zero at the line's own start, so a row that happens to begin at a script
+/// boundary is not indented by a quarter em past the flush edge.
+fn space(chars: &[char], rules: Rules, start: usize, at: usize) -> u32 {
+    if at <= start || rules.aki == 0 {
+        return 0;
+    }
+    match (chars.get(at - 1), chars.get(at)) {
+        (Some(&a), Some(&b)) if aki(a, b) => rules.aki,
+        _ => 0,
+    }
 }
 
 /// Whether `c` is a letter of a script that divides words rather than
@@ -300,6 +366,7 @@ fn word_around(chars: &[char], at: usize) -> Option<Range<usize>> {
 /// follows, so a division inside a bold word takes a bold hyphen.
 fn soft_break(
     chars: &[char],
+    rules: Rules,
     start: usize,
     over: usize,
     max_width: u32,
@@ -322,7 +389,7 @@ fn soft_break(
             break;
         }
         while cursor < at {
-            upto += measure(cursor, chars[cursor]);
+            upto += measure(cursor, chars[cursor]) + space(chars, rules, start, cursor);
             cursor += 1;
         }
         if upto + measure(at - 1, HYPHEN) <= max_width {
@@ -360,7 +427,7 @@ mod tests {
             .collect()
     }
 
-    const HANG: Rules = Rules { hang: true };
+    const HANG: Rules = Rules { hang: true, aki: 0 };
 
     /// A stand-in dictionary: the words it knows against the character offsets
     /// it divides them at. Anything else it divides nowhere, which is what a
@@ -696,5 +763,64 @@ mod tests {
         assert!(!can_break_between('「', '你'));
         assert!(can_break_between('你', '好'));
         assert!(!can_break_between('h', 'i'));
+    }
+
+    /// **Both ways round, letters and digits, and nothing else.** The pairs
+    /// that must *not* open a gap are the point: markup characters sit against
+    /// the Han they mark, and punctuation already has a sidebearing.
+    #[test]
+    fn a_quarter_em_goes_between_han_and_latin_and_nowhere_else() {
+        assert!(aki('は', 'R'));
+        assert!(aki('第', '3'));
+        assert!(aki('t', '世'));
+        assert!(aki('7', '月'));
+        assert!(!aki('世', '界'), "two Han characters");
+        assert!(!aki('h', 'i'), "two Latin letters");
+        assert!(!aki('*', '世'), "an emphasis marker is not a word");
+        assert!(!aki('世', '*'));
+        assert!(!aki('世', '。'), "a stop carries its own sidebearing");
+        assert!(!aki('」', 'a'));
+        assert!(!aki('世', ' '), "a space is already a space");
+    }
+
+    /// A width set on the line, not on either character: the same eleven
+    /// characters fit without it and do not with it.
+    #[test]
+    fn the_quarter_em_takes_room_on_the_line() {
+        let spaced = Rules {
+            hang: false,
+            aki: 1,
+        };
+        // `世界 abc` measures 2 + 2 + 3 = 7 units, and one boundary.
+        assert_eq!(hung("世界abc", 7, Rules::default()), ["世界abc"]);
+        assert_eq!(hung("世界abc", 7, spaced), ["世界", "abc"]);
+    }
+
+    /// **The gap goes away with the boundary.** A row that begins at a script
+    /// boundary must start flush, or the quarter em becomes an indent on the
+    /// one line the reader is most likely to notice it on.
+    #[test]
+    fn a_row_beginning_at_the_boundary_is_not_indented_by_the_gap() {
+        let spaced = Rules {
+            hang: false,
+            aki: 1,
+        };
+        // Six units of room: `世界` and then `abcdef`, which exactly fills a
+        // line only if the gap it broke at is not charged to it.
+        assert_eq!(hung("世界abcdef", 6, spaced), ["世界", "abcdef"]);
+    }
+
+    #[test]
+    fn spacing_still_tiles_the_input() {
+        let text = "karyllはRustで書いた, 第3章まで";
+        let chars: Vec<char> = text.chars().collect();
+        let rules = Rules { hang: true, aki: 1 };
+        let lines = wrap_with(&chars, 9, rules, |_, c| measure(c), |_| Vec::new());
+        let mut cursor = 0usize;
+        for l in &lines {
+            assert_eq!(l.range.start, cursor, "gap or overlap at {l:?}");
+            cursor = l.range.end;
+        }
+        assert_eq!(cursor, chars.len());
     }
 }

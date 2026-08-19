@@ -635,8 +635,9 @@ impl Hyphenator {
 
     /// Character offsets within `word` at which it may be broken, ascending.
     ///
-    /// The unit the wrapper works in — [`crate::wrap`] indexes characters, and
-    /// a byte offset would have to be converted at every call site.
+    /// The unit the wrapper works in — [`crate::wrap::wrap_with`] indexes
+    /// characters, and a byte offset would have to be converted at every call
+    /// site.
     pub fn breaks_in(&self, word: &[char]) -> Vec<usize> {
         let text: String = word.iter().collect();
         let mut at = self.hyphenate(&text).into_iter().peekable();

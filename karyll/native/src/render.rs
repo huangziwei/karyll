@@ -5,9 +5,8 @@
 //! partial waveform is two-level and an antialiased glyph comes out muddy.
 //!
 //! Syntax marks are drawn in a **flat grey** ([`crate::window::QUIET`]) rather
-//! than black. They were dithered, on the theory that a checkerboard at ~300 ppi
-//! would read as grey; the first device screenshot showed that it does not, for
-//! the reason recorded on that constant.
+//! than black, and never as a dither — see that constant for why a checkerboard
+//! does not read as grey on this panel.
 //!
 //! A selected run inverts — filled black, glyphs drawn white — which is what
 //! one bit has instead of a tint.
@@ -18,6 +17,13 @@
 //! これ with dots and *difficult* in a real italic. The dot is drawn here
 //! rather than taken from a face: the firmware faces carry no sesame glyph, and
 //! a filled dot is the most legible thing a one-bit panel can put on a page.
+//!
+//! **Every block starts its prose on one vertical line.** A `#`, a `>` or a
+//! `- ` is set right-aligned to end on that edge and reaches back into the
+//! *margin*, never into the text column — so the column keeps its full measure,
+//! nothing reflows when a marker is typed, and a wrapped list item continues
+//! under its own first word. See [`Marker`] and [`Lead`] for the three forms a
+//! marker takes and what decides between them.
 //!
 //! Layout runs per logical line. Each one is wrapped with real advances from
 //! the faces that will actually draw it, so the measuring pass and the drawing
@@ -111,7 +117,7 @@ pub struct Theme {
     ///
     /// The column is what is left in the middle, centred rather than
     /// full-bleed: long lines are harder to read and there is no reason to use
-    /// the full 1860 px. [`column`] resolves this against the surface being
+    /// the full 1860 px. [`column()`] resolves this against the surface being
     /// drawn on.
     pub margin: u16,
     pub margin_y: u16,
@@ -338,11 +344,157 @@ pub fn edge_at(theme: &Theme, width: u16, bottom: u16, x: u16, y: u16) -> Option
     None
 }
 
-/// Left inset for a block, so lists and quotes hang.
-pub fn block_indent(theme: &Theme, block: Block) -> u16 {
-    match block {
-        Block::Quote | Block::ListItem { .. } | Block::Task { .. } => (theme.body_px * 0.9) as u16,
-        _ => 0,
+/// 四分アキ at a type size: a quarter of the em, to the pixel.
+///
+/// Whole pixels because [`wrap::wrap_with`] measures the line in them while the
+/// pen draws in `f32`. A fractional quarter would put the two a fraction apart
+/// at every script boundary, and a line of mixed prose has many.
+fn aki_px(px: f32) -> f32 {
+    (px / 4.0).round()
+}
+
+/// How a row's block marker is set.
+///
+/// **The pen snaps to the prose edge where the marker ends**, whichever of
+/// these the row is — which is what makes the flush edge exact rather than
+/// nearly exact. Walking the marker forward and hoping to land on the edge
+/// leaves a fraction of a pixel behind at every size, and a fraction either
+/// side of a pixel boundary is a heading a pixel out from the paragraph under
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Marker {
+    /// The row has none: a paragraph, a blank, or a continuation row.
+    None,
+    /// Its own characters, `chars` of them, drawn from `from` and ending on
+    /// the prose edge.
+    Set { chars: usize, from: f32 },
+    /// `#N` in place of hashes the margin will not take.
+    ///
+    /// **The one place on the page where a character is not a glyph.** The
+    /// row's first `chars` characters are `###### `; two glyphs and a space
+    /// stand for them, and the characters themselves take no width — so a
+    /// caret anywhere inside the marker draws on the prose edge, and the
+    /// marker holds still while hashes are typed or deleted.
+    ///
+    /// Compact rather than truncated because truncation lies: `######` with its
+    /// left clipped away reads as a shallower heading, which is a *wrong*
+    /// reading rather than a degraded one. `#6` clipped loses a corner of the
+    /// `#` and keeps the digit, which is the marker's rightmost glyph, so the
+    /// level survives.
+    Compact { chars: usize, level: u8 },
+}
+
+impl Marker {
+    /// How many characters at the head of the row the marker covers.
+    fn chars(self) -> usize {
+        match self {
+            Marker::None => 0,
+            Marker::Set { chars, .. } | Marker::Compact { chars, .. } => chars,
+        }
+    }
+
+    /// Where the row's pen starts.
+    fn pen(self, prose: f32) -> f32 {
+        match self {
+            Marker::Set { from, .. } => from,
+            _ => prose,
+        }
+    }
+}
+
+/// The glyphs a compact marker is drawn with: `#`, the level, and the space
+/// that holds it off the prose.
+fn compact_glyphs(level: u8) -> [char; 3] {
+    ['#', (b'0' + level.min(9)) as char, ' ']
+}
+
+fn compact_width(fonts: &mut impl Metrics, role: Role, px: f32, level: u8) -> f32 {
+    compact_glyphs(level)
+        .into_iter()
+        .map(|c| fonts.advance(role, px, c))
+        .sum()
+}
+
+/// Where a logical line's prose starts, and how its marker gets out of the way.
+///
+/// **The gutter comes out of the margin, never out of the text column.** Prose
+/// is flush at the column's left edge on every block; the marker is
+/// right-aligned to end there and reaches back into the margin. So `left` never
+/// moves, nothing reflows when a `#` is typed, and every block on the page —
+/// paragraph, heading, quote, list — shares one vertical line.
+struct Lead {
+    /// Left edge of the prose, on every row of the line.
+    prose: f32,
+    /// What the prose has left to wrap in.
+    width: u32,
+    /// How the first row sets the marker. Every row after it has none.
+    marker: Marker,
+}
+
+/// How `entry`'s marker is set against the margin this page actually has.
+///
+/// Three answers, in order of preference: hung in the margin; set as `#N` where
+/// the hashes will not fit; and set inside the column where neither is possible
+/// — which is a marker whose own characters would be clipped into a different
+/// marker, `1. ` losing its digit at the largest sizes on the smallest panel.
+/// That row alone gives up the flush edge, and its continuations still hang
+/// under its prose.
+fn lead_of(
+    page: &Page,
+    fonts: &mut impl Metrics,
+    entry: &LineMarkup,
+    roles: &[Role],
+    px: f32,
+) -> Lead {
+    let left = page.left as f32;
+    let chars = entry.marker();
+    let column = |prose: f32| (page.measure as f32 - (prose - left)).max(0.0) as u32;
+    if chars == 0 {
+        return Lead {
+            prose: left,
+            width: column(left),
+            marker: Marker::None,
+        };
+    }
+    let text = &page.chars[entry.range.clone()];
+    let mut advance = |at: usize| {
+        let role = roles.get(at).copied().unwrap_or(Role::Body);
+        fonts.advance(role, px, text[at])
+    };
+    // A nested item keeps its own indent inside the column, so nesting still
+    // shows; only the marker itself hangs.
+    let indent: f32 = (0..chars)
+        .take_while(|&at| text[at] == ' ')
+        .map(&mut advance)
+        .sum();
+    let full: f32 = (0..chars).map(&mut advance).sum();
+    let prose = left + indent;
+
+    if prose - full >= 0.0 {
+        return Lead {
+            prose,
+            width: column(prose),
+            marker: Marker::Set {
+                chars,
+                from: prose - full,
+            },
+        };
+    }
+    // Hashes the margin will not take. h1 is never compacted: `#` is one glyph
+    // where `#1` is two, so it would swap a narrower marker for a wider one.
+    if let Block::Heading(level) = entry.block
+        && level >= 2
+    {
+        return Lead {
+            prose,
+            width: column(prose),
+            marker: Marker::Compact { chars, level },
+        };
+    }
+    Lead {
+        prose: left + full,
+        width: column(left + full),
+        marker: Marker::Set { chars, from: left },
     }
 }
 
@@ -433,10 +585,42 @@ impl<'a> Page<'a> {
             .get(at.checked_sub(entry.range.start)?)
             .copied()
     }
+}
 
-    /// Left edge of a block's text, past any hanging indent.
-    fn origin(&self, block: Block) -> f32 {
-        (self.left + block_indent(self.theme, block)) as f32
+/// Whether character `at` is one a compact marker stands for, so it is neither
+/// drawn nor advanced past.
+fn hidden(line: &VisualLine, at: usize) -> bool {
+    matches!(line.marker, Marker::Compact { chars, .. } if at < line.range.start + chars)
+}
+
+/// Where the row's pen sits before character `at` is drawn, given where it sat
+/// after the one before.
+///
+/// **The snap is the whole of the flush edge.** At the end of the marker the
+/// pen takes the prose edge outright rather than whatever the marker's advances
+/// added up to, so a heading, a bullet and a paragraph begin on one line to the
+/// pixel — and a marker may be any width at all, including two glyphs standing
+/// for seven characters.
+fn advanced(line: &VisualLine, at: usize, pen: f32) -> f32 {
+    if at == line.range.start + line.marker.chars() {
+        line.prose
+    } else {
+        pen
+    }
+}
+
+/// The space set before character `at` on `line`.
+///
+/// Zero at the row's own start: 四分アキ sits between two characters, and a gap
+/// where a row begins would indent it a quarter em past the flush edge — on the
+/// one line a reader is most likely to see it on.
+fn gap_before(page: &Page, line: &VisualLine, at: usize) -> f32 {
+    if at <= line.range.start {
+        return 0.0;
+    }
+    match (page.chars.get(at - 1), page.chars.get(at)) {
+        (Some(&a), Some(&b)) if wrap::aki(a, b) => aki_px(line.px),
+        _ => 0.0,
     }
 }
 
@@ -444,6 +628,14 @@ impl<'a> Page<'a> {
 pub struct VisualLine {
     /// Character range into the document.
     pub range: std::ops::Range<usize>,
+    /// Left edge of the row's prose, in window coordinates.
+    ///
+    /// **Per row rather than per block**, which is what lets a marker hang into
+    /// the margin while its own continuations line up under its prose. See
+    /// [`Lead`].
+    pub prose: f32,
+    /// How this row sets its block marker, if it has one.
+    pub marker: Marker,
     /// True when the line ended inside a word, so a [`wrap::HYPHEN`] is drawn
     /// after its last character.
     ///
@@ -557,36 +749,50 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
             y += (body_height * theme.heading_space) as i32;
         }
 
-        let indent = block_indent(theme, line.block);
-        let width = page.measure.saturating_sub(indent) as u32;
         let roles = roles_for_line(line, page.chars);
         let base = line.range.start;
+        let lead = lead_of(page, fonts, line, &roles, px);
 
-        // `wrap` indexes the slice it is given, so `roles` — built over the
-        // same line — is indexed the same way.
-        let text = &page.chars[line.range.clone()];
+        // **The marker is not wrapped with the prose.** It has already been
+        // given its own room by `lead_of`, and offering it to the wrapper as
+        // text would let a line break inside it and charge the column for
+        // width the margin is carrying.
+        let marker = lead.marker.chars();
+        let prose = &page.chars[base + marker..line.range.end];
+        // The quarter em is this block's own, so a heading sets a wider one
+        // than the body it heads.
+        let rules = wrap::Rules {
+            aki: aki_px(px) as u32,
+            ..theme.rules
+        };
         let broken = wrap::wrap_with(
-            text,
-            width,
-            theme.rules,
+            prose,
+            lead.width,
+            rules,
             |i, c| {
-                let role = roles.get(i).copied().unwrap_or(Role::Body);
+                let role = roles.get(marker + i).copied().unwrap_or(Role::Body);
                 fonts.advance(role, px, c).ceil() as u32
             },
             // Asked once per wrapped row, for the one word the overflow landed
             // inside, rather than once per word of the document.
             |word| match page.hyphen {
-                Some(dictionary) => dictionary.breaks_in(&text[word]),
+                Some(dictionary) => dictionary.breaks_in(&prose[word]),
                 None => Vec::new(),
             },
         );
 
-        for vl in broken {
-            let range = base + vl.range.start..base + vl.range.end;
+        for (n, vl) in broken.into_iter().enumerate() {
+            // The marker belongs to the first row, which therefore starts where
+            // the logical line does rather than where its prose does.
+            let first = n == 0;
+            let from = if first { 0 } else { marker + vl.range.start };
+            let range = base + from..base + marker + vl.range.end;
             let focus = focus_within(&page.focus, &range);
             let underline = span_within(&page.underline, &range);
             out.push(VisualLine {
                 range,
+                prose: lead.prose,
+                marker: if first { lead.marker } else { Marker::None },
                 hyphenated: vl.hyphenated,
                 markup: index,
                 block: line.block,
@@ -713,7 +919,7 @@ fn line_of(lines: &[VisualLine], cursor: usize) -> Option<usize> {
 fn pen_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, cursor: usize) -> Option<f32> {
     let entry = page.markup.get(line.markup)?;
     let roles = roles_for_line(entry, page.chars);
-    let mut x = page.origin(line.block);
+    let mut x = line.marker.pen(line.prose);
     for (i, ch) in page
         .chars
         .iter()
@@ -721,13 +927,17 @@ fn pen_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, cursor: usiz
         .take(cursor)
         .skip(line.range.start)
     {
+        x = advanced(line, i, x);
+        if hidden(line, i) {
+            continue;
+        }
         let role = roles
             .get(i - entry.range.start)
             .copied()
             .unwrap_or(Role::Body);
-        x += fonts.advance(role, line.px, *ch);
+        x += gap_before(page, line, i) + fonts.advance(role, line.px, *ch);
     }
-    Some(x)
+    Some(advanced(line, cursor, x))
 }
 
 /// The character index on `line` nearest horizontal position `x`.
@@ -740,17 +950,28 @@ fn index_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, x: f32) ->
         return line.range.start;
     };
     let roles = roles_for_line(entry, page.chars);
-    let mut pen = page.origin(line.block);
+    let mut pen = line.marker.pen(line.prose);
     for i in line.range.clone() {
-        let role = roles
-            .get(i - entry.range.start)
-            .copied()
-            .unwrap_or(Role::Body);
-        let advance = fonts.advance(role, line.px, page.chars[i]);
-        if x < pen + advance / 2.0 {
+        pen = advanced(line, i, pen);
+        // A compact marker's characters take no width, so the whole of it
+        // answers at once: a point left of the prose edge lands at the head of
+        // the row, and one right of it lands in the prose.
+        let (gap, advance) = if hidden(line, i) {
+            (0.0, 0.0)
+        } else {
+            let role = roles
+                .get(i - entry.range.start)
+                .copied()
+                .unwrap_or(Role::Body);
+            (
+                gap_before(page, line, i),
+                fonts.advance(role, line.px, page.chars[i]),
+            )
+        };
+        if x < pen + gap + advance / 2.0 {
             return i;
         }
-        pen += advance;
+        pen += gap + advance;
     }
     line.range.end
 }
@@ -1037,8 +1258,20 @@ fn run_rect(
     if start >= end {
         return None;
     }
-    let left = pen_at(page, fonts, line, start)?;
+    let mut left = pen_at(page, fonts, line, start)?;
     let mut right = pen_at(page, fonts, line, end)?;
+    // A compact marker is glyphs the row's characters do not account for, drawn
+    // back from the prose edge. A run that reaches the head of the row has to
+    // reach over them, or an inverted heading leaves its own marker unlit.
+    if let Marker::Compact { level, .. } = line.marker
+        && start == line.range.start
+    {
+        let role = page.roles_at(line, start).unwrap_or(Role::Body);
+        // Clamped to the page, because the marker may itself be clipped there:
+        // an inversion that started off the left edge would carry the width it
+        // lost round to the right one and fill past the run.
+        left = (left - compact_width(fonts, role, line.px, level)).max(0.0);
+    }
     // A division mark is drawn past the last character, so a run that reaches
     // the end of a divided row has to reach over it as well — otherwise the
     // mark is the one glyph left unlit in the middle of a selection.
@@ -1148,6 +1381,8 @@ impl Frame {
             && old.focus == line.focus
             && old.underline == line.underline
             && old.hyphenated == line.hyphenated
+            && old.prose == line.prose
+            && old.marker == line.marker
             && self.chars.get(old.range.clone()) == chars.get(line.range.clone())
     }
 }
@@ -1364,8 +1599,37 @@ pub fn paint(
         let styles = styles_for_line(entry);
         let mark = Mark::on(fonts, &page.roles, line.px, marks_above);
 
-        let mut pen = page.origin(line.block);
+        let mut pen = line.marker.pen(line.prose);
         let baseline = (line.y + line.baseline) as f32;
+        // The compact marker first, right-aligned to end on the prose edge and
+        // reaching back into the margin. It may overrun the page's left edge at
+        // the largest sizes on the narrowest setting, and is left to clip
+        // there: `put_pixel` drops what falls off, and what it drops is the
+        // left of the `#` rather than the digit that carries the level.
+        if let Marker::Compact { level, .. } = line.marker {
+            let role = roles.first().copied().unwrap_or(Role::Body);
+            let inverted = selection
+                .as_ref()
+                .is_some_and(|s| s.contains(&line.range.start));
+            // A marker is syntax, so it is quiet unless the selection takes it.
+            let ink = ink(inverted, true);
+            let mut x = pen - compact_width(fonts, role, line.px, level);
+            for ch in compact_glyphs(level) {
+                let origin_x = x;
+                fonts.draw(role, line.px, ch, |gx, gy, coverage| {
+                    if coverage <= 0.5 {
+                        return;
+                    }
+                    let gx = origin_x as i32 + gx;
+                    let gy = baseline as i32 + gy;
+                    if gx < 0 || gy < 0 {
+                        return;
+                    }
+                    window.put_pixel(gx as u16, gy as u16, ink);
+                });
+                x += fonts.advance(role, line.px, ch);
+            }
+        }
         // Collected as the pen passes, rather than measured again afterwards:
         // the rule has to start and stop under the glyphs actually drawn.
         let mut rule: Option<(f32, f32)> = None;
@@ -1380,6 +1644,10 @@ pub fn paint(
         let mut tail: Option<(Role, u8)> = None;
 
         for i in line.range.clone() {
+            pen = advanced(line, i, pen);
+            if hidden(line, i) {
+                continue;
+            }
             let at = i - entry.range.start;
             let role = roles.get(at).copied().unwrap_or(Role::Body);
             let style = styles.get(at).copied().unwrap_or(Style::Text);
@@ -1392,6 +1660,7 @@ pub fn paint(
             let inverted = selection.as_ref().is_some_and(|s| s.contains(&i));
             let ink = ink(inverted, quiet);
 
+            pen += gap_before(page, line, i);
             let origin_x = pen;
             let advance = fonts.advance(role, line.px, ch);
             // Before the glyph rather than after it, so a mark can never be
@@ -1872,15 +2141,6 @@ mod tests {
     }
 
     #[test]
-    fn lists_and_quotes_hang_but_paragraphs_do_not() {
-        let theme = Theme::default();
-        assert!(block_indent(&theme, Block::Quote) > 0);
-        assert!(block_indent(&theme, Block::ListItem { ordered: true }) > 0);
-        assert_eq!(block_indent(&theme, Block::Paragraph), 0);
-        assert_eq!(block_indent(&theme, Block::Heading(1)), 0);
-    }
-
-    #[test]
     fn the_measure_leaves_margins_on_this_panel() {
         // 1860 px wide panel; a centred column with real margins either side.
         let (left, measure) = column(&Theme::default(), 1860);
@@ -1903,6 +2163,10 @@ mod tests {
         let focus = 0..range.end - range.start;
         VisualLine {
             range,
+            // The flush edge of a default page on this surface, which is where
+            // the pages built below put their prose.
+            prose: column(&Theme::default(), SURFACE.width).0 as f32,
+            marker: Marker::None,
             hyphenated: false,
             markup: 0,
             block: Block::Paragraph,
@@ -2224,6 +2488,8 @@ mod tests {
         let focus = 0..range.end - range.start;
         VisualLine {
             range,
+            prose: column(&Theme::default(), SURFACE.width).0 as f32,
+            marker: Marker::None,
             hyphenated: false,
             markup,
             block: Block::Paragraph,
@@ -2784,6 +3050,372 @@ mod tests {
             ];
             assert_eq!(selection_span(&rects), Some((100, 174)));
             assert_eq!(selection_span(&[]), None);
+        }
+    }
+
+    mod flush_edge {
+        use super::*;
+        use crate::font::Proportional;
+
+        /// Every panel this app runs on, both ways up.
+        const PANELS: [(u16, u16); 6] = [
+            (1860, 2480),
+            (2480, 1860),
+            (1272, 1696),
+            (1696, 1272),
+            (1264, 1680),
+            (1680, 1264),
+        ];
+
+        /// One of every block that carries a marker, and a paragraph to
+        /// measure them against. Long enough that every one of them wraps at
+        /// the larger sizes, so continuation rows are covered too.
+        const BLOCKS: &str = "\
+Plain prose here, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+# One heading, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+## Two heading, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+### Three heading, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+#### Four heading, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+##### Five heading, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+###### Six heading, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+> Quoted prose, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+- Bulleted prose, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+1. Numbered prose, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.
+- [ ] A task, long enough that it wraps on every panel this app runs on, at every margin it offers and every size on its ladder.";
+
+        /// Lay `text` out on a page and hand the result to `f`, which is the
+        /// only way to hold a [`Page`] and its lines at once — the page borrows
+        /// the document it was built from.
+        fn on_page<T>(
+            text: &str,
+            theme: &Theme,
+            surface: (u16, u16),
+            f: impl FnOnce(&Page, &[VisualLine], &mut Proportional) -> T,
+        ) -> T {
+            let chars: Vec<char> = text.chars().collect();
+            let markup = karyll_core::markdown::analyze(&chars);
+            let page = Page::new(&chars, &markup, theme, surface, surface.1);
+            let mut fonts = Proportional;
+            let lines = layout(&page, &mut fonts, 0);
+            f(&page, &lines, &mut fonts)
+        }
+
+        /// Where a row's prose begins: the first character past its own
+        /// marker, which a continuation row does not have.
+        fn prose_x(page: &Page, fonts: &mut Proportional, line: &VisualLine) -> f32 {
+            let at = (line.range.start + line.marker.chars()).min(line.range.end);
+            pen_at(page, fonts, line, at).unwrap()
+        }
+
+        /// **The claim of the whole section**: on a default page every block
+        /// starts its prose on one vertical line, markers and all.
+        #[test]
+        fn prose_from_every_block_starts_in_the_same_place() {
+            let theme = Theme::default();
+            on_page(BLOCKS, &theme, PANELS[0], |page, lines, fonts| {
+                for line in lines {
+                    assert_eq!(
+                        prose_x(page, fonts, line),
+                        page.left as f32,
+                        "{:?} does not start on the flush edge",
+                        page.markup[line.markup].block
+                    );
+                }
+            });
+        }
+
+        /// And on every panel, at every margin and every size — first rows and
+        /// continuations alike.
+        ///
+        /// The one exception is a marker the margin cannot take in any form,
+        /// which stays in the column: that logical line's prose is a marker's
+        /// width in from the flush edge, and its first row starts on the edge.
+        /// Every row of it still shares one prose edge, which is 1a.
+        #[test]
+        fn the_flush_edge_holds_across_every_panel_margin_and_size() {
+            for panel in PANELS {
+                for (margin, _) in MARGINS {
+                    for px in SIZES {
+                        let theme = Theme::at(px, margin);
+                        on_page(BLOCKS, &theme, panel, |page, lines, fonts| {
+                            let left = page.left as f32;
+                            let mut in_column = std::collections::HashSet::new();
+                            for line in lines {
+                                let where_ = format!(
+                                    "{:?} at {px} px on {panel:?}/{margin}%",
+                                    page.markup[line.markup].block
+                                );
+                                if line.marker.pen(line.prose) == left && line.prose != left {
+                                    in_column.insert(line.markup);
+                                }
+                                assert_eq!(
+                                    prose_x(page, fonts, line),
+                                    line.prose,
+                                    "{where_}: the row does not start on its own prose edge"
+                                );
+                                assert!(
+                                    line.prose == left || in_column.contains(&line.markup),
+                                    "{where_}: prose at {} against a flush edge of {left}",
+                                    line.prose
+                                );
+                            }
+                            assert!(
+                                lines.len() > page.markup.len(),
+                                "nothing wrapped, so no continuation row was checked"
+                            );
+                        });
+                    }
+                }
+            }
+        }
+
+        /// **1a: a wrapped item hangs under its own prose**, not under its
+        /// bullet. This is what makes a list of two-line items still read as a
+        /// list.
+        #[test]
+        fn a_wrapped_item_continues_under_its_prose() {
+            // A narrow column, so the item wraps.
+            let theme = Theme::at(80.0, MARGINS[2].0);
+            on_page(
+                "- Bulleted prose long enough to wrap onto a second row.",
+                &theme,
+                (1264, 1680),
+                |page, lines, fonts| {
+                    assert!(
+                        lines.len() > 1,
+                        "the item has to wrap for this to mean anything"
+                    );
+                    let first = prose_x(page, fonts, &lines[0]);
+                    for row in &lines[1..] {
+                        assert_eq!(
+                            pen_at(page, fonts, row, row.range.start).unwrap(),
+                            first,
+                            "a continuation row did not start under the prose"
+                        );
+                    }
+                },
+            );
+        }
+
+        /// **A nested item keeps its indent, and only its marker hangs.**
+        /// Hanging the indent along with the marker would put every level of a
+        /// list on the same edge, which is a list that has stopped saying what
+        /// is under what.
+        #[test]
+        fn nesting_still_shows_and_the_marker_still_hangs() {
+            let theme = Theme::default();
+            on_page(
+                "- Top\n  - Nested",
+                &theme,
+                PANELS[0],
+                |page, lines, fonts| {
+                    let top = prose_x(page, fonts, &lines[0]);
+                    let nested = prose_x(page, fonts, &lines[1]);
+                    assert_eq!(top, page.left as f32);
+                    assert!(nested > top, "the nested item lost its indent");
+                    // Both markers hang, so the gap between the two prose edges is
+                    // the indent itself and not the indent plus a bullet.
+                    let indent = 2.0 * Proportional.advance(Role::Body, DEFAULT_SIZE, ' ');
+                    assert_eq!(nested - top, indent);
+                },
+            );
+        }
+
+        /// The marker hangs into the margin: it is drawn left of the flush
+        /// edge, and it takes nothing off the measure the prose wraps in.
+        #[test]
+        fn a_marker_takes_its_room_from_the_margin_and_not_the_column() {
+            let theme = Theme::default();
+            let plain = on_page("Plain prose.", &theme, PANELS[0], |_, lines, _| {
+                lines[0].range.len()
+            });
+            on_page("> Plain prose.", &theme, PANELS[0], |page, lines, _| {
+                assert!(
+                    matches!(lines[0].marker, Marker::Set { from, .. } if from < page.left as f32),
+                    "the marker did not hang"
+                );
+                assert_eq!(
+                    lines[0].range.len(),
+                    plain + 2,
+                    "the quote wrapped in a narrower column than the paragraph"
+                );
+            });
+        }
+
+        /// Deep hashes set in full where the margin takes them and as `#N`
+        /// where it does not — and never on h1, whose `#` is one glyph where
+        /// `#1` would be two.
+        #[test]
+        fn deep_headings_compact_only_where_the_margin_is_too_narrow() {
+            let wide = Theme::at(42.0, MARGINS[2].0);
+            on_page("###### Six", &wide, PANELS[0], |_, lines, _| {
+                assert!(
+                    matches!(lines[0].marker, Marker::Set { .. }),
+                    "a wide margin takes the hashes"
+                );
+            });
+            let tight = Theme::at(80.0, MARGINS[0].0);
+            on_page("###### Six\n# One", &tight, (1264, 1680), |_, lines, _| {
+                assert_eq!(
+                    lines[0].marker,
+                    Marker::Compact { level: 6, chars: 7 },
+                    "a narrow margin should have set the level compactly"
+                );
+                assert!(
+                    matches!(lines[1].marker, Marker::Set { .. }),
+                    "h1 never compacts"
+                );
+            });
+        }
+
+        /// **The sequence a writer sees deleting hashes back to `###`.** The
+        /// caret does not move and the prose does not move; only the digit
+        /// changes, and the marker expands into the margin the moment there is
+        /// room for it.
+        #[test]
+        fn deleting_a_hash_changes_the_marker_and_moves_nothing() {
+            // The largest type on the smallest panel, at a margin that can
+            // still take a shallow heading's hashes — so the run passes through
+            // both forms.
+            let theme = Theme::at(80.0, MARGINS[1].0);
+            let mut seen = Vec::new();
+            for level in (1..=6).rev() {
+                let text = format!("{} Heading", "#".repeat(level));
+                on_page(&text, &theme, (1264, 1680), |page, lines, fonts| {
+                    let row = &lines[0];
+                    // Two glyphs stand for the whole marker, so every position
+                    // inside it draws in one place and the caret holds still
+                    // while the hashes come off.
+                    if matches!(row.marker, Marker::Compact { .. }) {
+                        for at in 0..=level {
+                            assert_eq!(
+                                pen_at(page, fonts, row, at).unwrap(),
+                                row.prose,
+                                "the caret moved inside a compact {level}-hash marker"
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        prose_x(page, fonts, row),
+                        page.left as f32,
+                        "the prose moved at {level} hashes"
+                    );
+                    seen.push(match row.marker {
+                        Marker::Compact { level, .. } => Some(level),
+                        _ => None,
+                    });
+                });
+            }
+            // Compact down to the level whose hashes the margin can take, and
+            // in full from there.
+            assert_eq!(seen.first(), Some(&Some(6)));
+            assert_eq!(seen.last(), Some(&None), "h1 sets its one hash");
+            let expanded = seen.iter().position(|c| c.is_none()).unwrap();
+            assert!(
+                seen[expanded..].iter().all(|c| c.is_none()),
+                "a marker that expanded should not compact again: {seen:?}"
+            );
+        }
+
+        /// A row whose marker changed form has to be repainted, even where not
+        /// one of its characters changed — a margin can do it on its own.
+        #[test]
+        fn a_row_that_changes_its_marker_form_is_not_unchanged() {
+            let chars: Vec<char> = "###### Six".chars().collect();
+            let markup = karyll_core::markdown::analyze(&chars);
+            let mut rows = Vec::new();
+            for margin in [MARGINS[0].0, MARGINS[2].0] {
+                let theme = Theme::at(42.0, margin);
+                let page = Page::new(&chars, &markup, &theme, (1264, 1680), 1680);
+                rows.push(layout(&page, &mut Proportional, 0).remove(0));
+            }
+            assert_ne!(rows[0].marker, rows[1].marker, "the form should differ");
+            let frame = Frame {
+                chars: chars.clone(),
+                lines: vec![rows.remove(0)],
+                caret: None,
+                selection: None,
+                candidates: None,
+            };
+            let mut later = rows.remove(0);
+            // Same place on the page, same text: only the form differs.
+            later.y = frame.lines[0].y;
+            later.prose = frame.lines[0].prose;
+            assert!(!frame.unchanged(0, &chars, &later));
+        }
+    }
+
+    mod spacing {
+        use super::*;
+        use crate::font::Proportional;
+
+        fn width_of(text: &str) -> f32 {
+            let chars: Vec<char> = text.chars().collect();
+            let markup = karyll_core::markdown::analyze(&chars);
+            let theme = Theme::default();
+            let page = Page::new(&chars, &markup, &theme, (1860, 2480), 2480);
+            let mut fonts = Proportional;
+            let lines = layout(&page, &mut fonts, 0);
+            let row = &lines[0];
+            pen_at(&page, &mut fonts, row, row.range.end).unwrap() - row.prose
+        }
+
+        /// 四分アキ: a quarter em at each Han-Latin boundary, and nothing at a
+        /// boundary that is not one.
+        #[test]
+        fn a_quarter_em_is_set_at_each_script_boundary() {
+            let quarter = aki_px(DEFAULT_SIZE);
+            assert!(quarter > 0.0);
+            // Two boundaries in `はRustで`, none in the all-Han line.
+            assert_eq!(
+                width_of("karyllはRustで書いた") - width_of("karylltはRustaで書いた")
+                    + 2.0 * Proportional.advance(Role::Body, DEFAULT_SIZE, 'a'),
+                0.0,
+                "the two lines differ by two Latin letters and nothing else"
+            );
+            let plain: f32 = width_of("世界世界");
+            let mixed: f32 = width_of("世界ab");
+            let latin = 2.0 * Proportional.advance(Role::Body, DEFAULT_SIZE, 'a');
+            let han = 2.0 * Proportional.advance(Role::Han, DEFAULT_SIZE, '世');
+            assert_eq!(
+                mixed - (plain - han + latin),
+                quarter,
+                "one boundary, one gap"
+            );
+        }
+
+        /// Not against punctuation, which carries its own sidebearing, and not
+        /// against markup, which has to sit on the character it marks.
+        #[test]
+        fn nothing_is_set_against_punctuation_or_markup() {
+            let quarter = aki_px(DEFAULT_SIZE);
+            assert_ne!(quarter, 0.0);
+            assert_eq!(width_of("世a世") - width_of("世,世"), 2.0 * quarter);
+            assert_eq!(width_of("世*世"), width_of("世,世"));
+        }
+
+        /// **The gap goes away with the boundary it sat on.** A row that begins
+        /// at a script boundary starts flush with every other row, or the
+        /// quarter em becomes an indent.
+        #[test]
+        fn a_row_beginning_at_a_boundary_still_starts_flush() {
+            // Narrow enough that the Latin run is pushed onto its own row.
+            let theme = Theme::at(80.0, MARGINS[2].0);
+            let chars: Vec<char> = "世界世界世界 supercalifragilistic".chars().collect();
+            let markup = karyll_core::markdown::analyze(&chars);
+            let page = Page::new(&chars, &markup, &theme, (1264, 1680), 1680);
+            let mut fonts = Proportional;
+            let lines = layout(&page, &mut fonts, 0);
+            assert!(
+                lines.len() > 1,
+                "the line has to wrap for this to mean anything"
+            );
+            for row in &lines {
+                assert_eq!(
+                    pen_at(&page, &mut fonts, row, row.range.start).unwrap(),
+                    page.left as f32
+                );
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Reading the touchscreen.
 //!
 //! Without this karyll is unusable before a keyboard exists — and unescapable,
-//! since the only way out was a key chord. Touch is what makes the app reachable
+//! since the only way out is a key chord. Touch is what makes the app reachable
 //! on a device that has never had a keyboard attached.
 //!
 //! Protocol B multitouch. A contact begins with `ABS_MT_TRACKING_ID >= 0` and

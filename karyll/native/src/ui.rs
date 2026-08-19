@@ -1257,12 +1257,10 @@ pub fn cell_at(bounds: &[(u16, u16)], x: u16) -> Option<usize> {
 /// wall it cannot have, so the row reads as unfinished. They are also a second
 /// delimiter for a boundary the brackets already draw.
 ///
-/// The rule went full width with them. It stopped at the last cell on the
-/// argument that a few left-packed buttons under a full-width rule read as an
-/// empty shelf, and two things are wrong with that: the band is full width
-/// because `status` lives in the other end of it, and the section headings on
-/// the panel directly above rule the whole width. A strip that stopped short
-/// was the one line on screen that did not.
+/// **The rule runs the full width**, not out to the last cell. The band is
+/// full width because `status` lives in the other end of it, and the section
+/// headings on the panel directly above rule the whole width — a strip that
+/// stopped short would be the one line on screen that did not.
 ///
 /// `status` is right-aligned and quiet — the same band rather than a second one
 /// stacked under it, and a thing you look at when you stop rather than while
@@ -2734,10 +2732,10 @@ mod tests {
     }
 
     /// **The invariant the paging exists for**: everything on a page is inside
-    /// the box that page is drawn in. It was not — [`overlay_rect`] clamped the
-    /// box to the panel while [`overlay_cells`] went on laying candidates out
-    /// past its edge, so the last ones were drawn off the screen and the number
-    /// row went on picking them.
+    /// the box that page is drawn in. [`overlay_rect`] clamps the box to the
+    /// panel and [`overlay_cells`] lays the candidates out, and the two have to
+    /// agree — a candidate past the box's edge is drawn off the screen while
+    /// the number row goes on picking it.
     #[test]
     fn every_candidate_on_a_page_is_inside_its_box() {
         for panel in [WIDE, NARROW] {

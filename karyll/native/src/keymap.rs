@@ -687,9 +687,9 @@ mod tests {
     ///
     /// German is asserted beside US because that is the trap these four sit in:
     /// this arm resolves the code with shift forced off, so a binding that
-    /// needs Shift on QWERTZ is dead there. `Ctrl+/` was the first choice for
-    /// Help — ⌘⇧/ is what macOS teaches — and `/` is `Shift+7` on QWERTZ, so a
-    /// German writer would have reached `7` and hit nothing.
+    /// needs Shift on QWERTZ is dead there. `Ctrl+/` cannot be Help, however
+    /// natural ⌘⇧/ is on macOS: `/` is `Shift+7` on QWERTZ, so a German writer
+    /// would reach `7` and hit nothing.
     #[test]
     fn every_panel_has_a_key_and_it_works_on_both_layouts() {
         let bindings = [
@@ -886,7 +886,8 @@ mod tests {
                 action(code::HOME, plain(), Layout::Us),
                 Some(Action::LineStart)
             );
-            // Ctrl+E went with it; it must not linger as a half-binding.
+            // Ctrl+E stays unbound: its Emacs partner is Select All here, and
+            // half a pair is worse than neither.
             assert_eq!(action(18, ctrl(), Layout::Us), None);
         }
 

@@ -39,8 +39,8 @@ const BUILD: &str = match option_env!("KARYLL_BUILD") {
 /// **A file that is not there is a document that has not been written yet**,
 /// which is what the launcher hands over on a Kindle karyll has never run on:
 /// it names the welcome document before anything has created it. Refusing to
-/// start was the worst answer available — the editor exited before it drew
-/// anything, so what the writer saw was a tile that does nothing.
+/// start is the worst answer available: the editor would exit before drawing
+/// anything, so the writer would see a tile that does nothing.
 ///
 /// Anything else is still an error. A file that exists and cannot be read is a
 /// permission or a disk fault, and opening an empty page over the top of it
@@ -150,8 +150,8 @@ fn main() -> Result<()> {
     };
 
     // Touch is what makes karyll reachable — and escapable — before a keyboard
-    // exists. Without it the only way out was a key chord on a keyboard that
-    // has not been paired yet.
+    // exists. Without it the only way out is a key chord on a keyboard that has
+    // not been paired yet.
     let touch = match touch::Touchscreen::open() {
         Ok(touch) => Some(touch),
         Err(err) => {
@@ -3656,12 +3656,6 @@ impl Editor {
         self.show_status("Scanning…")
     }
 
-    /// Follow the framework if it has turned the screen under us.
-    ///
-    /// The compositor rotates our pixels for us, so nothing needs redrawing —
-    /// but the touchscreen is panel-fixed, so the mapping does change, and
-    /// without this every tap after a 180° flip lands on the mirror of where it
-    /// was aimed and the buttons appear dead.
     /// Turn the page to match the way the device is being held.
     ///
     /// **Not a *Rotate* button**, which would be an invisible mode: turning the
@@ -3730,6 +3724,12 @@ impl Editor {
         Ok(())
     }
 
+    /// Follow the framework if it has turned the screen under us.
+    ///
+    /// The compositor rotates our pixels for us, so nothing needs redrawing —
+    /// but the touchscreen is panel-fixed, so the mapping does change. Without
+    /// this every tap after a 180° flip lands on the mirror of where it was
+    /// aimed, and the buttons appear dead.
     fn poll_orientation(&mut self) {
         if self.orientation_checked.elapsed() < ORIENTATION_POLL {
             return;
@@ -5417,13 +5417,14 @@ fn document_index(display: usize, cursor: usize, preedit: usize) -> usize {
 /// **The hidden flag is about the writing screen and nothing else.** A panel
 /// draws its own strip unconditionally — that strip *is* the panel's controls,
 /// not chrome that gets out of the way — so `writing` is the first thing asked.
-/// Leaving it out was a real bug: opening Help or Files *from the keyboard* left
-/// the flag set by the keystroke that opened it, so the panel drew a strip that
-/// nothing would hit-test. Every tap on it was swallowed by the reveal guard in
-/// [`Editor::tapped`], and swallowed again on the next tap, because
-/// `set_chrome_hidden` declines to change anything outside `Mode::Writing` and
-/// so the flag could never clear. `Done`, `Previous` and `Next` were dead until
-/// the writer happened to go back, tap the page to reveal the chrome, and enter
+/// It has to stay first: opening Help or Files *from the keyboard* leaves the
+/// hidden flag set by the keystroke that opened it, so a panel that consulted
+/// the flag would draw a strip nothing hit-tests. Every tap on it is swallowed
+/// by the reveal guard in [`Editor::tapped`], and swallowed again on the next
+/// tap, because `set_chrome_hidden` declines to change anything outside
+/// `Mode::Writing` and so the flag can never clear. `Done`, `Previous` and
+/// `Next` stay dead until the writer happens to go back, tap the page to reveal
+/// the chrome, and enter
 /// a panel by finger instead.
 ///
 /// Two more things override the flag while writing. **Without a keyboard the
@@ -5521,8 +5522,8 @@ fn font_groups(enabled: &[Language]) -> Vec<font::Group> {
 /// enough to that budget to be riding on the length of the words, which is not a
 /// thing to hold a control on the page with.
 ///
-/// A count rather than a fitted row, now that chrome no longer follows the
-/// document face and the widths hold still: the arithmetic would have to run in
+/// A count rather than a fitted row. Chrome does not follow the document face,
+/// so the widths hold still; and fitting one would have to run in
 /// `Editor::config_items`, which is `&self` where measuring wants the faces
 /// mutably. Three is under the budget on every supported panel and splits the
 /// Latin list where it already divides — the writing faces, then the firmware's
@@ -5586,9 +5587,14 @@ fn hanging_file() -> PathBuf {
 /// Push-out unless the file says otherwise, which is the remedy that needs no
 /// explaining: a mark never leaves the column, and a line is a character
 /// shorter where one would have.
+///
+/// The quarter em is not a setting and is not read here — it is a rule of the
+/// script rather than a taste, and its width belongs to the type size, so the
+/// page fills it in per block.
 fn read_rules() -> karyll_core::wrap::Rules {
     karyll_core::wrap::Rules {
         hang: std::fs::read_to_string(hanging_file()).is_ok_and(|s| s.trim() == "1"),
+        ..Default::default()
     }
 }
 
@@ -6294,16 +6300,15 @@ enum Bar {
     Cancel,
     /// Paging a list too long for the panel: back, where you are, and on.
     ///
-    /// **All three or none.** This was one `More` that appeared only while
-    /// there was a next page — so on the last page there was no button at all
-    /// and no way back, which is a list you can read once and then have to
-    /// leave and re-open. The wrap it was documented as doing could never
-    /// happen, because the button was gone by the time it would have.
+    /// **All three or none.** A single `More` shown only while there is a next
+    /// page leaves the last page with no button at all and no way back, which
+    /// is a list you can read once and then have to leave and re-open — and a
+    /// button that wraps cannot, because it is gone by the time it would.
     ///
     /// Named apart from the find bar's `Previous`/`Next`/`Count` rather than
     /// shared with them, though they read the same and mean the same kind of
-    /// thing: one `Bar` that dispatches two ways depending on the mode is the
-    /// shape of bug this project keeps writing down.
+    /// thing: one variant that dispatches two ways depending on the mode is a
+    /// shape this project keeps out.
     PageBack,
     PageAt,
     PageOn,
@@ -7279,16 +7284,15 @@ nine words in this one under the third level
 
     #[test]
     fn a_descriptor_that_can_no_longer_deliver_counts_as_ready() {
-        // **The bug behind every "the keyboard stopped working until I
-        // relaunched".** `evdev_poll` returns `EPOLLHUP | EPOLLERR` and
-        // *never* `EPOLLIN` once the device is gone, so a wait that tested
-        // `POLLIN` alone never read the node, never saw the read fail, never
-        // let go of the descriptor, and never looked for its replacement — for
-        // the rest of the session.
+        // `evdev_poll` returns `EPOLLHUP | EPOLLERR` and *never* `EPOLLIN`
+        // once the device is gone. A wait that tested `POLLIN` alone would
+        // never read the node, never see the read fail, never let go of the
+        // descriptor and never look for its replacement — so the keyboard
+        // would stay dead for the rest of the session.
         //
-        // A pipe cannot stand in for that on the host: closing the write end
-        // leaves the read end *readable* at EOF, so `POLLIN` is set as well and
-        // the broken rule and the fixed one agree. An invalid descriptor has
+        // **A pipe cannot stand in for a gone device here.** Closing the write
+        // end leaves the read end *readable* at EOF, so `POLLIN` is set and a
+        // rule that ignored it would pass anyway. An invalid descriptor has
         // the shape that matters — `revents` set, `POLLIN` clear — and it is
         // the only discrimination this rule makes.
         const GONE: std::os::unix::io::RawFd = 1_000_000;

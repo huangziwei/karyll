@@ -233,10 +233,4 @@ mod tests {
         assert_eq!(Orientation::from_letter(""), Orientation::Up);
         assert_eq!(Orientation::from_letter("nonsense"), Orientation::Up);
     }
-
-    // `rotated()` and `is_landscape()` went with the *Rotate* button they
-    // existed for: the orientation follows the device now, so there is nothing
-    // to toggle and no caller left asking which way round we are. Their tests
-    // went with them rather than being kept alive against a hypothetical future
-    // caller.
 }
