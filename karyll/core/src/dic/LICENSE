@@ -1,0 +1,22 @@
+Hyphenation data in this directory
+==================================
+
+One file, and it is not a pattern set. karyll reads its pattern sets from the
+Kindle, at `/usr/java/lib/dictionaries/hyphen/` — see `crate::hyphen` — so
+nothing here is a dictionary and none is bundled.
+
+
+en.curation — break decisions for American English
+--------------------------------------------------
+
+From bokai, `src/text/hyphenation/dic/en.curation`, verbatim.
+
+Break decisions taken by hand over the stock `hyph_en_US.dic` patterns, which
+are generated from a word list by machine and are judged on aggregate. The
+commonest few hundred words of English are on every page, so a division that
+reads poorly in one of them is seen constantly, and no adjustment of the
+pattern machinery reaches it — the decision is per word. The file states the
+two rules it was produced by in its own header.
+
+The patterns it decides over are the Kindle's own, read at run time from
+`/usr/java/lib/dictionaries/hyphen/hyph_en_US.dic`.

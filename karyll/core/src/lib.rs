@@ -7,6 +7,7 @@ pub mod buffer;
 pub mod dict;
 pub mod doc;
 pub mod find;
+pub mod hyphen;
 pub mod markdown;
 pub mod script;
 pub mod segment;
@@ -19,6 +20,7 @@ pub mod wrap;
 pub use buffer::Buffer;
 pub use dict::{Dict, Layout};
 pub use doc::Document;
+pub use hyphen::{HyphenationError, Hyphenator};
 pub use markdown::{
     Block, Continue, LineMarkup, Span, Style, analyze, continues, toggle_emphasis, toggle_heading,
 };
@@ -28,4 +30,4 @@ pub use undo::{Edit, History};
 pub use word::{word_at, word_end, word_start};
 // `words` is not re-exported flat: `karyll_core::count` would say nothing about
 // what is counted, and `words::count` says it at every call site.
-pub use wrap::{Class, Line, can_break_between, classify, wrap};
+pub use wrap::{Class, Line, Rules, aki, can_break_between, classify, hangable, wrap, wrap_with};

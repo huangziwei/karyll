@@ -187,10 +187,10 @@ mod tests {
 
     #[test]
     fn a_quarter_turn_maps_the_panel_across_the_long_edge() {
-        // The bug this pins: a point halfway down the panel has to arrive
-        // halfway across a landscape window. Scaling into the window's own axes
-        // first squashed this by 1860/2480, so a tap aimed at the third button
-        // of five landed on the second.
+        // A point halfway down the panel has to arrive halfway across a
+        // landscape window. Scaling into the window's own axes first squashes
+        // it by 1860/2480, which walks a tap aimed at the third button of five
+        // onto the second.
         let down_the_panel = 2480 / 2;
         let (x, _) = Orientation::Left.apply(900, down_the_panel, LANDSCAPE);
         assert_eq!(
@@ -233,10 +233,4 @@ mod tests {
         assert_eq!(Orientation::from_letter(""), Orientation::Up);
         assert_eq!(Orientation::from_letter("nonsense"), Orientation::Up);
     }
-
-    // `rotated()` and `is_landscape()` went with the *Rotate* button they
-    // existed for: the orientation follows the device now, so there is nothing
-    // to toggle and no caller left asking which way round we are. Their tests
-    // went with them rather than being kept alive against a hypothetical future
-    // caller.
 }

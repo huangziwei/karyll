@@ -63,9 +63,9 @@
 //!
 //! All return `int`, 0 = ok — **except `+0x1c`, which returns nothing**. It is
 //! the one slot that never sets `r0` on its exit path, so a caller reads
-//! leftover register content. On device it returned 1, 3, 5, 7, 7 across five
-//! keystrokes that all produced perfect candidates. Treating it as a status
-//! means never showing a candidate. The out-count is the answer.
+//! leftover register content — arbitrary non-zero values on calls that produced
+//! perfect candidates. Treating it as a status means never showing a candidate.
+//! The out-count is the answer.
 //!
 //! `+0x1c` fills a caller-supplied `char *` array with pointers **borrowed**
 //! from the plugin's own fixed-stride candidate table, valid only until the
@@ -1902,7 +1902,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
                 Compose::Feed('ー')
             );
             // Outside a word it is an ordinary hyphen, and in Chinese it always
-            // is — the plan leaves arithmetic and dashes ASCII in both.
+            // is: arithmetic and dashes stay ASCII in both scripts.
             assert_eq!(
                 compose(&Action::Insert('-'), false, Script::Japanese),
                 Compose::Pass

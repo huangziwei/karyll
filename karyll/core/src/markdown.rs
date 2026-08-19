@@ -96,6 +96,29 @@ pub struct LineMarkup {
     pub highlights: Vec<Range<usize>>,
 }
 
+impl LineMarkup {
+    /// How many characters at the head of the line are its block marker —
+    /// `## `, `> `, `- [x] ` — including the space that ends it and any indent
+    /// before it. Zero for a line that has none.
+    ///
+    /// Taken from the spans rather than parsed again, so it cannot disagree
+    /// with what [`analyze`] decided; the block is what says whether the
+    /// leading syntax span is a marker at all, since a fence and a rule are
+    /// syntax end to end and neither has one.
+    pub fn marker(&self) -> usize {
+        if !matches!(
+            self.block,
+            Block::Heading(_) | Block::Quote | Block::ListItem { .. } | Block::Task { .. }
+        ) {
+            return 0;
+        }
+        match self.spans.first() {
+            Some(span) if span.style == Style::Syntax => span.range.len(),
+            _ => 0,
+        }
+    }
+}
+
 /// Label every line of `chars`.
 pub fn analyze(chars: &[char]) -> Vec<LineMarkup> {
     let mut out = Vec::new();
@@ -478,6 +501,39 @@ mod continuation {
     fn a_cjk_item_continues_like_any_other() {
         assert_eq!(marker("- 中文条目"), "- ");
         assert_eq!(marker("1. 日本語"), "2. ");
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    fn marker_of(text: &str) -> usize {
+        let chars: Vec<char> = text.chars().collect();
+        analyze(&chars)[0].marker()
+    }
+
+    #[test]
+    fn a_marker_is_its_punctuation_its_indent_and_the_space_after_it() {
+        assert_eq!(marker_of("# Title"), 2);
+        assert_eq!(marker_of("###### Deep"), 7);
+        assert_eq!(marker_of("> Quoted"), 2);
+        assert_eq!(marker_of("- Bullet"), 2);
+        assert_eq!(marker_of("1. First"), 3);
+        assert_eq!(marker_of("- [x] Done"), 6);
+        assert_eq!(marker_of("  - Nested"), 4);
+    }
+
+    /// **A block that is syntax end to end has no marker.** A fence and a rule
+    /// are one leading syntax span covering the whole line, which is the shape
+    /// a marker has and not the thing a marker is.
+    #[test]
+    fn a_block_without_one_answers_nothing() {
+        assert_eq!(marker_of("ordinary prose"), 0);
+        assert_eq!(marker_of("```"), 0);
+        assert_eq!(marker_of("---"), 0);
+        assert_eq!(marker_of(""), 0);
+        assert_eq!(marker_of("#no space"), 0);
     }
 }
 

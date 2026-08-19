@@ -1,7 +1,7 @@
-//! On-screen UI, in `sidle/native`'s idiom.
+//! On-screen UI.
 //!
-//! Its conventions, not invented ones — they are proven on this hardware and
-//! there is no reason for karyll to look or behave differently:
+//! Conventions shared with the other apps on this device, proven on this
+//! hardware, rather than invented ones:
 //!
 //! - **Geometry comes from the font**, not from magic pixel constants. Rows are
 //!   `(line_height * 2).max(96)`, the title sits `line_height * 3` down. A
@@ -13,9 +13,8 @@
 //!   answers the vertical axis; [`hit`] adds the horizontal one, which a page
 //!   of settings needs because its controls sit side by side.
 //!
-//! Coordinates arriving here are already in window space — [`crate::orientation`]
-//! has been applied, the way sidle applies it before its own corner and row
-//! tests.
+//! Coordinates arriving here are already in window space: [`crate::orientation`]
+//! has been applied before any corner or row test.
 
 use anyhow::Result;
 use karyll_core::script::{Role, chrome_role_for, script_of};
@@ -23,7 +22,7 @@ use karyll_core::script::{Role, chrome_role_for, script_of};
 use crate::font::{Fonts, Metrics};
 use crate::window::{BLACK, QUIET, Rect, WHITE, Window};
 
-/// Bottom action strip, matching sidle's generous button row.
+/// Bottom action strip: a generous button row.
 pub const STRIP_H: u16 = 120;
 /// Left inset for titles and row labels.
 pub const MARGIN_X: u16 = 60;
@@ -44,9 +43,8 @@ pub struct Layout {
 
 impl Layout {
     /// `text_lh` and `title_lh` are the line heights of the faces actually
-    /// drawn, so nothing has to be guessed from the body size — deriving the
-    /// spacing from the wrong face is what made the title and the status line
-    /// overlap.
+    /// drawn, so nothing has to be guessed from the body size. Spacing derived
+    /// from the wrong face overlaps the title and the status line.
     pub fn compute(text_lh: u16, title_lh: u16, height: u16) -> Self {
         let lh = text_lh.max(1);
         let title_lh = title_lh.max(1);
@@ -111,13 +109,12 @@ impl Layout {
 
 /// One line of a panel.
 ///
-/// **A settings page is not a list**, and building it out of one is what made
-/// the first Config screen eleven identical rules with no shape to it: five
-/// languages, four faces and a keyboard, all the same weight, each hiding its
-/// choices behind a tap that cycled them one at a time. This panel is 1860 px
-/// across on a 10.2″ panel — there is room to show every option at once and say
-/// what belongs with what, and no reason to make a writer tap three times to
-/// see three faces.
+/// **A settings page is not a list.** Built out of one, Config is eleven
+/// identical rules with no shape to it — five languages, four faces and a
+/// keyboard, all the same weight, each hiding its choices behind a tap that
+/// cycles them one at a time. This panel is 1860 px across on a 10.2″ panel:
+/// there is room to show every option at once and say what belongs with what,
+/// and no reason to make a writer tap three times to see three faces.
 pub enum Item {
     /// A section heading, with a rule under it. Not tappable: it names what
     /// follows rather than doing anything.
@@ -1260,12 +1257,10 @@ pub fn cell_at(bounds: &[(u16, u16)], x: u16) -> Option<usize> {
 /// wall it cannot have, so the row reads as unfinished. They are also a second
 /// delimiter for a boundary the brackets already draw.
 ///
-/// The rule went full width with them. It stopped at the last cell on the
-/// argument that a few left-packed buttons under a full-width rule read as an
-/// empty shelf, and two things are wrong with that: the band is full width
-/// because `status` lives in the other end of it, and the section headings on
-/// the panel directly above rule the whole width. A strip that stopped short
-/// was the one line on screen that did not.
+/// **The rule runs the full width**, not out to the last cell. The band is
+/// full width because `status` lives in the other end of it, and the section
+/// headings on the panel directly above rule the whole width — a strip that
+/// stopped short would be the one line on screen that did not.
 ///
 /// `status` is right-aligned and quiet — the same band rather than a second one
 /// stacked under it, and a thing you look at when you stop rather than while
@@ -1554,10 +1549,9 @@ pub fn overlay_rect(
     let gap = (px * 0.25) as u16;
 
     // **Each cell is its label plus the same padding on both sides**, and the
-    // box is exactly the cells. An earlier version added the padding once per
-    // label *and* once more to the total, which left `pad/2` at the left edge
-    // and one and a half at the right — the box hugged its text on one side and
-    // not the other.
+    // box is exactly the cells. Padding added once per label *and* again to the
+    // total would leave `pad/2` at the left edge and one and a half at the
+    // right, so the box must not take it twice.
     let cells: Vec<u16> = labels
         .iter()
         .map(|label| label_width(fonts, label, px) + pad_x * 2)
@@ -2351,9 +2345,9 @@ mod tests {
         assert_eq!(chip_bounds(400, 600, long, &options, stub)[0].0, 400);
     }
 
-    /// The bug class this file has had three times: the invert lands on one
-    /// control and the tap runs another. Drawing and hit-testing are the same
-    /// two functions here, and this is the test that says so.
+    /// What this pins: the invert must not land on one control while the tap
+    /// runs another. Drawing and hit-testing are the same two functions here,
+    /// and this is the test that says so.
     #[test]
     fn a_tap_reported_on_a_chip_is_inside_the_chip_that_gets_drawn() {
         let l = layout();
@@ -2738,10 +2732,10 @@ mod tests {
     }
 
     /// **The invariant the paging exists for**: everything on a page is inside
-    /// the box that page is drawn in. It was not — [`overlay_rect`] clamped the
-    /// box to the panel while [`overlay_cells`] went on laying candidates out
-    /// past its edge, so the last ones were drawn off the screen and the number
-    /// row went on picking them.
+    /// the box that page is drawn in. [`overlay_rect`] clamps the box to the
+    /// panel and [`overlay_cells`] lays the candidates out, and the two have to
+    /// agree — a candidate past the box's edge is drawn off the screen while
+    /// the number row goes on picking it.
     #[test]
     fn every_candidate_on_a_page_is_inside_its_box() {
         for panel in [WIDE, NARROW] {
