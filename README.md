@@ -1,6 +1,6 @@
 # Karyll
 
-Karyll is a minimalistic writing app with bluetooth keyboard for jailbroken Kindles.
+Karyll[^1] is a minimalistic writing app[^2] with bluetooth keyboard support[^3] for jailbroken Kindles[^4]. 
 
 Tested on Kindle Scribe (2022; firmware 5.19.4.0.1), Kindle Colorsoft (firmware 5.18.0.2) and Kindle Oasis 2 (firmware 5.16.2.1.1), with a Pebble K380s keyboard.
 
@@ -72,6 +72,7 @@ v0.2.0 added support for smaller devices. I did it for fun, mostly because I was
 The Oasis doesn't deserve a screenshot. It will be just same grayscale images, but on a smaller screen, and we already have grayscale images on a bigger screen, and also some on a color smaller screen. All I want to say is, the Oasis is a terrible device to write with. The Bluetooth takes about 20 seconds to connect to the keyboard, and it's quite slow to respond to keystrokes. It does have an accelerometer and can rotate on all four sides like the Scribe, but that's about all one can say in its favor. But what would you expect from a 9-year-old reading device?
 
 
-## Thanks
-
-This project will not be possible without [kindle-hid-passthrough](https://github.com/zampierilucas/kindle-hid-passthrough). And our design is heavily inspired by [iA writer](https://ia.net).
+[^1]: The name is borrowed from Bloodborne's Runesmith Caryll, who was able to transcribe the whisper of the Great Ones into signs.  
+[^2]: The design is heavily inspired by [iA writer](https://ia.net).  
+[^3]: This project will not be possible without [kindle-hid-passthrough](https://github.com/zampierilucas/kindle-hid-passthrough).   
+[^4]: see [https://kindlemodding.org](https://kindlemodding.org). 
