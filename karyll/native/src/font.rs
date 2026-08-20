@@ -658,15 +658,29 @@ impl Slot {
     }
 }
 
+/// The [`PxScale`] that draws a face with an em `px` pixels tall.
+///
+/// ab_glyph scales a face by `PxScale / hhea_height`, so `px` alone sets the em
+/// of a 1000/1480 face to 0.68 of a 1000/1000 face's. `hhea_height` cancels it.
+fn em_scale(px: f32, units_per_em: f32, hhea_height: f32) -> PxScale {
+    PxScale::from(px * hhea_height / units_per_em)
+}
+
+/// [`em_scale`] for a loaded face. A face reporting no `unitsPerEm` takes `px`
+/// as ab_glyph reads it.
+fn scale_of(font: &FontVec, px: f32) -> PxScale {
+    let height = font.height_unscaled();
+    em_scale(px, font.units_per_em().unwrap_or(height), height)
+}
+
 /// `hhea` and `head` out of a font file, in ems.
 ///
 /// Both are small tables at offsets the table directory names, so this reads the
 /// 12-byte offset table, the directory, and twenty bytes — never the outlines,
 /// which are all but a rounding error of the file.
 ///
-/// The numbers match what `ab_glyph` reports for a loaded face: its `PxScale` is
-/// pixels per em, and its ascent is `hhea.ascender / unitsPerEm * px`, which is
-/// this multiplied out.
+/// The numbers are fractions of the em, so a face's ascent on screen is
+/// `Vertical::ascent * px`.
 fn vertical_of(path: &str) -> Option<Vertical> {
     vertical_in(&mut std::fs::File::open(path).ok()?)
 }
@@ -872,7 +886,7 @@ impl Fonts {
         let advance = self.slots[face]
             .get()
             .map(|font| {
-                font.as_scaled(PxScale::from(px))
+                font.as_scaled(scale_of(font, px))
                     .h_advance(font.glyph_id(ch))
             })
             .unwrap_or(0.0);
@@ -971,7 +985,7 @@ impl Fonts {
     ) -> Option<ab_glyph::Rect> {
         let face = self.resolve(role, ch)?;
         let font = self.slots[face].get()?;
-        let glyph = font.glyph_id(ch).with_scale(PxScale::from(px));
+        let glyph = font.glyph_id(ch).with_scale(scale_of(font, px));
         let outlined = font.outline_glyph(glyph)?;
         let bounds = outlined.px_bounds();
         let (ox, oy) = (bounds.min.x as i32, bounds.min.y as i32);
@@ -1038,6 +1052,9 @@ impl Metrics for Stub {
 /// difference, because the answer is where every fitting bug comes from: ten
 /// four-character candidates want more than a 7″ panel is wide and less than a
 /// 10.2″ one is, and a stub that measures them alike sees neither case.
+///
+/// **Half an em is a stress figure for the panels**, which are set in Amazon
+/// Ember at about 0.37 em. The iA faces set on a 0.6 em base.
 #[cfg(test)]
 pub struct Proportional;
 
@@ -1146,6 +1163,33 @@ mod tests {
         // And no group lists a chrome role, so `set_family` never re-points one.
         for group in GROUPS {
             assert!(group.roles().iter().all(|r| !r.is_chrome()), "{group:?}");
+        }
+    }
+
+    /// **One size is one em, in every face karyll draws with**, across the
+    /// whole of [`crate::render::SIZES`]. The pairs are
+    /// `(unitsPerEm, ascender − descender)`, read from the faces themselves.
+    #[test]
+    fn one_size_is_one_em_whatever_the_face_reports() {
+        let faces = [
+            ("STHeitiMedium", 1000.0, 1000.0),
+            ("TBGothicMed_213", 256.0, 256.0),
+            ("NotoSansKR-Regular", 1000.0, 1480.0),
+            ("NotoSerifKR-Medium", 1000.0, 1437.0),
+            ("iAWriterDuoS-Regular", 1000.0, 1300.0),
+            ("Amazon-Ember-Regular", 1000.0, 1254.0),
+            ("code2000", 2048.0, 2600.0),
+        ];
+        for px in crate::render::SIZES {
+            for (name, units, height) in faces {
+                // The factor ab_glyph applies to the face's own units.
+                let factor = em_scale(px, units, height).y / height;
+                assert!(
+                    (factor * units - px).abs() < 1e-3,
+                    "{name} draws an em of {} at a size of {px}",
+                    factor * units
+                );
+            }
         }
     }
 
