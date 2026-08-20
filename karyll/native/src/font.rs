@@ -50,6 +50,21 @@ pub trait Metrics {
     fn line_height(&mut self, px: f32, roles: &[Role]) -> f32;
     /// Top of the row to its baseline, for a row that may hold any of `roles`.
     fn ascent(&mut self, px: f32, roles: &[Role]) -> f32;
+    /// Top and bottom of the ink `roles` draw, from the baseline, positive
+    /// downwards. What a label is centred on; see [`probe`].
+    fn ink_box(&mut self, px: f32, roles: &[Role]) -> (f32, f32);
+}
+
+/// The character whose ink stands for a role's face: a cap with no descender
+/// for Latin, and for Han and Hangul a character that fills its em.
+fn probe(role: Role) -> char {
+    if role.is_hangul() {
+        '한'
+    } else if role.is_han() {
+        '中'
+    } else {
+        'H'
+    }
 }
 
 /// A row that only ever holds Latin: chrome, panel titles, anything whose text
@@ -976,6 +991,14 @@ impl Fonts {
     /// Coverage is passed through rather than thresholded here — where the cut
     /// falls is the renderer's decision, and syntax marks dither instead of
     /// cutting.
+    /// The box `ch` covers against the baseline, without rasterising it.
+    fn ink_of(&mut self, role: Role, px: f32, ch: char) -> Option<ab_glyph::Rect> {
+        let face = self.resolve(role, ch)?;
+        let font = self.slots[face].get()?;
+        let glyph = font.glyph_id(ch).with_scale(scale_of(font, px));
+        Some(font.outline_glyph(glyph)?.px_bounds())
+    }
+
     pub fn draw(
         &mut self,
         role: Role,
@@ -1006,7 +1029,31 @@ impl Metrics for Fonts {
     fn ascent(&mut self, px: f32, roles: &[Role]) -> f32 {
         self.row_box(px, roles).0
     }
+
+    fn ink_box(&mut self, px: f32, roles: &[Role]) -> (f32, f32) {
+        let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+        for &role in roles {
+            if let Some(ink) = self.ink_of(role, px, probe(role)) {
+                top = top.min(ink.min.y);
+                bottom = bottom.max(ink.max.y);
+            }
+        }
+        if top > bottom {
+            // No face readable: a Latin cap places the label.
+            return (-px * CAP, 0.0);
+        }
+        (top, bottom)
+    }
 }
+
+/// A Latin cap, as a share of the em. Amazon Ember and the iA faces both draw
+/// `H` to 0.711.
+const CAP: f32 = 0.711;
+
+/// A CJK glyph against the baseline: 中 and 한 both reach 0.842 above it, and
+/// the deeper of the two drops 0.132 below.
+#[cfg(test)]
+const CJK_INK: (f32, f32) = (0.842, 0.132);
 
 /// Metrics with no font behind them: every character ten units wide, so a test
 /// can say exactly where it expects a caret or a box edge to land.
@@ -1041,6 +1088,15 @@ impl Metrics for Stub {
             px * 0.8
         }
     }
+
+    /// The proportions the real faces draw to.
+    fn ink_box(&mut self, px: f32, roles: &[Role]) -> (f32, f32) {
+        if roles.iter().any(is_cjk) {
+            (-px * CJK_INK.0, px * CJK_INK.1)
+        } else {
+            (-px * CAP, 0.0)
+        }
+    }
 }
 
 /// Metrics in the proportions the real faces have: a CJK glyph is one em wide
@@ -1070,6 +1126,10 @@ impl Metrics for Proportional {
 
     fn ascent(&mut self, px: f32, roles: &[Role]) -> f32 {
         Stub.ascent(px, roles)
+    }
+
+    fn ink_box(&mut self, px: f32, roles: &[Role]) -> (f32, f32) {
+        Stub.ink_box(px, roles)
     }
 }
 

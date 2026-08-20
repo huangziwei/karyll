@@ -360,15 +360,16 @@ impl Language {
 
     /// What the button says. Each names itself the way its writers would, and
     /// the CJK entries name themselves in their own script.
+    ///
+    /// **One character each**, so the six chips are one width. 한 is what the
+    /// 한/영 key carries; 简, 繁 and 日 name 简体字, 繁體字 and 日本語.
     fn label(self) -> &'static str {
         match self {
             Language::English => "EN",
             Language::German => "DE",
-            Language::Chinese => "简体",
-            Language::ChineseTraditional => "繁體",
-            Language::Japanese => "日本語",
-            // 한, not 한국어: the button carries the 한/영 key's own word for
-            // the state it puts the keyboard in, and it is the shorter for it.
+            Language::Chinese => "简",
+            Language::ChineseTraditional => "繁",
+            Language::Japanese => "日",
             Language::Korean => "한",
         }
     }

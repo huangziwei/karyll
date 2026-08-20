@@ -716,7 +716,15 @@ fn draw_item(
         return;
     };
     let top = layout.rows_top + i as u16 * layout.row_h;
-    let middle = top as i32 + (layout.row_h as i32 - TEXT_PX as i32) / 2;
+    // The band a row's chips are centred in, so a 한글 label and the chips
+    // beside it share one optical centre.
+    let band = Rect {
+        x: MARGIN_X,
+        y: top,
+        width: width.saturating_sub(MARGIN_X),
+        height: layout.row_h,
+    };
+    let middle = |fonts: &mut Fonts, label: &str| centred_top(fonts, band, label, TEXT_PX);
     if focus.is_some() {
         // In the air [`ROW_INSET`] leaves, so the mark sits beside the label
         // rather than pushing it along: a line that shifts when it takes focus
@@ -773,11 +781,11 @@ fn draw_item(
                 measure(fonts, s, TEXT_PX) as u16
             });
             let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
-            draw_line(
-                window, fonts, &label, ROW_INSET, middle, TEXT_PX, *on, BLACK,
-            );
+            let y = middle(fonts, &label);
+            draw_line(window, fonts, &label, ROW_INSET, y, TEXT_PX, *on, BLACK);
             if !detail.is_empty() {
-                draw_line(window, fonts, detail, column, middle, TEXT_PX, false, BLACK);
+                let y = middle(fonts, detail);
+                draw_line(window, fonts, detail, column, y, TEXT_PX, false, BLACK);
             }
             if let Some(text) = action {
                 let rect = action_rect(layout, i, width, text, |s| {
@@ -804,9 +812,8 @@ fn draw_item(
                 measure(fonts, s, TEXT_PX) as u16
             });
             let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
-            draw_line(
-                window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
-            );
+            let y = middle(fonts, &label);
+            draw_line(window, fonts, &label, ROW_INSET, y, TEXT_PX, false, BLACK);
             for (o, _) in bounds.iter().enumerate() {
                 let rect = chip_rect(layout, i, &bounds, o);
                 draw_chip(
@@ -828,9 +835,8 @@ fn draw_item(
                 measure(fonts, s, TEXT_PX) as u16
             });
             let label = elided(label, room, |s| measure(fonts, s, TEXT_PX) as u16);
-            draw_line(
-                window, fonts, &label, ROW_INSET, middle, TEXT_PX, false, BLACK,
-            );
+            let y = middle(fonts, &label);
+            draw_line(window, fonts, &label, ROW_INSET, y, TEXT_PX, false, BLACK);
             let bounds = swatch_bounds(column, width, inks.len());
             for (o, _) in bounds.iter().enumerate() {
                 let rect = chip_rect(layout, i, &bounds, o);
@@ -980,7 +986,7 @@ fn draw_chip(window: &mut Window, fonts: &mut Fonts, rect: Rect, label: &str, st
     }
     let w = measure(fonts, label, TEXT_PX) as u16;
     let start = rect.x + rect.width.saturating_sub(w) / 2;
-    let top = rect.y as i32 + (rect.height as i32 - TEXT_PX as i32) / 2 - 4;
+    let top = centred_top(fonts, rect, label, TEXT_PX);
     draw_line(window, fonts, label, start, top, TEXT_PX, false, ink);
 }
 
@@ -1607,6 +1613,16 @@ fn glyph_box(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
     fonts.line_height(px, &label_roles(label)) as u16
 }
 
+/// The top edge to hand [`draw_line`] so `label`'s ink is centred in `rect`.
+/// [`draw_line`] places the baseline an ascent below that top, so the two are
+/// worked out together.
+fn centred_top(fonts: &mut impl Metrics, rect: Rect, label: &str, px: f32) -> i32 {
+    let roles = label_roles(label);
+    let (top, bottom) = fonts.ink_box(px, &roles);
+    let baseline = rect.y as f32 + (rect.height as f32 - (bottom - top)) / 2.0 - top;
+    (baseline - fonts.ascent(px, &roles)).round() as i32
+}
+
 fn label_roles(label: &str) -> Vec<Role> {
     label
         .chars()
@@ -1712,11 +1728,8 @@ pub fn draw_overlay(
 
     let cells = overlay_cells(fonts, rect, body_px, labels);
     for (label, (x, _)) in labels.iter().zip(&cells) {
-        // Each label centred on its own glyph box rather than dropped at the
-        // top: `US` and `简体` have different heights, and one rule that centres
-        // whichever it is sits both of them properly in the same box.
-        let box_h = glyph_box(fonts, label, px);
-        let top = rect.y as i32 + (rect.height as i32 - box_h as i32) / 2;
+        // Each label centred on its own ink, whichever face draws it.
+        let top = centred_top(fonts, rect, label, px);
         draw_line(window, fonts, label, x + pad_x, top, px, false, BLACK);
     }
 }
@@ -2582,27 +2595,51 @@ mod tests {
             box_h + pad_y * 2,
             "and the same above and below it"
         );
-        // Which is what makes the drawn top symmetric.
-        let top = rect.y as i32 + (rect.height as i32 - box_h as i32) / 2;
-        assert_eq!(top - rect.y as i32, pad_y as i32);
+        let box_top = rect.y as i32 + (rect.height as i32 - box_h as i32) / 2;
+        assert_eq!(box_top - rect.y as i32, pad_y as i32);
     }
 
+    /// **Every script sits square in its box.** `EN`, `简` and `한` come out of
+    /// three faces whose reported extents differ by a fifth of an em;
+    /// [`centred_top`] measures the ink they draw.
     #[test]
-    fn a_short_latin_label_is_centred_in_the_box_a_han_one_would_need() {
-        // `US` and `简体` have different glyph boxes. Whichever it is has to
-        // end up in the middle, not standing on the box's floor.
-
-        for label in ["US", "简体", "日本語"] {
+    fn every_script_sits_in_the_middle_of_its_box() {
+        for label in ["EN", "简", "日本語", "한글", "1 你好"] {
             let labels = vec![label.to_string()];
             let rect =
                 overlay_rect(1860, &mut Stub, caret_at(100), TEXT_PX, BOX_BOTTOM, &labels).unwrap();
             let px = TEXT_PX * CANDIDATE_SCALE;
-            let box_h = glyph_box(&mut Stub, label, px);
-            let above = (rect.height as i32 - box_h as i32) / 2;
-            let below = rect.height as i32 - box_h as i32 - above;
+            let roles = label_roles(label);
+            let (ink_top, ink_bottom) = Stub.ink_box(px, &roles);
+            let baseline = centred_top(&mut Stub, rect, label, px) as f32 + Stub.ascent(px, &roles);
+            let above = baseline + ink_top - rect.y as f32;
+            let below = (rect.y + rect.height) as f32 - (baseline + ink_bottom);
             assert!(
-                (above - below).abs() <= 1,
-                "{label}: {above} above against {below} below"
+                (above - below).abs() <= 1.0,
+                "{label}: {above:.1} above against {below:.1} below"
+            );
+        }
+    }
+
+    /// A chip is the same rule against a rectangle of its own.
+    #[test]
+    fn every_script_sits_in_the_middle_of_its_chip() {
+        let rect = Rect {
+            x: 0,
+            y: 400,
+            width: 200,
+            height: 72,
+        };
+        for label in ["EN", "简", "한", "Forget"] {
+            let roles = label_roles(label);
+            let (ink_top, ink_bottom) = Stub.ink_box(TEXT_PX, &roles);
+            let baseline =
+                centred_top(&mut Stub, rect, label, TEXT_PX) as f32 + Stub.ascent(TEXT_PX, &roles);
+            let above = baseline + ink_top - rect.y as f32;
+            let below = (rect.y + rect.height) as f32 - (baseline + ink_bottom);
+            assert!(
+                (above - below).abs() <= 1.0,
+                "{label}: {above:.1} above against {below:.1} below"
             );
         }
     }
