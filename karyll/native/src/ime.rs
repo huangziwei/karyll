@@ -1,4 +1,11 @@
-//! CJK input, through Amazon's own predictor plugins.
+//! CJK input: two languages through Amazon's own predictor plugins, and one
+//! karyll composes itself.
+//!
+//! [`Korean`] is the one karyll composes. It needs no dictionary, no candidate
+//! list and no segmenter — a Hangul syllable is arithmetic on a code point and
+//! the words are spaced — so it is three tables and a state machine, and all of
+//! it runs under `cargo test`. Everything below it is the two that are a
+//! binding.
 //!
 //! The device ships a complete IME for each of twenty languages under
 //! `/usr/share/keyboard/<locale>/libpredictor.so.1` — engine, dictionaries and
@@ -95,11 +102,13 @@ use std::ops::Range;
 ///
 /// Not the same thing as the plugin: Simplified and Traditional Chinese are one
 /// engine and one set of rules, differing only in what the candidates are
-/// converted to on the way out.
+/// converted to on the way out. Korean names no plugin at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Script {
     Chinese,
     Japanese,
+    /// Korean, composed by [`Korean`] in this process.
+    Korean,
 }
 
 /// What the editor needs from an input method.
@@ -212,6 +221,9 @@ fn punctuation(script: Script, key: char) -> Option<Punct> {
         _ => None,
     };
     match script {
+        // **Korean sets its punctuation in ASCII**: the full stop, comma and
+        // quotation marks Korean prose takes are the ones on the key.
+        Script::Korean => None,
         Script::Chinese => match key {
             ',' => fixed("，"),
             // The enumeration comma, which Chinese uses between list items
@@ -293,11 +305,23 @@ impl Punctuation {
     }
 }
 
-/// What a keystroke means while Chinese input is switched on.
+/// What a keystroke means while CJK input is switched on.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Compose {
     /// Send this to the engine.
     Feed(char),
+    /// Compose this key into the Hangul syllable under way, through
+    /// [`Korean::key`]. [`Script::Korean`] only: that answers with committed
+    /// text where an engine answers with candidates.
+    Jamo(char),
+    /// Take one jamo back off the syllable — 앉 → 안 → 아. [`Script::Korean`]
+    /// only, through [`Korean::backspace`].
+    Decompose,
+    /// **The composition is finished text.** Commit it and let the editor have
+    /// the keystroke as usual. [`Script::Korean`] only: a half-typed Hangul
+    /// syllable is correct Korean, so every key that is not a jamo ends it and
+    /// then means what it always means.
+    Finish,
     /// Take candidate `n` of the ten on screen, counting from zero.
     Select(usize),
     /// Show the ten candidates after the ones on screen, or the ten before.
@@ -340,6 +364,23 @@ const CHOONPU: char = 'ー';
 /// Pure, so all of this is tested without an engine, a window or a keyboard.
 pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) -> Compose {
     use crate::keymap::Action;
+
+    // **A Korean keyboard types Korean.** Every letter is a jamo while
+    // [`Script::Korean`] is selected, capitals included — those are the tense
+    // consonants — and Latin is reached by switching source, which is what the
+    // 한/영 key does and what `Ctrl + Space` does here.
+    //
+    // Every other key finishes the syllable and goes on to mean what it means:
+    // space is a space, a digit is a digit, `.` is a full stop, Enter breaks
+    // the line. No candidate list to number, and no page to turn.
+    if script == Script::Korean {
+        return match action {
+            Action::Insert(c) if jamo_for(*c).is_some() => Compose::Jamo(*c),
+            Action::Backspace if composing => Compose::Decompose,
+            _ if composing => Compose::Finish,
+            _ => Compose::Pass,
+        };
+    }
 
     match action {
         // **A capital is never CJK input.** Pinyin and romaji are both written
@@ -391,6 +432,7 @@ pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) 
         Action::Insert(' ') => match script {
             Script::Chinese => Compose::Select(0),
             Script::Japanese => Compose::Feed(' '),
+            Script::Korean => Compose::Finish,
         },
 
         // Backspace goes to the engine rather than the document. Chinese routes
@@ -425,6 +467,310 @@ pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) 
         // one keystroke.
         _ => Compose::Cancel,
     }
+}
+
+/// The 19 초성, in the order the composition formula counts them.
+const INITIALS: [char; 19] = [
+    'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ',
+    'ㅌ', 'ㅍ', 'ㅎ',
+];
+
+/// The 21 중성.
+const MEDIALS: [char; 21] = [
+    'ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ',
+    'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ',
+];
+
+/// The 27 종성 a syllable can end in, counted from one: index zero of the
+/// formula means no 받침 at all.
+///
+/// ㄸ, ㅃ and ㅉ are absent: Korean never writes them there, so [`Korean::key`]
+/// opens a new syllable on one.
+const CODAS: [char; 27] = [
+    'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ',
+    'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+];
+
+/// Where the precomposed syllables start: 가.
+const FIRST_SYLLABLE: u32 = 0xAC00;
+
+/// The vowels two keys make, and the pair each is made of.
+///
+/// 두벌식 has one key per simple vowel, so ㅘ is typed ㅗ then ㅏ, and
+/// [`Korean::backspace`] takes it back to the pair.
+const COMPOUND_MEDIALS: [(char, char, char); 7] = [
+    ('ㅗ', 'ㅏ', 'ㅘ'),
+    ('ㅗ', 'ㅐ', 'ㅙ'),
+    ('ㅗ', 'ㅣ', 'ㅚ'),
+    ('ㅜ', 'ㅓ', 'ㅝ'),
+    ('ㅜ', 'ㅔ', 'ㅞ'),
+    ('ㅜ', 'ㅣ', 'ㅟ'),
+    ('ㅡ', 'ㅣ', 'ㅢ'),
+];
+
+/// The 받침 two consonants make.
+///
+/// **Every one of these splits under a vowel**, and only its tail moves: 앉
+/// followed by ㅏ is 안자. The tense finals ㄲ and ㅆ are absent — they are
+/// single keys on the shifted row of [`jamo_for`].
+const COMPOUND_CODAS: [(char, char, char); 11] = [
+    ('ㄱ', 'ㅅ', 'ㄳ'),
+    ('ㄴ', 'ㅈ', 'ㄵ'),
+    ('ㄴ', 'ㅎ', 'ㄶ'),
+    ('ㄹ', 'ㄱ', 'ㄺ'),
+    ('ㄹ', 'ㅁ', 'ㄻ'),
+    ('ㄹ', 'ㅂ', 'ㄼ'),
+    ('ㄹ', 'ㅅ', 'ㄽ'),
+    ('ㄹ', 'ㅌ', 'ㄾ'),
+    ('ㄹ', 'ㅍ', 'ㄿ'),
+    ('ㄹ', 'ㅎ', 'ㅀ'),
+    ('ㅂ', 'ㅅ', 'ㅄ'),
+];
+
+/// The jamo a key writes under 두벌식, or `None` for a key that is not one.
+///
+/// **두벌식 is the standard Korean arrangement**, defined against QWERTY:
+/// consonants under the left hand, vowels under the right.
+///
+/// ```text
+/// q ㅂ  w ㅈ  e ㄷ  r ㄱ  t ㅅ  y ㅛ  u ㅕ  i ㅑ  o ㅐ  p ㅔ
+/// a ㅁ  s ㄴ  d ㅇ  f ㄹ  g ㅎ  h ㅗ  j ㅓ  k ㅏ  l ㅣ
+/// z ㅋ  x ㅌ  c ㅊ  v ㅍ  b ㅠ  n ㅜ  m ㅡ
+/// ```
+///
+/// `key` is the character [`crate::keymap::Layout`] resolved, not a scan code,
+/// so this holds for whatever keyboard is attached.
+///
+/// **Nothing but the letters.** Korean sets its punctuation in ASCII, so every
+/// other key writes what it says and `None` leaves it to the editor.
+fn jamo_for(key: char) -> Option<char> {
+    Some(match key {
+        'q' => 'ㅂ',
+        'w' => 'ㅈ',
+        'e' => 'ㄷ',
+        'r' => 'ㄱ',
+        't' => 'ㅅ',
+        'y' => 'ㅛ',
+        'u' => 'ㅕ',
+        'i' => 'ㅑ',
+        'o' => 'ㅐ',
+        'p' => 'ㅔ',
+        'a' => 'ㅁ',
+        's' => 'ㄴ',
+        'd' => 'ㅇ',
+        'f' => 'ㄹ',
+        'g' => 'ㅎ',
+        'h' => 'ㅗ',
+        'j' => 'ㅓ',
+        'k' => 'ㅏ',
+        'l' => 'ㅣ',
+        'z' => 'ㅋ',
+        'x' => 'ㅌ',
+        'c' => 'ㅊ',
+        'v' => 'ㅍ',
+        'b' => 'ㅠ',
+        'n' => 'ㅜ',
+        'm' => 'ㅡ',
+        // Shift carries the five tense consonants and the two iotised vowels,
+        // which is the whole of the shifted row.
+        'Q' => 'ㅃ',
+        'W' => 'ㅉ',
+        'E' => 'ㄸ',
+        'R' => 'ㄲ',
+        'T' => 'ㅆ',
+        'O' => 'ㅒ',
+        'P' => 'ㅖ',
+        // 두벌식 leaves the rest of the shifted row unassigned, and every
+        // capital on it writes the jamo under the finger.
+        c if c.is_ascii_uppercase() => return jamo_for(c.to_ascii_lowercase()),
+        _ => return None,
+    })
+}
+
+/// The Korean input method: 두벌식 in, Hangul out.
+///
+/// **No dictionary, no candidate list and nothing that can fail to load.** A
+/// syllable is three slots, and the code point is the formula:
+///
+/// ```text
+/// syllable = 0xAC00 + (초성 × 21 + 중성) × 28 + 종성
+/// ```
+///
+/// It does not implement [`Ime`]: that trait is a session with an engine that
+/// offers candidates and is told which one to take. [`Korean::key`] offers
+/// none, and commits without being asked.
+///
+/// **The 받침 migrates.** A final belongs to the syllable it was typed into
+/// until a vowel arrives, and then to the next one — ㅎㅏㄴ is 한 and ㅎㅏㄴㅏ is
+/// 하나. So [`Korean::key`] hands back two things: text that is finished with,
+/// and the syllable under construction. The finished half is empty for most
+/// keystrokes.
+///
+/// The three tables hold **compatibility jamo**, which is what a lone jamo is
+/// written as. The conjoining jamo of U+1100 appear nowhere here: a
+/// half-composed syllable shows as ㄱ.
+///
+/// A syllable holds a lone consonant (ㄱ), a lone vowel (ㅏ), or all three
+/// slots — and a 받침 only once the other two are filled, which keeps
+/// [`Korean::preedit`] a single code point wherever one exists. Empty is not
+/// composing.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Korean {
+    initial: Option<char>,
+    medial: Option<char>,
+    coda: Option<char>,
+}
+
+impl Korean {
+    /// Compose one key, and hand back the text this keystroke finished.
+    ///
+    /// Empty for the keystrokes that go on building the same syllable, which
+    /// is most of them; what they build is [`Korean::preedit`]. It carries a
+    /// syllable when the one in hand is full and a new one starts, and in the
+    /// 받침 case, where a vowel takes the final away.
+    ///
+    /// `key` is what the keyboard resolved. One that [`jamo_for`] does not
+    /// know leaves the composition alone and hands back the empty string;
+    /// [`Compose::Finish`] is that key's case.
+    pub fn key(&mut self, key: char) -> String {
+        let Some(jamo) = jamo_for(key) else {
+            return String::new();
+        };
+        if MEDIALS.contains(&jamo) {
+            self.vowel(jamo)
+        } else {
+            self.consonant(jamo)
+        }
+    }
+
+    /// Take one jamo back off the syllable: 앉 → 안 → 아 → ㅇ → nothing.
+    ///
+    /// **A Korean backspace decomposes.** A compound falls back to its head,
+    /// and each slot empties in turn. `false` says the syllable was empty and
+    /// the keystroke belongs to the document.
+    pub fn backspace(&mut self) -> bool {
+        if let Some(coda) = self.coda {
+            self.coda = split(&COMPOUND_CODAS, coda).map(|(head, _)| head);
+        } else if let Some(medial) = self.medial {
+            self.medial = split(&COMPOUND_MEDIALS, medial).map(|(head, _)| head);
+        } else if self.initial.is_some() {
+            self.initial = None;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// The syllable under construction, as it appears on the page.
+    ///
+    /// A complete syllable is one precomposed code point. One missing a slot
+    /// is the jamo typed so far — ㄱ, ㅏ — and both are correct Korean text.
+    pub fn preedit(&self) -> String {
+        if let (Some(initial), Some(medial)) = (self.initial, self.medial)
+            && let Some(syllable) = compose_syllable(initial, medial, self.coda)
+        {
+            return syllable.to_string();
+        }
+        [self.initial, self.medial, self.coda]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Finish the syllable in hand and hand back its text.
+    pub fn take(&mut self) -> String {
+        let text = self.preedit();
+        self.clear();
+        text
+    }
+
+    /// Abandon the syllable.
+    pub fn clear(&mut self) {
+        *self = Korean::default();
+    }
+
+    /// A consonant is the 받침 of the syllable in hand where one fits, and the
+    /// initial of a new syllable everywhere else.
+    fn consonant(&mut self, c: char) -> String {
+        if self.initial.is_some() && self.medial.is_some() {
+            match self.coda {
+                None if CODAS.contains(&c) => {
+                    self.coda = Some(c);
+                    return String::new();
+                }
+                Some(held) => {
+                    if let Some(joined) = join(&COMPOUND_CODAS, held, c) {
+                        self.coda = Some(joined);
+                        return String::new();
+                    }
+                }
+                None => {}
+            }
+        }
+        let done = self.take();
+        self.initial = Some(c);
+        done
+    }
+
+    /// A vowel fills the empty 중성, compounds with the one there, or takes the
+    /// 받침 away into a syllable of its own.
+    fn vowel(&mut self, v: char) -> String {
+        // **The 받침 belongs to the vowel's syllable.** It becomes that
+        // syllable's initial, and a compound sends only its tail.
+        if let Some(coda) = self.coda {
+            let (stays, moves) = match split(&COMPOUND_CODAS, coda) {
+                Some((head, tail)) => (Some(head), tail),
+                None => (None, coda),
+            };
+            self.coda = stays;
+            let done = self.take();
+            self.initial = Some(moves);
+            self.medial = Some(v);
+            return done;
+        }
+        let Some(held) = self.medial else {
+            self.medial = Some(v);
+            return String::new();
+        };
+        if let Some(joined) = join(&COMPOUND_MEDIALS, held, v) {
+            self.medial = Some(joined);
+            return String::new();
+        }
+        // Two vowels that do not compound are two syllables, and the second
+        // opens with an empty 초성.
+        let done = self.take();
+        self.medial = Some(v);
+        done
+    }
+}
+
+/// The code point for three slots, or `None` for a combination that is not a
+/// syllable.
+fn compose_syllable(initial: char, medial: char, coda: Option<char>) -> Option<char> {
+    let initial = INITIALS.iter().position(|c| *c == initial)?;
+    let medial = MEDIALS.iter().position(|c| *c == medial)?;
+    let coda = match coda {
+        Some(coda) => CODAS.iter().position(|c| *c == coda)? + 1,
+        None => 0,
+    };
+    let index = (initial * MEDIALS.len() + medial) * (CODAS.len() + 1) + coda;
+    char::from_u32(FIRST_SYLLABLE + index as u32)
+}
+
+/// The jamo `a` and `b` make together, if they make one.
+fn join(pairs: &[(char, char, char)], a: char, b: char) -> Option<char> {
+    pairs
+        .iter()
+        .find(|(head, tail, _)| *head == a && *tail == b)
+        .map(|(_, _, joined)| *joined)
+}
+
+/// The pair a compound jamo is made of, or `None` if it is simple.
+fn split(pairs: &[(char, char, char)], jamo: char) -> Option<(char, char)> {
+    pairs
+        .iter()
+        .find(|(_, _, joined)| *joined == jamo)
+        .map(|(head, tail, _)| (*head, *tail))
 }
 
 /// The Chinese plugin: XT9 pinyin over `libxt9a`, one dictionary, Simplified.
@@ -1476,6 +1822,254 @@ impl Ime for KanaStub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Type `keys` as they are struck on a 두벌식 keyboard, and hand back what
+    /// is on the page: everything committed, with [`Korean::preedit`] after it.
+    fn typed(keys: &str) -> String {
+        let mut korean = Korean::default();
+        let mut page: String = keys.chars().map(|key| korean.key(key)).collect();
+        page.push_str(&korean.preedit());
+        page
+    }
+
+    #[test]
+    fn a_syllable_is_its_three_slots() {
+        assert_eq!(compose_syllable('ㄱ', 'ㅏ', None), Some('가'));
+        assert_eq!(compose_syllable('ㅎ', 'ㅏ', Some('ㄴ')), Some('한'));
+        assert_eq!(compose_syllable('ㅇ', 'ㅏ', Some('ㄵ')), Some('앉'));
+        // The last syllable of the block.
+        assert_eq!(compose_syllable('ㅎ', 'ㅣ', Some('ㅎ')), Some('힣'));
+    }
+
+    /// The 받침 belongs to the syllable it was typed into until a vowel
+    /// arrives, and to the next one after that.
+    #[test]
+    fn a_vowel_takes_the_final_away() {
+        assert_eq!(typed("gks"), "한");
+        assert_eq!(typed("gksk"), "하나");
+        assert_eq!(typed("dksw"), "앉");
+        assert_eq!(typed("dkswk"), "안자");
+    }
+
+    /// A compound sends its tail and keeps its head as the 받침.
+    #[test]
+    fn a_compound_final_splits_rather_than_migrating_whole() {
+        assert_eq!(typed("dlfg"), "잃");
+        assert_eq!(typed("dlfgj"), "일허");
+        assert_eq!(typed("dhkfrh"), "왈고");
+    }
+
+    #[test]
+    fn two_keys_make_one_vowel() {
+        assert_eq!(typed("rhk"), "과");
+        assert_eq!(typed("rho"), "괘");
+        assert_eq!(typed("rhl"), "괴");
+        assert_eq!(typed("rnj"), "궈");
+        assert_eq!(typed("rnp"), "궤");
+        assert_eq!(typed("rnl"), "귀");
+        assert_eq!(typed("rml"), "긔");
+        // A compound vowel composes with an empty 초성 in front of it.
+        assert_eq!(typed("hk"), "ㅘ");
+    }
+
+    #[test]
+    fn two_keys_make_one_final() {
+        assert_eq!(typed("ahrt"), "몫");
+        assert_eq!(typed("djqt"), "없");
+        assert_eq!(typed("ekfr"), "닭");
+    }
+
+    /// The consonants absent from [`CODAS`] open a syllable of their own.
+    #[test]
+    fn a_final_korean_never_writes_starts_a_syllable() {
+        // ㄸ, ㅃ and ㅉ are initials only, so 가 followed by one is two
+        // syllables.
+        assert_eq!(typed("rkE"), "가ㄸ");
+        assert_eq!(typed("rkEk"), "가따");
+        // ㄲ and ㅆ are in CODAS, and stay put.
+        assert_eq!(typed("dlT"), "있");
+    }
+
+    /// Whole words, typed the way they are typed.
+    ///
+    /// 반갑습니다 carries a compound 받침 through one word: ㅂ takes ㅅ as ㅄ,
+    /// and the ㅡ after it splits the pair, leaving 갑 and carrying ㅅ into 스.
+    #[test]
+    fn words_come_out_as_words() {
+        assert_eq!(typed("gksrmf"), "한글");
+        assert_eq!(typed("dkssud"), "안녕");
+        assert_eq!(typed("gksrnrdj"), "한국어");
+        assert_eq!(typed("qksrkqtmqslek"), "반갑습니다");
+    }
+
+    /// A lone consonant and a lone vowel are correct text, and are what
+    /// [`Korean::preedit`] carries while a syllable is half typed.
+    #[test]
+    fn a_half_typed_syllable_shows_as_its_jamo() {
+        assert_eq!(typed("r"), "ㄱ");
+        assert_eq!(typed("k"), "ㅏ");
+        assert_eq!(typed("rr"), "ㄱㄱ");
+        assert_eq!(typed("kk"), "ㅏㅏ");
+    }
+
+    /// 앉 → 안 → 아 → ㅇ → nothing, one jamo at a time.
+    #[test]
+    fn backspace_decomposes_a_syllable() {
+        let mut korean = Korean::default();
+        for key in "dksw".chars() {
+            korean.key(key);
+        }
+        for expected in ["앉", "안", "아", "ㅇ", ""] {
+            assert_eq!(korean.preedit(), expected);
+            assert_eq!(korean.backspace(), !expected.is_empty());
+        }
+        // Empty, and the keystroke is the document.s.
+        assert!(!korean.backspace());
+        assert_eq!(korean.preedit(), "");
+    }
+
+    /// A compound falls back to its head.
+    #[test]
+    fn backspace_undoes_one_half_of_a_compound() {
+        let mut korean = Korean::default();
+        for key in "rhk".chars() {
+            korean.key(key);
+        }
+        assert_eq!(korean.preedit(), "과");
+        korean.backspace();
+        assert_eq!(korean.preedit(), "고");
+    }
+
+    /// Every tail a 받침 can send is in [`INITIALS`], so the migration in
+    /// `Korean::vowel` always has a slot to land in.
+    #[test]
+    fn every_final_can_become_an_initial() {
+        for coda in CODAS {
+            let moves = split(&COMPOUND_CODAS, coda).map_or(coda, |(_, tail)| tail);
+            assert!(
+                INITIALS.contains(&moves),
+                "{coda} would migrate as {moves}, which is no initial"
+            );
+        }
+    }
+
+    /// The layout covers every letter and touches nothing else, which leaves
+    /// Korean.s ASCII punctuation, digits and space to the editor.
+    #[test]
+    fn the_layout_is_the_letters_and_only_the_letters() {
+        for key in 'a'..='z' {
+            assert!(jamo_for(key).is_some(), "{key} writes no jamo");
+        }
+        for key in ['1', '0', '.', ',', ' ', '-', '/', '\'', ';', '\n'] {
+            assert_eq!(jamo_for(key), None, "{key:?} should stay itself");
+        }
+    }
+
+    /// Shift carries the tense consonants and the two iotised vowels. Every
+    /// other capital writes the jamo under the finger.
+    #[test]
+    fn the_shifted_row_is_the_tense_consonants_and_two_vowels() {
+        for (key, jamo) in [
+            ('Q', 'ㅃ'),
+            ('W', 'ㅉ'),
+            ('E', 'ㄸ'),
+            ('R', 'ㄲ'),
+            ('T', 'ㅆ'),
+            ('O', 'ㅒ'),
+            ('P', 'ㅖ'),
+        ] {
+            assert_eq!(jamo_for(key), Some(jamo));
+        }
+        for key in ('A'..='Z').filter(|c| !"QWERTOP".contains(*c)) {
+            assert_eq!(
+                jamo_for(key),
+                jamo_for(key.to_ascii_lowercase()),
+                "{key} is not on the shifted row"
+            );
+        }
+    }
+
+    /// Every jamo [`jamo_for`] produces is in [`INITIALS`] or [`MEDIALS`], so
+    /// [`Korean::key`] has an arm for all of them.
+    #[test]
+    fn every_key_writes_a_jamo_the_composer_knows() {
+        for key in ('a'..='z').chain('A'..='Z') {
+            let jamo = jamo_for(key).unwrap();
+            assert!(
+                INITIALS.contains(&jamo) || MEDIALS.contains(&jamo),
+                "{key} writes {jamo}, which is neither an initial nor a vowel"
+            );
+        }
+    }
+
+    /// **A Korean keyboard types Korean**, capitals included: a capital is the
+    /// tense consonant on the shifted row. Latin is reached by switching
+    /// source.
+    #[test]
+    fn every_letter_is_a_jamo_while_korean_is_on() {
+        use crate::keymap::Action;
+        for composing in [false, true] {
+            for key in ('a'..='z').chain('A'..='Z') {
+                assert_eq!(
+                    compose(&Action::Insert(key), composing, Script::Korean),
+                    Compose::Jamo(key),
+                    "{key} while {}composing",
+                    if composing { "" } else { "not " }
+                );
+            }
+        }
+        // [`Script::Chinese`] and [`Script::Japanese`] send a capital straight
+        // to the page.
+        assert_eq!(
+            compose(&Action::Insert('N'), true, Script::Chinese),
+            Compose::Latin('N')
+        );
+    }
+
+    /// **Every key that is not a letter finishes the syllable and goes on to
+    /// mean what it always means.** No candidate to number, no page to turn,
+    /// and no CJK punctuation: Korean writes ASCII marks.
+    #[test]
+    fn a_key_that_is_not_a_jamo_ends_the_syllable_without_being_eaten() {
+        use crate::keymap::Action;
+        for action in [
+            Action::Insert(' '),
+            Action::Insert('.'),
+            Action::Insert('1'),
+            Action::Insert('\''),
+            Action::Newline,
+            Action::Right,
+            Action::Escape,
+            Action::Undo,
+        ] {
+            assert_eq!(
+                compose(&action, true, Script::Korean),
+                Compose::Finish,
+                "{action:?}"
+            );
+            // With nothing under construction the key passes straight through.
+            assert_eq!(
+                compose(&action, false, Script::Korean),
+                Compose::Pass,
+                "{action:?}"
+            );
+        }
+    }
+
+    /// Backspace decomposes while a syllable holds a jamo, and passes to the
+    /// document past the last one.
+    #[test]
+    fn korean_backspace_reaches_the_composer_only_while_it_holds_one() {
+        use crate::keymap::Action;
+        assert_eq!(
+            compose(&Action::Backspace, true, Script::Korean),
+            Compose::Decompose
+        );
+        assert_eq!(
+            compose(&Action::Backspace, false, Script::Korean),
+            Compose::Pass
+        );
+    }
 
     #[test]
     fn the_stub_grows_a_preedit_and_narrows_the_candidates() {

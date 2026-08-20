@@ -56,8 +56,8 @@ pub trait Metrics {
 /// karyll wrote itself rather than read out of a document.
 pub const LATIN_ROW: &[Role] = &[Role::Chrome];
 
-/// A set of roles that are chosen between as one: the Latin four, or one
-/// convention's Han three.
+/// A set of roles that are chosen between as one: the Latin four, one
+/// convention's Han pair, or Hangul's.
 ///
 /// **The Han faces depend on the region**, because Han unification gives the
 /// three conventions one code point and three correct glyphs. Drawing
@@ -66,24 +66,31 @@ pub const LATIN_ROW: &[Role] = &[Role::Chrome];
 /// Latin chooses once for every language written in it: English and German are
 /// drawn by the same faces, and offering each of them its own setting would be
 /// two controls over one thing.
+///
+/// **Hangul takes no region.** No code point it holds is drawn two ways, so a
+/// Korean family is a plain choice of face, as a Latin one is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     Latin,
     Han(Region),
+    Hangul,
 }
 
 /// Every group, in the order the settings panel lists them.
-pub const GROUPS: [Group; 4] = [
+pub const GROUPS: [Group; 5] = [
     Group::Latin,
     Group::Han(Region::Simplified),
     Group::Han(Region::Traditional),
     Group::Han(Region::Japanese),
+    Group::Hangul,
 ];
 
 impl Group {
     /// The group `role` is chosen as part of.
     fn of(role: Role, region: Region) -> Group {
-        if role.is_han() {
+        if role.is_hangul() {
+            Group::Hangul
+        } else if role.is_han() {
             Group::Han(region)
         } else {
             Group::Latin
@@ -96,14 +103,15 @@ impl Group {
         match self {
             Group::Latin => &LATIN_ROLES,
             Group::Han(_) => &HAN_ROLES,
+            Group::Hangul => &HANGUL_ROLES,
         }
     }
 
-    /// The convention this group draws. Latin has none and answers the default,
-    /// which is the region its slots are filed under.
+    /// The convention this group draws. Latin and Hangul have none and answer
+    /// the default, which is the region their slots are filed under.
     fn region(self) -> Region {
         match self {
-            Group::Latin => Region::default(),
+            Group::Latin | Group::Hangul => Region::default(),
             Group::Han(region) => region,
         }
     }
@@ -119,6 +127,7 @@ impl Group {
             Group::Han(Region::Simplified) => "简体",
             Group::Han(Region::Traditional) => "繁體",
             Group::Han(Region::Japanese) => "日本語",
+            Group::Hangul => "한글",
         }
     }
 
@@ -129,6 +138,7 @@ impl Group {
             Group::Han(Region::Simplified) => "sc",
             Group::Han(Region::Traditional) => "tc",
             Group::Han(Region::Japanese) => "ja",
+            Group::Hangul => "ko",
         }
     }
 }
@@ -284,6 +294,37 @@ const JAPANESE_FAMILIES: &[Family] = &[
     },
 ];
 
+/// Korean, default first.
+///
+/// **All four are in `/usr/java/lib/fonts`**, the base firmware, on every
+/// Kindle karyll runs on: a Korean document draws with nothing installed.
+///
+/// **Their sfnt tag is `OTTO`** — CFF outlines, and the `.otf` extension that
+/// goes with them. `ab_glyph` reads the table. Each holds 13,727 glyphs of
+/// Hangul, Latin and the CJK punctuation, with no Hanja and no kana, which is
+/// what puts them at a tenth of a Han face's size.
+///
+/// **고딕 opens**, on the argument at the head of this file: a one-bit cut
+/// thins a thin horizontal stroke out of existence, and 명조 is a Song-like
+/// face that has them where 고딕 holds an even weight. The bold is a 900
+/// against a 400 body, which is what the firmware carries.
+const HANGUL_FAMILIES: &[Family] = &[
+    Family {
+        name: "고딕",
+        faces: &[
+            "/usr/java/lib/fonts/NotoSansKR-Regular.otf",
+            "/usr/java/lib/fonts/NotoSansKR-Black.otf",
+        ],
+    },
+    Family {
+        name: "명조",
+        faces: &[
+            "/usr/java/lib/fonts/NotoSerifKR-Medium.otf",
+            "/usr/java/lib/fonts/NotoSerifKR-Black.otf",
+        ],
+    },
+];
+
 /// What a group can be set to, best first. Never empty.
 pub fn families(group: Group) -> &'static [Family] {
     match group {
@@ -291,6 +332,7 @@ pub fn families(group: Group) -> &'static [Family] {
         Group::Han(Region::Simplified) => SIMPLIFIED_FAMILIES,
         Group::Han(Region::Traditional) => TRADITIONAL_FAMILIES,
         Group::Han(Region::Japanese) => JAPANESE_FAMILIES,
+        Group::Hangul => HANGUL_FAMILIES,
     }
 }
 
@@ -440,6 +482,10 @@ const LATIN_ROLES: [Role; 4] = [
 /// The Han roles, each of which has a face **per region**.
 const HAN_ROLES: [Role; 2] = [Role::Han, Role::HanBold];
 
+/// The Hangul roles. One face each, at [`HANGUL_AT`]: no unification cuts them
+/// three ways, and [`HANGUL_FAMILIES`] is the whole repertoire.
+const HANGUL_ROLES: [Role; 2] = [Role::Hangul, Role::HangulBold];
+
 /// The chrome roles, in [`CHROME_FACES`] order. One face each and no regional
 /// cuts: karyll's own Latin is the same wherever it is read.
 const CHROME_ROLES: [Role; 2] = [Role::Chrome, Role::ChromeBold];
@@ -449,9 +495,9 @@ const REGIONS: [Region; 3] = [Region::Simplified, Region::Traditional, Region::J
 /// Where `(role, region)` sits in `slots`.
 ///
 /// Latin first, then the Han roles with all three conventions of each side by
-/// side, then [`FALLBACK`]. Every pair has its own slot and keeps it for the
-/// life of the process, which is what lets the advance cache be keyed on the
-/// index rather than on a path.
+/// side, then Hangul, then the chrome and [`FALLBACK`]. Every pair has its own
+/// slot and keeps it for the life of the process, which is what lets the
+/// advance cache be keyed on the index rather than on a path.
 ///
 /// A slot's *contents* do change, when the writer picks another family — and
 /// that is precisely why [`Fonts::set_family`] evicts the cached advances of
@@ -471,11 +517,15 @@ fn slot_of(role: Role, region: Region) -> usize {
                 .expect("every region is listed");
             LATIN_ROLES.len() + at * REGIONS.len() + region
         }
+        Group::Hangul => HANGUL_AT + at,
     }
 }
 
+/// Where the Hangul slots start.
+const HANGUL_AT: usize = LATIN_ROLES.len() + HAN_ROLES.len() * REGIONS.len();
+
 /// Where the chrome slots start.
-const CHROME_AT: usize = LATIN_ROLES.len() + HAN_ROLES.len() * REGIONS.len();
+const CHROME_AT: usize = HANGUL_AT + HANGUL_ROLES.len();
 
 /// Where [`FALLBACK`] starts.
 const FALLBACK_AT: usize = CHROME_AT + CHROME_ROLES.len();
@@ -490,6 +540,10 @@ const FALLBACK_AT: usize = CHROME_AT + CHROME_ROLES.len();
 /// does not re-cut the Han already on the page — it deletes whatever that face
 /// has never heard of.
 ///
+/// **A Hangul role has one face.** The Korean faces carry no Hanja and are
+/// never asked for one: 한자 in Korean prose is
+/// [`karyll_core::script::Script::Han`], and the Han chain draws that run.
+///
 /// The right glyph if the preferred face has it; the character in another
 /// convention's shape if only another does. A wrong shape is a real cost and is
 /// far cheaper than a character that does not appear.
@@ -501,6 +555,30 @@ fn chain_of(role: Role, region: Region) -> Vec<usize> {
         .chain(REGIONS.iter().copied().filter(|r| *r != region))
         .map(|r| slot_of(role, r))
         .collect()
+}
+
+/// One slot per role, in the order [`slot_of`] files them.
+///
+/// [`FALLBACK`] is not here: it is not a role, and [`Fonts::resolve`] reaches
+/// it from `FALLBACK_AT` whatever role was asked for. The one statement of the
+/// order, so a slot index means the same face to every caller — the advance
+/// cache is keyed on it.
+fn role_slots(choices: Choices) -> impl Iterator<Item = Slot> {
+    let region = Region::default();
+    LATIN_ROLES
+        .iter()
+        .map(move |r| Slot::pending(path_for(*r, region, choices)))
+        .chain(HAN_ROLES.iter().flat_map(move |r| {
+            REGIONS
+                .iter()
+                .map(move |g| Slot::pending(path_for(*r, *g, choices)))
+        }))
+        .chain(
+            HANGUL_ROLES
+                .iter()
+                .chain(CHROME_ROLES.iter())
+                .map(move |r| Slot::pending(path_for(*r, region, choices))),
+        )
 }
 
 enum State {
@@ -608,7 +686,9 @@ fn vertical_in(file: &mut (impl std::io::Read + std::io::Seek)) -> Option<Vertic
     file.read_exact(&mut directory).ok()?;
     let offset_of = |tag: &[u8; 4]| -> Option<u64> {
         directory
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .find(|entry| &entry[0..4] == tag)
             .map(|entry| u32::from_be_bytes([entry[8], entry[9], entry[10], entry[11]]) as u64)
     };
@@ -650,8 +730,8 @@ struct Measured {
 }
 
 pub struct Fonts {
-    /// Role faces first, in [`LATIN_ROLES`] then [`HAN_ROLES`] order, then
-    /// [`FALLBACK`].
+    /// Role faces first, in [`LATIN_ROLES`], [`HAN_ROLES`] then
+    /// [`HANGUL_ROLES`] order, then [`FALLBACK`].
     slots: Vec<Slot>,
     /// Advances are re-measured on every wrap, and wrapping runs on a 1 GHz
     /// ARM, so this is worth its memory.
@@ -672,19 +752,7 @@ impl Fonts {
     /// to refuse to start: the chain falls through and the text still draws.
     pub fn load(choices: Choices) -> Result<Self> {
         let region = Region::default();
-        let slots: Vec<Slot> = LATIN_ROLES
-            .iter()
-            .map(|r| Slot::pending(path_for(*r, region, choices)))
-            .chain(HAN_ROLES.iter().flat_map(|r| {
-                REGIONS
-                    .iter()
-                    .map(move |g| Slot::pending(path_for(*r, *g, choices)))
-            }))
-            .chain(
-                CHROME_ROLES
-                    .iter()
-                    .map(|r| Slot::pending(path_for(*r, region, choices))),
-            )
+        let slots: Vec<Slot> = role_slots(choices)
             .chain(FALLBACK.iter().map(|p| Slot::pending(p)))
             .collect();
         if !slots.iter().any(|s| Path::new(s.path).is_file()) {
@@ -941,11 +1009,11 @@ impl Metrics for Stub {
         10.0
     }
 
-    /// A Han role makes the row a fifth taller, standing in for the real faces:
-    /// Han glyphs are taller than Amazon Ember's ascent, and every bug this
+    /// A CJK role makes the row a fifth taller, standing in for the real faces:
+    /// those glyphs are taller than Amazon Ember's ascent, and every bug this
     /// stub exists to catch comes from a row that does not know it.
     fn line_height(&mut self, px: f32, roles: &[Role]) -> f32 {
-        if roles.iter().any(is_han) {
+        if roles.iter().any(is_cjk) {
             px * 1.2
         } else {
             px
@@ -953,7 +1021,7 @@ impl Metrics for Stub {
     }
 
     fn ascent(&mut self, px: f32, roles: &[Role]) -> f32 {
-        if roles.iter().any(is_han) {
+        if roles.iter().any(is_cjk) {
             px
         } else {
             px * 0.8
@@ -961,7 +1029,7 @@ impl Metrics for Stub {
     }
 }
 
-/// Metrics in the proportions the real faces have: a Han glyph is one em wide
+/// Metrics in the proportions the real faces have: a CJK glyph is one em wide
 /// and a Latin one about half.
 ///
 /// [`Stub`]'s flat ten units are easier to check arithmetic against, and they
@@ -976,7 +1044,7 @@ pub struct Proportional;
 #[cfg(test)]
 impl Metrics for Proportional {
     fn advance(&mut self, role: Role, px: f32, _ch: char) -> f32 {
-        if role.is_han() { px } else { px * 0.5 }
+        if is_cjk(&role) { px } else { px * 0.5 }
     }
 
     fn line_height(&mut self, px: f32, roles: &[Role]) -> f32 {
@@ -988,9 +1056,11 @@ impl Metrics for Proportional {
     }
 }
 
+/// A role drawn from a CJK face: one em wide, and taller than a Latin ascent.
+/// Han and Hangul take the same room.
 #[cfg(test)]
-fn is_han(role: &Role) -> bool {
-    matches!(role, Role::Han | Role::HanBold)
+fn is_cjk(role: &Role) -> bool {
+    role.is_han() || role.is_hangul()
 }
 
 #[cfg(test)]
@@ -1001,7 +1071,11 @@ mod tests {
     // exist. They cover the parts that do not need the files.
 
     fn all_roles() -> impl Iterator<Item = Role> {
-        LATIN_ROLES.into_iter().chain(HAN_ROLES).chain(CHROME_ROLES)
+        LATIN_ROLES
+            .into_iter()
+            .chain(HAN_ROLES)
+            .chain(HANGUL_ROLES)
+            .chain(CHROME_ROLES)
     }
 
     /// Every family for every group, which is what most of these check.
@@ -1218,32 +1292,39 @@ mod tests {
         }
     }
 
-    /// **A Han family is one design at two weights**, because emphasis is a
+    /// **A CJK family is one design at two weights**, because emphasis is a
     /// mark against the character rather than a second face — an entry that
     /// reached outside its own design for the bold would set a bold word in a
     /// family the writer did not choose.
     #[test]
-    fn a_han_family_is_one_design_bodied_and_bolded() {
+    fn a_cjk_family_is_one_design_bodied_and_bolded() {
         for (group, _, family) in all_families() {
-            if matches!(group, Group::Latin) {
+            let [body, bold] = group.roles() else {
+                assert!(
+                    matches!(group, Group::Latin),
+                    "{} is no pair",
+                    group.label()
+                );
                 continue;
-            }
-            let body = index_in(group, Role::Han);
-            let bold = index_in(group, Role::HanBold);
+            };
             assert_ne!(
-                family.faces[body], family.faces[bold],
+                family.faces[index_in(group, *body)],
+                family.faces[index_in(group, *bold)],
                 "{} sets bold in its own body face",
                 family.name
             );
             assert_eq!(family.faces.len(), 2, "{} is not a pair", family.name);
         }
-        // The sans by default in each convention's own families — 黑体 for
-        // Chinese, ゴシック for Japanese.
+        // The sans by default in every writing system — 黑体 for Chinese,
+        // ゴシック for Japanese, 고딕 for Korean.
         let default = Choices::default();
+        let ko = Region::default();
         assert!(path_for(Role::Han, Region::Simplified, default).contains("STHeiti"));
         assert!(path_for(Role::HanBold, Region::Simplified, default).contains("STHeitiBold"));
         assert!(path_for(Role::Han, Region::Japanese, default).contains("TBGothic"));
         assert!(path_for(Role::HanBold, Region::Japanese, default).contains("TBGothicBold"));
+        assert!(path_for(Role::Hangul, ko, default).contains("NotoSansKR-Regular"));
+        assert!(path_for(Role::HangulBold, ko, default).contains("NotoSansKR-Black"));
     }
 
     /// Traditional Chinese and Japanese must not be drawn from the Simplified
@@ -1432,23 +1513,9 @@ mod tests {
     }
 
     fn bare(choices: Choices) -> Fonts {
-        let region = Region::default();
         Fonts {
-            slots: LATIN_ROLES
-                .iter()
-                .map(|r| Slot::pending(path_for(*r, region, choices)))
-                .chain(HAN_ROLES.iter().flat_map(|r| {
-                    REGIONS
-                        .iter()
-                        .map(move |g| Slot::pending(path_for(*r, *g, choices)))
-                }))
-                .chain(
-                    CHROME_ROLES
-                        .iter()
-                        .map(|r| Slot::pending(path_for(*r, region, choices))),
-                )
-                .collect(),
-            region,
+            slots: role_slots(choices).collect(),
+            region: Region::default(),
             advances: HashMap::new(),
             choices,
         }

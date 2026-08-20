@@ -31,7 +31,7 @@
 
 use anyhow::Result;
 use karyll_core::markdown::{Block, LineMarkup, Style};
-use karyll_core::script::{Role, role_for, script_of, takes_mark};
+use karyll_core::script::{Role, mark_above, role_for, script_of, takes_mark};
 use karyll_core::wrap;
 
 use crate::font::{Fonts, Metrics};
@@ -174,34 +174,41 @@ impl Theme {
 
 /// Where an emphasis mark sits on a line, and how big it is.
 ///
-/// **In the air the leading leaves.** A Han glyph fills its em, so the only
+/// **In the air the leading leaves.** A CJK glyph fills its em, so the only
 /// room for a mark is between one row's glyph box and the next — the same air
 /// on every row, which is what keeps a marked line the height of an unmarked
 /// one and a page of them evenly spaced. Nothing about the mark reaches the
 /// wrap: it takes no width, so a marked run breaks exactly where the same run
 /// unmarked would.
+///
+/// **Both sides are measured.** Chinese sets 着重号 under the character and
+/// Korean sets 드러냄표 over it, so a sentence mixing 简体 with 한글 draws a
+/// mark on each side of one line.
 struct Mark {
-    /// Baseline to the centre of the mark, positive downwards.
-    offset: f32,
+    /// Baseline to the centre of the mark on each side, positive downwards.
+    above: f32,
+    below: f32,
     radius: u16,
 }
 
 impl Mark {
     /// Measured once per line, from the metrics the row is already built from.
-    fn on(fonts: &mut impl Metrics, roles: &[Role], px: f32, above: bool) -> Self {
+    fn on(fonts: &mut impl Metrics, roles: &[Role], px: f32) -> Self {
         // A sixteenth of the type size: 3 px against a 46 px body, which is
         // half the width of the caret and reads as a dot rather than a bullet.
         let radius = (px / 16.0).round().max(2.0);
         let ascent = fonts.ascent(px, roles);
         let box_height = fonts.line_height(px, roles);
         Self {
-            offset: if above {
-                -(ascent + radius + 1.0)
-            } else {
-                box_height - ascent + radius + 1.0
-            },
+            above: -(ascent + radius + 1.0),
+            below: box_height - ascent + radius + 1.0,
             radius: radius as u16,
         }
+    }
+
+    /// Baseline to the centre of the mark, on the side [`mark_above`] names.
+    fn offset(&self, above: bool) -> f32 {
+        if above { self.above } else { self.below }
     }
 }
 
@@ -215,6 +222,7 @@ fn emphasis_mark(
     window: &mut Window,
     line: &VisualLine,
     mark: &Mark,
+    above: bool,
     cx: f32,
     baseline: f32,
     ink: u8,
@@ -222,7 +230,7 @@ fn emphasis_mark(
     let radius = mark.radius as f32;
     let top = line.y as f32 + radius;
     let bottom = (line.y + line.height) as f32 - radius;
-    let cy = (baseline + mark.offset).clamp(top, bottom);
+    let cy = (baseline + mark.offset(above)).clamp(top, bottom);
     if cx < radius || cy < radius {
         return;
     }
@@ -1519,8 +1527,9 @@ pub fn paint(
     let span = selection_span(&selected);
     let fields = highlight_fields(page, fonts, &lines);
     // Read once: the convention is the document's, and it cannot change while
-    // one page is being drawn.
-    let marks_above = fonts.region().mark_above();
+    // one page is being drawn. [`mark_above`] takes it per character, since
+    // Hangul answers from the script.
+    let region = fonts.region();
 
     // Damage is clipped to the page. A rewrap extends it to the foot of the
     // surface, and without this that clears the action strip — which is drawn
@@ -1597,7 +1606,7 @@ pub fn paint(
         };
         let roles = roles_for_line(entry, page.chars);
         let styles = styles_for_line(entry);
-        let mark = Mark::on(fonts, &page.roles, line.px, marks_above);
+        let mark = Mark::on(fonts, &page.roles, line.px);
 
         let mut pen = line.marker.pen(line.prose);
         let baseline = (line.y + line.baseline) as f32;
@@ -1666,7 +1675,16 @@ pub fn paint(
             // Before the glyph rather than after it, so a mark can never be
             // drawn over the character it belongs to.
             if matches!(style, Style::Emphasis | Style::StrongEmphasis) && takes_mark(ch) {
-                emphasis_mark(window, line, &mark, origin_x + advance / 2.0, baseline, ink);
+                let above = mark_above(script_of(ch), region);
+                emphasis_mark(
+                    window,
+                    line,
+                    &mark,
+                    above,
+                    origin_x + advance / 2.0,
+                    baseline,
+                    ink,
+                );
             }
             fonts.draw(role, line.px, ch, |gx, gy, coverage| {
                 // The rasterizer reports coverage; the panel takes ink. One bit,
@@ -1809,19 +1827,41 @@ mod tests {
     #[test]
     fn the_emphasis_mark_sits_outside_the_glyph_box() {
         let mut fonts = crate::font::Stub;
-        let roles = [Role::Han];
+        let roles = [Role::Han, Role::Hangul];
         let ascent = fonts.ascent(DEFAULT_SIZE, &roles);
         let box_height = fonts.line_height(DEFAULT_SIZE, &roles);
-        let above = Mark::on(&mut fonts, &roles, DEFAULT_SIZE, true);
-        let below = Mark::on(&mut fonts, &roles, DEFAULT_SIZE, false);
+        let mark = Mark::on(&mut fonts, &roles, DEFAULT_SIZE);
         assert!(
-            above.offset + above.radius as f32 <= -ascent,
-            "the Japanese mark reaches into the glyphs"
+            mark.above + mark.radius as f32 <= -ascent,
+            "the 圏点 and 드러냄표 side reaches into the glyphs"
         );
         assert!(
-            below.offset - below.radius as f32 >= box_height - ascent,
-            "the Chinese mark reaches into the glyphs"
+            mark.below - mark.radius as f32 >= box_height - ascent,
+            "the 着重号 side reaches into the glyphs"
         );
+    }
+
+    /// **One line, two sides.** A sentence that mixes 简体 with 한글 takes
+    /// [`Mark::above`] for the Hangul and [`Mark::below`] for the Han, at every
+    /// [`Region`].
+    #[test]
+    fn hangul_and_han_are_marked_on_their_own_sides() {
+        use karyll_core::script::Region;
+        let mut fonts = crate::font::Stub;
+        let mark = Mark::on(&mut fonts, &[Role::Han, Role::Hangul], DEFAULT_SIZE);
+        for region in [Region::Simplified, Region::Traditional, Region::Japanese] {
+            let hangul = mark.offset(mark_above(script_of('글'), region));
+            let han = mark.offset(mark_above(script_of('字'), region));
+            assert_eq!(hangul, mark.above, "{region:?} moved 드러냄표 below");
+            assert_eq!(
+                han,
+                if region == Region::Japanese {
+                    mark.above
+                } else {
+                    mark.below
+                }
+            );
+        }
     }
 
     /// **Every size has to leave the mark room**, or [`emphasis_mark`] clamps it
@@ -1830,18 +1870,16 @@ mod tests {
     #[test]
     fn every_size_leaves_the_mark_room_in_the_leading() {
         let mut fonts = crate::font::Stub;
-        let roles = [Role::Han];
+        let roles = [Role::Han, Role::Hangul];
         for px in SIZES {
             let box_height = fonts.line_height(px, &roles);
             let air = (box_height * Theme::at(px, DEFAULT_MARGIN).leading - box_height) / 2.0;
-            for above in [true, false] {
-                let mark = Mark::on(&mut fonts, &roles, px, above);
-                let needed = 2.0 * mark.radius as f32 + 1.0;
-                assert!(
-                    needed <= air,
-                    "{px} px leaves {air:.1} px of leading for a mark wanting {needed}"
-                );
-            }
+            let mark = Mark::on(&mut fonts, &roles, px);
+            let needed = 2.0 * mark.radius as f32 + 1.0;
+            assert!(
+                needed <= air,
+                "{px} px leaves {air:.1} px of leading for a mark wanting {needed}"
+            );
         }
     }
 

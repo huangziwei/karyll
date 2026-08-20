@@ -168,6 +168,7 @@ mod tests {
             Language::Chinese,
             Language::ChineseTraditional,
             Language::Japanese,
+            Language::Korean,
         ] {
             assert!(
                 !DICTIONARIES.iter().any(|(l, _, _)| *l == language),

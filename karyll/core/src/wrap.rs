@@ -129,12 +129,21 @@ pub fn can_break_between(a: char, b: char) -> bool {
 /// well as words — and a gap opened between `*` and 世 would push the emphasis
 /// marker off the character it marks.
 ///
+/// **Hangul is not 欧文.** It classifies as [`Class::Other`] and is
+/// alphanumeric, which is the pair `latin` tests, so the predicate names the
+/// script as well. A quarter em between 漢字 and 한글 is a gap Korean does not
+/// write: Hangul is set on the same even em Han is.
+///
 /// **Nothing against punctuation on either side.** A mark carries its own
 /// sidebearing inside its em box, and a quarter em on top of that reads as two
 /// spaces rather than as one.
 pub fn aki(a: char, b: char) -> bool {
     let han = |c| classify(c) == Class::Ideograph;
-    let latin = |c: char| classify(c) == Class::Other && c.is_alphanumeric();
+    let latin = |c: char| {
+        classify(c) == Class::Other
+            && c.is_alphanumeric()
+            && crate::script::script_of(c) != crate::script::Script::Hangul
+    };
     han(a) && latin(b) || latin(a) && han(b)
 }
 
@@ -781,6 +790,8 @@ mod tests {
         assert!(!aki('世', '。'), "a stop carries its own sidebearing");
         assert!(!aki('」', 'a'));
         assert!(!aki('世', ' '), "a space is already a space");
+        assert!(!aki('漢', '한'), "Hangul is CJK, not 欧文");
+        assert!(!aki('글', '字'));
     }
 
     /// A width set on the line, not on either character: the same eleven

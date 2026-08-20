@@ -235,6 +235,7 @@ fn main() -> Result<()> {
         last_edit: None,
         dirty_since: None,
         engines: Vec::new(),
+        korean: ime::Korean::default(),
         cjk: false,
         typed: String::new(),
         preedit: String::new(),
@@ -342,15 +343,19 @@ enum Language {
     /// Japanese: romaji typed, kana and kanji out. A different engine from
     /// Chinese's — Omron iWnn rather than XT9 — behind the same plugin ABI.
     Japanese,
+    /// Korean: 두벌식 typed, Hangul out. No engine at all — a syllable is
+    /// arithmetic on a code point, so karyll composes it itself.
+    Korean,
 }
 
 impl Language {
-    const ALL: [Language; 5] = [
+    const ALL: [Language; 6] = [
         Language::English,
         Language::German,
         Language::Chinese,
         Language::ChineseTraditional,
         Language::Japanese,
+        Language::Korean,
     ];
 
     /// What the button says. Each names itself the way its writers would, and
@@ -362,6 +367,9 @@ impl Language {
             Language::Chinese => "简体",
             Language::ChineseTraditional => "繁體",
             Language::Japanese => "日本語",
+            // 한, not 한국어: the button carries the 한/영 key's own word for
+            // the state it puts the keyboard in, and it is the shorter for it.
+            Language::Korean => "한",
         }
     }
 
@@ -372,6 +380,7 @@ impl Language {
             Language::Chinese => 'c',
             Language::ChineseTraditional => 't',
             Language::Japanese => 'j',
+            Language::Korean => 'k',
         }
     }
 
@@ -381,6 +390,7 @@ impl Language {
             "c" => Language::Chinese,
             "t" => Language::ChineseTraditional,
             "j" => Language::Japanese,
+            "k" => Language::Korean,
             _ => Language::English,
         }
     }
@@ -396,6 +406,7 @@ impl Language {
         match self {
             Language::Chinese | Language::ChineseTraditional => Some(ime::Script::Chinese),
             Language::Japanese => Some(ime::Script::Japanese),
+            Language::Korean => Some(ime::Script::Korean),
             Language::English | Language::German => None,
         }
     }
@@ -406,12 +417,27 @@ impl Language {
     /// The Latin languages keep whatever was last set rather than forcing a
     /// convention of their own: switching to English to type a word in the
     /// middle of a Japanese paragraph must not re-cut the kanji around it.
+    /// Korean names none either: Hangul carries no unification, and 한자 in
+    /// Korean prose is drawn by whichever convention the document holds.
     fn region(self) -> Option<karyll_core::script::Region> {
         match self {
             Language::Chinese => Some(karyll_core::script::Region::Simplified),
             Language::ChineseTraditional => Some(karyll_core::script::Region::Traditional),
             Language::Japanese => Some(karyll_core::script::Region::Japanese),
-            Language::English | Language::German => None,
+            Language::English | Language::German | Language::Korean => None,
+        }
+    }
+
+    /// Which font row in the Config panel this language is set from.
+    ///
+    /// One row per writing system: English and German share the Latin faces,
+    /// the three Han conventions have one each, and Korean has a row no
+    /// convention touches.
+    fn font_group(self) -> font::Group {
+        match self.region() {
+            Some(region) => font::Group::Han(region),
+            None if self == Language::Korean => font::Group::Hangul,
+            None => font::Group::Latin,
         }
     }
 
@@ -444,15 +470,15 @@ impl Language {
     /// is no layout control anywhere in karyll, only this: choosing German
     /// chooses QWERTZ, and a French entry would choose AZERTY.
     ///
-    /// Chinese is US, and Japanese would be too. Pinyin and romaji are both
-    /// defined against the QWERTY letter arrangement — that is what every IME
-    /// assumes and what macOS does regardless of the hardware underneath — so
-    /// they do not inherit whatever keyboard was last used for prose.
+    /// The CJK three are US. Pinyin, romaji and 두벌식 are all defined against
+    /// the QWERTY letter arrangement — that is what every IME assumes and what
+    /// macOS does regardless of the hardware underneath — so they do not
+    /// inherit whatever keyboard was last used for prose. [`ime::Korean`] maps
+    /// the letter this layout resolves onto a jamo, which leaves Korean's ASCII
+    /// punctuation, digits and Ctrl chords where every other language has them.
     fn layout(self) -> keymap::Layout {
         match self {
             Language::German => keymap::Layout::German,
-            // Everything else is written on QWERTY: pinyin and romaji are both
-            // defined against that arrangement.
             _ => keymap::Layout::Us,
         }
     }
@@ -574,6 +600,24 @@ enum Sink {
     Find,
     /// The filename being typed.
     Name,
+}
+
+/// What offering a keystroke to an input method did with it.
+///
+/// **[`Composed::Finished`] is Korean's.** A half-typed Hangul syllable is
+/// correct text as it stands, so [`ime::Compose::Finish`] commits it and leaves
+/// the key to mean what it always means — a space, a line break, a move. The
+/// key reaches the editor and the surface has changed; a caller that paints on
+/// [`Composed::Took`] alone draws the syllable as a composition after writing
+/// it into the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Composed {
+    /// Handled. The editor must not see this key.
+    Took,
+    /// Not handled, and the composition was committed on the way out.
+    Finished,
+    /// Untouched.
+    Passed,
 }
 
 struct Editor {
@@ -716,7 +760,11 @@ struct Editor {
     /// mapped dictionary pages, which the kernel can evict; getting it wrong
     /// costs a crash mid-sentence.
     engines: Vec<(ime::Script, Box<dyn ime::Ime>)>,
-    /// Whether keys are going to an engine at all. Ctrl+Space toggles it.
+    /// The Hangul syllable being typed. A few bytes of state with no plugin,
+    /// no dictionary and no candidate list behind them, so it is always
+    /// available and never loaded.
+    korean: ime::Korean,
+    /// Whether keys are going to an input method at all. Ctrl+Space toggles it.
     cjk: bool,
     /// The keys sent towards the current word, what the engine makes of them,
     /// and what it offers for it.
@@ -1065,9 +1113,13 @@ impl Editor {
                     let Some(action) = self.pressed_action(&event) else {
                         continue;
                     };
-                    if self.compose_key(&action) {
-                        dirty = true;
-                        continue;
+                    match self.compose_key(&action) {
+                        Composed::Took => {
+                            dirty = true;
+                            continue;
+                        }
+                        Composed::Finished => dirty = true,
+                        Composed::Passed => {}
                     }
                     // Settled — the name is taken or abandoned, and whatever
                     // that moved to has painted itself.
@@ -1137,9 +1189,13 @@ impl Editor {
                     let Some(action) = self.pressed_action(&event) else {
                         continue;
                     };
-                    if self.compose_key(&action) {
-                        dirty = true;
-                        continue;
+                    match self.compose_key(&action) {
+                        Composed::Took => {
+                            dirty = true;
+                            continue;
+                        }
+                        Composed::Finished => dirty = true,
+                        Composed::Passed => {}
                     }
                     // The bar has closed, and closing it painted.
                     if self.typed_query(&action)? {
@@ -1168,7 +1224,7 @@ impl Editor {
                 // Chinese input gets first refusal. It only takes keys it has a
                 // use for, so English typing is untouched even while the engine
                 // is switched on.
-                if self.compose_key(&action) {
+                if self.compose_key(&action) == Composed::Took {
                     dirty = true;
                     continue;
                 }
@@ -4418,6 +4474,9 @@ impl Editor {
             ime::Script::Japanese => {
                 ime::Japanese::open().map(|e| Box::new(e) as Box<dyn ime::Ime>)
             }
+            // [`Editor::korean`] composes Hangul in this process. No plugin to
+            // open, and nothing here that can fail.
+            ime::Script::Korean => return true,
         };
         match loaded {
             Ok(engine) => {
@@ -4441,17 +4500,19 @@ impl Editor {
             .map(|(_, e)| e)
     }
 
-    /// Offer a keystroke to Chinese input. Returns whether it was consumed.
+    /// Offer a keystroke to the selected input method.
     ///
     /// Every rule about *what* a key means lives in [`ime::compose`], which is
-    /// pure and tested. This is only the part that needs the engine and the
-    /// document.
-    fn compose_key(&mut self, action: &Action) -> bool {
+    /// pure and tested. This is the part that needs the engine and the
+    /// document, and it is two: [`Editor::compose_plugin`] drives a session
+    /// with candidates and pages, [`Editor::compose_hangul`] drives the state
+    /// machine in this process. [`ime::compose`] is all they share.
+    fn compose_key(&mut self, action: &Action) -> Composed {
         let Some(script) = self.language.script() else {
-            return false;
+            return Composed::Passed;
         };
         if !self.cjk {
-            return false;
+            return Composed::Passed;
         }
         // Asked of [`Editor::composing`] rather than of `typed`, so that one
         // answer drives the rules, the bar and the hit-testing together. They
@@ -4460,8 +4521,50 @@ impl Editor {
         // and a backspace then empties `typed` while the engine is still
         // holding kana. Keying the rules off `typed` would stop composing with
         // a composition still on screen.
-        match ime::compose(action, self.composing(), script) {
-            ime::Compose::Pass => return false,
+        let compose = ime::compose(action, self.composing(), script);
+        if script == ime::Script::Korean {
+            self.compose_hangul(compose)
+        } else {
+            self.compose_plugin(compose, script)
+        }
+    }
+
+    /// Korean: three cases, and no engine to reach for.
+    ///
+    /// [`ime::Korean::key`] hands back whatever the keystroke finished — the
+    /// empty string for most, and the previous syllable when a vowel has taken
+    /// its 받침 away.
+    fn compose_hangul(&mut self, compose: ime::Compose) -> Composed {
+        match compose {
+            ime::Compose::Jamo(key) => {
+                let done = self.korean.key(key);
+                self.preedit = self.korean.preedit();
+                self.insert_committed(&done);
+                Composed::Took
+            }
+            ime::Compose::Decompose => {
+                self.korean.backspace();
+                self.preedit = self.korean.preedit();
+                Composed::Took
+            }
+            // The key is not consumed: space is a space, Enter breaks the
+            // line, an arrow moves the cursor past what was written.
+            ime::Compose::Finish => {
+                let text = self.korean.take();
+                self.preedit.clear();
+                self.insert_committed(&text);
+                Composed::Finished
+            }
+            _ => Composed::Passed,
+        }
+    }
+
+    /// Chinese and Japanese, which are a session with one of Amazon's plugins:
+    /// candidates on a bar, a page to turn, and a commit that may convert only
+    /// the front of the reading.
+    fn compose_plugin(&mut self, compose: ime::Compose, script: ime::Script) -> Composed {
+        match compose {
+            ime::Compose::Pass => return Composed::Passed,
             // Backspace is fed to the engine, which drops one unit and
             // re-predicts, so what is shown follows rather than leads.
             ime::Compose::Feed('\u{8}') => {
@@ -4523,8 +4626,12 @@ impl Editor {
                 self.insert_committed(&text);
             }
             ime::Compose::Cancel => self.abandon_composition(),
+            // [`Editor::compose_hangul`] takes these three.
+            ime::Compose::Jamo(_) | ime::Compose::Decompose | ime::Compose::Finish => {
+                return Composed::Passed;
+            }
         }
-        true
+        Composed::Took
     }
 
     /// Send one key to the engine, and take back both of the things it changes:
@@ -4682,6 +4789,7 @@ impl Editor {
         if let Some(engine) = self.engine() {
             engine.clear();
         }
+        self.korean.clear();
         self.typed.clear();
         self.preedit.clear();
         self.set_candidates(Vec::new());
@@ -5501,10 +5609,7 @@ fn write_languages(enabled: &[Language]) {
 fn font_groups(enabled: &[Language]) -> Vec<font::Group> {
     let mut groups: Vec<font::Group> = Vec::new();
     for language in Language::ALL.into_iter().filter(|l| enabled.contains(l)) {
-        let group = match language.region() {
-            Some(region) => font::Group::Han(region),
-            None => font::Group::Latin,
-        };
+        let group = language.font_group();
         if !groups.contains(&group) {
             groups.push(group);
         }
@@ -5902,11 +6007,14 @@ fn help_items() -> Vec<ui::Item> {
         // The rule, said once rather than repeated on every row above.
         row("Close it again", "The same shortcut, or Esc"),
         row("Leave karyll", "Ctrl/⌘ + Q"),
-        heading("Writing in Chinese and Japanese"),
+        heading("Writing in Chinese, Japanese and Korean"),
         row("Switch input source", "Ctrl + Space"),
         row("Take a candidate", "Space, or 1 … 0"),
         row("Take the letters as typed", "Shift + Enter"),
         row("Drop the half-typed word", "Esc"),
+        // Korean offers no candidates, so this is the one key it reads
+        // differently from the two rows above.
+        row("Take one jamo back, in Korean", "Backspace"),
         row("Emphasis, marked not slanted", "Ctrl/⌘ + I"),
         heading("Touch and pen"),
         // First, because it is the only way through a long document with
@@ -7153,6 +7261,17 @@ nine words in this one under the third level
             vec![
                 font::Group::Han(Region::Simplified),
                 font::Group::Han(Region::Traditional)
+            ]
+        );
+        // Korean is a row of its own: the Korean faces carry no Hanja and the
+        // Han faces carry no Hangul.
+        assert_eq!(font_groups(&[Language::Korean]), vec![font::Group::Hangul]);
+        assert_eq!(
+            font_groups(&[Language::English, Language::Japanese, Language::Korean]),
+            vec![
+                font::Group::Latin,
+                font::Group::Han(Region::Japanese),
+                font::Group::Hangul
             ]
         );
     }

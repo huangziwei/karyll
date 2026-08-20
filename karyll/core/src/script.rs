@@ -12,12 +12,13 @@
 //! run, which is what keeps Han unification from setting one paragraph in two
 //! conventions.
 //!
-//! **Han emphasis is a mark, not a slant.** An oblique Han glyph is a
+//! **CJK emphasis is a mark, not a slant.** An oblique Han or Hangul glyph is a
 //! synthetic distortion rather than a style the script has, so emphasis is set
 //! the way the writing systems themselves set it: a dot against each character
-//! — 着重号 under it in Chinese, 圏点 over it in Japanese. The face does not
-//! change, which is what lets one sentence carry both — [`role_for`] gives
-//! Latin a real italic and leaves Han upright for [`takes_mark`] to point at.
+//! — 着重号 under it in Chinese, 圏点 over it in Japanese, 드러냄표 over it in
+//! Korean. The face does not change, which is what lets one sentence carry both
+//! — [`role_for`] gives Latin a real italic and leaves the CJK scripts upright
+//! for [`takes_mark`] to point at.
 
 use crate::markdown::{Block, Style};
 
@@ -27,6 +28,12 @@ pub enum Script {
     Latin,
     /// Han, kana and the fullwidth forms — everything set from a CJK face.
     Han,
+    /// Hangul: the syllables, and the jamo a half-composed syllable shows as.
+    ///
+    /// **The Korean faces carry no Hanja and the Han faces carry no Hangul.**
+    /// 한자 written in Korean prose is a Han run beside a Hangul one, and each
+    /// is drawn by the family that has it.
+    Hangul,
     /// Anything else. Drawn from the Latin chain, falling back through it.
     Other,
 }
@@ -40,6 +47,9 @@ pub fn script_of(c: char) -> Script {
         | 0xF900..=0xFAFF
         | 0xFF00..=0xFF60
         | 0x20000..=0x3FFFF => Script::Han,
+        // The syllables, the conjoining jamo they decompose into, and the
+        // compatibility jamo a half-composed syllable is shown as.
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7AF => Script::Hangul,
         // ASCII and the Latin supplements, which is the bulk of prose here.
         0x0020..=0x024F | 0x2000..=0x206F | 0x2200..=0x22FF => Script::Latin,
         _ => Script::Other,
@@ -58,6 +68,9 @@ pub enum Role {
     /// Han body. Emphasis is set in it too, and marked rather than slanted.
     Han,
     HanBold,
+    /// Hangul body. Emphasis is a 드러냄표 against the character.
+    Hangul,
+    HangulBold,
     /// karyll's own Latin text — a panel label, the action strip, a filename.
     Chrome,
     ChromeBold,
@@ -66,6 +79,10 @@ pub enum Role {
 impl Role {
     pub fn is_han(self) -> bool {
         matches!(self, Role::Han | Role::HanBold)
+    }
+
+    pub fn is_hangul(self) -> bool {
+        matches!(self, Role::Hangul | Role::HangulBold)
     }
 
     /// Whether this role draws karyll's own text rather than the document's.
@@ -84,16 +101,19 @@ impl Role {
 /// no longer fitting after it. So Latin chrome is pinned, and [`role_for`] is
 /// left to the document alone.
 ///
-/// **Han chrome is not pinned**, and follows the writer's Han family. A label
+/// **CJK chrome is not pinned**, and follows the writer's own family. A label
 /// that says 简体 is showing which convention is set as well as naming it, and
 /// there is no second Han face to pin it to that would not be one more 10 MB
-/// file resident for the sake of four labels.
+/// file resident for the sake of four labels. Amazon Ember has no Hangul, so a
+/// 한글 label draws from the Korean family.
 pub fn chrome_role_for(bold: bool, script: Script) -> Role {
-    match (script == Script::Han, bold) {
-        (true, true) => Role::HanBold,
-        (true, false) => Role::Han,
-        (false, true) => Role::ChromeBold,
-        (false, false) => Role::Chrome,
+    match (script, bold) {
+        (Script::Han, true) => Role::HanBold,
+        (Script::Han, false) => Role::Han,
+        (Script::Hangul, true) => Role::HangulBold,
+        (Script::Hangul, false) => Role::Hangul,
+        (_, true) => Role::ChromeBold,
+        (_, false) => Role::Chrome,
     }
 }
 
@@ -133,25 +153,45 @@ impl Region {
     }
 }
 
+/// Which side of a character an emphasis mark sits on.
+///
+/// **Korean sets 드러냄표 over the character**, as Japanese sets 圏点. Hangul
+/// carries no unification ambiguity, so [`Region`] holds no Korean entry and
+/// [`Script::Hangul`] answers from `script` alone. Han asks the document,
+/// through [`Region::mark_above`].
+pub fn mark_above(script: Script, region: Region) -> bool {
+    match script {
+        Script::Hangul => true,
+        _ => region.mark_above(),
+    }
+}
+
 /// Whether an emphasised character carries a mark of its own.
 ///
 /// **A mark per character, and only where a character is what it is against.**
-/// Han is written without spaces and every glyph is the same width, so a mark
-/// under each one reads as a run; a mark under the space or the comma between
-/// two of them reads as a mistake. Latin inside the same emphasis is set in a
-/// real italic instead and is never marked.
+/// Han and Hangul are written on an even em, so a mark against each one reads
+/// as a run; a mark under the space or the comma between two of them reads as a
+/// mistake. Latin inside the same emphasis is set in a real italic instead and
+/// is never marked.
+///
+/// Korean sets its punctuation in ASCII, which classifies as [`Script::Latin`],
+/// so the Hangul blocks hold letters and every one of them takes a mark.
 pub fn takes_mark(c: char) -> bool {
-    if script_of(c) != Script::Han || c.is_whitespace() {
-        return false;
+    match script_of(c) {
+        Script::Hangul => true,
+        Script::Han if !c.is_whitespace() => {
+            // The CJK punctuation block, and the fullwidth forms of the ASCII
+            // marks — the fullwidth *letters* and digits between them are text
+            // and take a mark.
+            !matches!(c as u32,
+                0x3000..=0x303F
+                | 0xFF01..=0xFF0F
+                | 0xFF1A..=0xFF20
+                | 0xFF3B..=0xFF40
+                | 0xFF5B..=0xFF65)
+        }
+        _ => false,
     }
-    // The CJK punctuation block, and the fullwidth forms of the ASCII marks —
-    // the fullwidth *letters* and digits between them are text and take a mark.
-    !matches!(c as u32,
-        0x3000..=0x303F
-        | 0xFF01..=0xFF0F
-        | 0xFF1A..=0xFF20
-        | 0xFF3B..=0xFF40
-        | 0xFF5B..=0xFF65)
 }
 
 /// The face for a run, given what it is and where it sits.
@@ -163,13 +203,20 @@ pub fn role_for(block: Block, style: Style, script: Script) -> Role {
     let emphasis = matches!(style, Style::Emphasis | Style::StrongEmphasis);
     let strong = matches!(style, Style::Strong | Style::StrongEmphasis);
 
-    // Han emphasis does not appear here at all: it is a mark beside the
+    // CJK emphasis does not appear here at all: it is a mark beside the
     // character, drawn by the renderer, and the face stays where it is.
     if script == Script::Han {
         return if heading || strong {
             Role::HanBold
         } else {
             Role::Han
+        };
+    }
+    if script == Script::Hangul {
+        return if heading || strong {
+            Role::HangulBold
+        } else {
+            Role::Hangul
         };
     }
 
@@ -237,7 +284,27 @@ mod tests {
         assert_eq!(script_of('世'), Script::Han);
         assert_eq!(script_of('。'), Script::Han);
         assert_eq!(script_of('あ'), Script::Han);
+        assert_eq!(script_of('한'), Script::Hangul);
+        assert_eq!(script_of('ㄱ'), Script::Hangul);
+        assert_eq!(script_of('ᄒ'), Script::Hangul);
         assert_eq!(script_of('А'), Script::Other);
+    }
+
+    /// **한자 in Korean prose is a Han run.** It classifies as [`Script::Han`],
+    /// so `runs` splits it off for the Han faces to draw and the Korean faces
+    /// are never asked for a Hanja. Korean sets its punctuation in ASCII, so a
+    /// full stop is Latin here.
+    #[test]
+    fn korean_prose_splits_into_the_faces_that_have_it() {
+        assert_eq!(
+            scripts("한자는 漢字, hanja."),
+            [
+                ("한자는".to_string(), Script::Hangul),
+                (" ".to_string(), Script::Latin),
+                ("漢字".to_string(), Script::Han),
+                (", hanja.".to_string(), Script::Latin),
+            ]
+        );
     }
 
     #[test]
@@ -311,10 +378,24 @@ mod tests {
         );
     }
 
+    /// Emphasis leaves the Hangul face where it is: [`role_for`] answers the
+    /// body face, and the 드러냄표 carries the emphasis.
+    #[test]
+    fn hangul_emphasis_is_a_mark_never_a_slant_or_a_swap() {
+        let body = role_for(Block::Paragraph, Style::Text, Script::Hangul);
+        let emphasised = role_for(Block::Paragraph, Style::Emphasis, Script::Hangul);
+        assert_eq!(emphasised, body);
+        assert_eq!(body, Role::Hangul);
+        assert_eq!(
+            role_for(Block::Heading(1), Style::Text, Script::Hangul),
+            Role::HangulBold
+        );
+    }
+
     /// The mark goes on the characters and not on what sits between them.
     #[test]
     fn what_carries_an_emphasis_mark() {
-        for c in ['世', 'あ', 'ア', '漢', 'Ａ', '１'] {
+        for c in ['世', 'あ', 'ア', '漢', 'Ａ', '１', '한', '글', 'ㄱ'] {
             assert!(takes_mark(c), "{c} should carry a mark");
         }
         for c in ['。', '、', '，', '「', ' ', '\u{3000}', 'a', '.', '·'] {
@@ -329,6 +410,16 @@ mod tests {
         assert!(Region::Japanese.mark_above());
         assert!(!Region::Simplified.mark_above());
         assert!(!Region::Traditional.mark_above());
+    }
+
+    /// A page mixing 한글 with 简体 marks the Hangul above and the Han below,
+    /// in one sentence, at every [`Region`].
+    #[test]
+    fn hangul_marks_above_whichever_convention_is_set() {
+        for region in [Region::Simplified, Region::Traditional, Region::Japanese] {
+            assert!(mark_above(Script::Hangul, region), "{region:?}");
+            assert_eq!(mark_above(Script::Han, region), region.mark_above());
+        }
     }
 
     #[test]
