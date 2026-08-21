@@ -765,6 +765,8 @@ pub struct Fonts {
     /// Advances are re-measured on every wrap, and wrapping runs on a 1 GHz
     /// ARM, so this is worth its memory.
     advances: HashMap<Measured, f32>,
+    /// One [`Fonts::centring`] per face and probe, in ems.
+    centres: HashMap<(u8, char), f32>,
     /// Which convention the Han slots are currently loaded for.
     region: Region,
     /// Which family each group is set to. Held here rather than beside the
@@ -791,6 +793,7 @@ impl Fonts {
         Ok(Self {
             slots,
             advances: HashMap::new(),
+            centres: HashMap::new(),
             region,
             choices,
         })
@@ -827,6 +830,7 @@ impl Fonts {
             }
             self.slots[slot] = Slot::pending(path);
             self.advances.retain(|key, _| key.face as usize != slot);
+            self.centres.retain(|(face, _), _| *face as usize != slot);
         }
     }
 
@@ -991,12 +995,42 @@ impl Fonts {
     /// Coverage is passed through rather than thresholded here — where the cut
     /// falls is the renderer's decision, and syntax marks dither instead of
     /// cutting.
+    /// How far a face moves its CJK ink to bring its centre onto
+    /// [`CJK_CENTRE`], in ems. Zero for a Latin role, which sits on the
+    /// baseline.
+    fn centring(&mut self, face: usize, role: Role) -> f32 {
+        if !(role.is_han() || role.is_hangul()) {
+            return 0.0;
+        }
+        let probe = probe(role);
+        let key = (face as u8, probe);
+        if let Some(hit) = self.centres.get(&key) {
+            return *hit;
+        }
+        // `px_bounds` is whole pixels; `CENTRING_PX` makes that a rounding
+        // error in an answer every size scales from.
+        let centre = self.slots[face].get().and_then(|font| {
+            let scale = scale_of(font, CENTRING_PX);
+            let ink = font
+                .outline_glyph(font.glyph_id(probe).with_scale(scale))?
+                .px_bounds();
+            Some((ink.min.y + ink.max.y) / 2.0 / CENTRING_PX)
+        });
+        let drop = centre.map_or(0.0, |centre| -CJK_CENTRE - centre);
+        self.centres.insert(key, drop);
+        drop
+    }
+
     /// The box `ch` covers against the baseline, without rasterising it.
     fn ink_of(&mut self, role: Role, px: f32, ch: char) -> Option<ab_glyph::Rect> {
         let face = self.resolve(role, ch)?;
+        let drop = self.centring(face, role) * px;
         let font = self.slots[face].get()?;
         let glyph = font.glyph_id(ch).with_scale(scale_of(font, px));
-        Some(font.outline_glyph(glyph)?.px_bounds())
+        let mut ink = font.outline_glyph(glyph)?.px_bounds();
+        ink.min.y += drop;
+        ink.max.y += drop;
+        Some(ink)
     }
 
     pub fn draw(
@@ -1007,11 +1041,12 @@ impl Fonts {
         mut emit: impl FnMut(i32, i32, f32),
     ) -> Option<ab_glyph::Rect> {
         let face = self.resolve(role, ch)?;
+        let drop = (self.centring(face, role) * px).round() as i32;
         let font = self.slots[face].get()?;
         let glyph = font.glyph_id(ch).with_scale(scale_of(font, px));
         let outlined = font.outline_glyph(glyph)?;
         let bounds = outlined.px_bounds();
-        let (ox, oy) = (bounds.min.x as i32, bounds.min.y as i32);
+        let (ox, oy) = (bounds.min.x as i32, bounds.min.y as i32 + drop);
         outlined.draw(|gx, gy, coverage| emit(ox + gx as i32, oy + gy as i32, coverage));
         Some(bounds)
     }
@@ -1046,9 +1081,14 @@ impl Metrics for Fonts {
     }
 }
 
-/// A Latin cap, as a share of the em. Amazon Ember and the iA faces both draw
-/// `H` to 0.711.
+/// A Latin cap, in ems: Amazon Ember and the iA faces draw `H` to 0.711.
 const CAP: f32 = 0.711;
+
+/// Where CJK ink is centred above the baseline, in ems. Half a [`CAP`].
+const CJK_CENTRE: f32 = CAP / 2.0;
+
+/// The em [`Fonts::centring`] measures at. Large, and never drawn.
+const CENTRING_PX: f32 = 512.0;
 
 /// A CJK glyph against the baseline: 中 and 한 both reach 0.842 above it, and
 /// the deeper of the two drops 0.132 below.
@@ -1251,6 +1291,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Changing family or convention does not move the ink.** The CJK faces
+    /// centre 中 and 한 anywhere between 0.348 and 0.413 of an em above the
+    /// baseline; [`Fonts::centring`] brings every one onto [`CJK_CENTRE`].
+    ///
+    /// The centres are read from the faces, one per entry in [`families`].
+    #[test]
+    fn every_cjk_family_puts_its_ink_at_one_height() {
+        let centres = [
+            ("SC 黑体", -0.359),
+            ("SC 宋体", -0.402),
+            ("TC 黑體", -0.413),
+            ("TC 楷體", -0.359),
+            ("TC 圓體", -0.402),
+            ("JA ゴシック", -0.348),
+            ("JA 明朝", -0.348),
+            ("JA 筑紫明朝", -0.380),
+            ("KO 고딕", -0.380),
+            ("KO 명조", -0.391),
+        ];
+        for px in crate::render::SIZES {
+            for (name, centre) in centres {
+                let drop = -CJK_CENTRE - centre;
+                let landed = (centre + drop) * px;
+                assert!(
+                    (landed - -CJK_CENTRE * px).abs() < 0.5,
+                    "{name} lands at {landed} against {} at a size of {px}",
+                    -CJK_CENTRE * px
+                );
+            }
+        }
+        // The spread is worth more than two pixels at the default size.
+        let raw: Vec<f32> = centres.iter().map(|(_, c)| *c).collect();
+        let spread = raw.iter().cloned().fold(f32::MIN, f32::max)
+            - raw.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            spread * crate::render::DEFAULT_SIZE > 2.0,
+            "{spread} em is not worth correcting"
+        );
     }
 
     /// A panel row is measured against Ember, a page row against the document's
@@ -1621,6 +1701,7 @@ mod tests {
             slots: role_slots(choices).collect(),
             region: Region::default(),
             advances: HashMap::new(),
+            centres: HashMap::new(),
             choices,
         }
     }
@@ -1707,6 +1788,7 @@ mod tests {
             slots: Vec::new(),
             region: Region::Simplified,
             advances: HashMap::new(),
+            centres: HashMap::new(),
             choices: Choices::default(),
         };
         // No faces at all, but the invisible check comes first and short
