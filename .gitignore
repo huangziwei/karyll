@@ -12,11 +12,18 @@ artifacts/
 # Ad-hoc scripting: not part of the tool.
 scripts/
 
-# The assembled install tree, and what build.sh fetches to make it: the armhf
-# glibc it links against and the Bluetooth stack it bundles, both pinned by URL
-# and checksum. All build products — nothing here is put in place by hand, and
-# no source file names any of it as a prerequisite.
+# What build.sh downloads: the glibc sysroots it cross-links against, the
+# Bluetooth stack tarball and the font files, each pinned by URL and checksum.
 deploy/
+
+# What build.sh stages into the install tree: the two binaries, the Bluetooth
+# stack and the writing faces. config.ini is the one hand-written file in hid/.
+device/extensions/karyll/bin/karyll
+device/extensions/karyll/bin/karyll-softfloat
+device/extensions/karyll/fonts/
+device/extensions/karyll/var/
+device/extensions/karyll/hid/*
+!device/extensions/karyll/hid/config.ini
 
 # macOS directory metadata.
 .DS_Store

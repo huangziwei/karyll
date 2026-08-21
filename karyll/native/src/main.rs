@@ -6598,7 +6598,7 @@ const OUTLINE_STEP: &str = "    ";
 /// understands is in it — and a specimen that has drifted from the document
 /// writers actually see is worse than none, because it is the one thing checked
 /// when the type looks wrong.
-const SPECIMEN: &str = include_str!("../../../device/share/Welcome.md");
+const SPECIMEN: &str = include_str!("../../../device/extensions/karyll/share/Welcome.md");
 
 #[cfg(test)]
 mod tests {

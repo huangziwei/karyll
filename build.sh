@@ -1,18 +1,13 @@
 #!/bin/sh
-# Cross-compile karyll and assemble the directory that gets copied to the
-# device. Run from anywhere:
-#
-#   ./build.sh
-#
-# Output: deploy/out — its extensions/ and documents/ go into /mnt/us/.
+# Cross-compile karyll and stage device/ for a USB copy:
+#   device/extensions/karyll/   -> /mnt/us/extensions/karyll/
+#   device/documents/Karyll.sh  -> /mnt/us/documents/Karyll.sh
 
 set -e
 
 cd "$(dirname "$0")"
 ROOT=$(pwd)
-DEVICE="$ROOT/device"
-OUT="$ROOT/deploy/out"
-EXT="$OUT/extensions/karyll"
+EXT="$ROOT/device/extensions/karyll"
 
 # **Two ARM ABIs, and which one a Kindle wants is not discoverable at runtime.**
 # A hard-float binary names `/lib/ld-linux-armhf.so.3` as its interpreter and a
@@ -408,27 +403,19 @@ for abi in $ABIS; do
     build_abi "$abi"
 done
 
-echo "==> Assembling $OUT"
-rm -rf "$OUT"
-mkdir -p "$EXT/bin" "$EXT/hid" "$EXT/var" "$EXT/share" "$OUT/documents"
+echo "==> Staging $EXT"
 
-cp "$DEVICE"/bin/*.sh "$EXT/bin/"
-# The welcome document, which the launcher copies into the documents directory
-# the first time it finds it empty. It ships inside the extension rather than
-# in documents/ because documents/ is the writer's, and an update replaces the
-# extension wholesale — so a file placed here can never overwrite a draft.
-cp "$DEVICE"/share/*.md "$EXT/share/"
-# Both binaries, because which one a Kindle can start is a property of the
-# Kindle. The launcher picks by looking for the loader each one names.
+# hid/ and fonts/ hold fetched files; config.ini is tracked.
+if [ -d "$EXT/hid" ]; then
+    find "$EXT/hid" -mindepth 1 -maxdepth 1 ! -name config.ini -exec rm -rf {} +
+fi
+rm -rf "$EXT/fonts"
+mkdir -p "$EXT/bin" "$EXT/hid" "$EXT/var"
+
 for abi in $ABIS; do
     cp "$ROOT/target/$(abi_target "$abi")/release/karyll" "$EXT/bin/$(abi_binary "$abi")"
+    chmod 755 "$EXT/bin/$(abi_binary "$abi")"
 done
-chmod 755 "$EXT/bin"/* 2>/dev/null || true
-
-# The home-screen tile. The hotfix indexes documents/*.sh as a library tile,
-# which is the only way in on this device.
-cp "$DEVICE"/documents/*.sh "$OUT/documents/"
-chmod 755 "$OUT/documents"/*.sh 2>/dev/null || true
 
 # The Bluetooth stack. Fetched here rather than committed: it is 49 MB of
 # someone else's release, it changes wholesale on every upstream bump, and the
@@ -469,19 +456,16 @@ if ! verify "$TARBALL"; then
 fi
 
 echo "==> Bundling the Bluetooth stack $HID_VERSION"
-# koreader-plugin/ is omitted: this project excludes KOReader outright, and
-# nothing in a Python daemon loads a Lua plugin.
-tar xzf "$TARBALL" -C "$EXT/hid" --exclude="./koreader-plugin"
+# ./config.ini in the tarball collides with the tracked $EXT/hid/config.ini.
+# ./koreader-plugin holds a KOReader Lua plugin.
+tar xzf "$TARBALL" -C "$EXT/hid" \
+    --exclude="./koreader-plugin" --exclude="./config.ini"
 # The release ships no LICENSE; GPLv3 asks that one travel with the binaries.
 if [ -f "$ROOT/LICENSE" ]; then
     cp "$ROOT/LICENSE" "$EXT/hid/LICENSE"
 fi
 printf 'kindle-hid-passthrough %s\nsource: https://github.com/zampierilucas/kindle-hid-passthrough\ntarball sha256: %s\nkoreader-plugin/ omitted; LICENSE added (upstream ships none, and it is GPLv3).\n' \
     "$HID_VERSION" "$HID_SHA256" > "$EXT/hid/PROVENANCE"
-
-# Our overlay last: README, and the config.ini that repoints the stack's state
-# into the extension and its log off tmpfs.
-cp "$DEVICE"/hid/*.md "$DEVICE"/hid/*.ini "$EXT/hid/" 2>/dev/null || true
 
 # The writing faces. **No Kindle carries a monospace text face**: the devices
 # probed ship the same 87 faces, one of them adds a set of handwriting styles,
@@ -556,9 +540,12 @@ printf 'iA-Fonts @ %s\nsource: https://github.com/iaolo/iA-Fonts\nlicence: SIL O
     "$FONTS_COMMIT" > "$EXT/fonts/PROVENANCE"
 
 echo
-echo "==> Ready: $OUT"
-du -sh "$OUT" 2>/dev/null || true
-echo
-echo "Copy both of these into /mnt/us/ over MTP or USB:"
-echo "    extensions/karyll    the app"
-echo "    documents/Karyll.sh  the home-screen tile you tap to open it"
+echo "==> staged $(du -sh "$EXT" | awk '{print $1}') -> device/extensions/karyll"
+
+cat <<'EOF'
+
+==> install — copy these two onto the device
+
+    device/extensions/karyll/   ->  /mnt/us/extensions/karyll/
+    device/documents/Karyll.sh  ->  /mnt/us/documents/Karyll.sh
+EOF

@@ -57,16 +57,15 @@ jobs:
                     armv7-unknown-linux-gnueabihf \
                     armv7-unknown-linux-gnueabi
 
-            # 31 MB of pinned downloads that never change between runs of the same
-            # build.sh. Keyed on the file that holds the pins, so editing a version or
-            # a checksum earns a fresh fetch and nothing else does.
-            - name: Restore the fetched sysroots and Bluetooth stack
+            # build.sh holds every URL and sha256 the paths below are fetched from.
+            - name: Restore the fetched sysroots, Bluetooth stack and faces
               uses: actions/cache@v4
               with:
                   path: |
                       deploy/sysroot-armhf
                       deploy/sysroot-armel
                       deploy/hid
+                      deploy/fonts
                   key: deploy-${{ runner.os }}-${{ hashFiles('build.sh') }}
 
             - uses: actions/cache@v4
@@ -96,19 +95,17 @@ jobs:
               env:
                   VERSION: ${{ github.event.release.tag_name || github.ref_name }}
               run: |
-                  # One asset, not one per model: nothing about the build is told which
-                  # Kindle it is for, so there is nothing to name it after.
+                  # One asset: the build is not told which Kindle it is for.
                   name="karyll-$VERSION-kindle"
-                  # Zipped from inside deploy/out so the archive opens onto
-                  # extensions/ and documents/, which are what get dragged to /mnt/us.
-                  (cd deploy/out && zip -qr "../$name.zip" .)
-                  sha256sum "deploy/$name.zip" | sed "s| deploy/| |" > "deploy/$name.zip.sha256"
+                  # The archive opens onto extensions and documents; device/assets
+                  # and device/make-tile.sh stay out of it.
+                  (cd device && zip -qr "$RUNNER_TEMP/$name.zip" extensions documents -x '*.DS_Store')
+                  # The sidecar names the zip alone.
+                  (cd "$RUNNER_TEMP" && sha256sum "$name.zip" > "$name.zip.sha256")
                   echo "name=$name" >> "$GITHUB_OUTPUT"
-                  ls -lh "deploy/$name.zip"
+                  ls -lh "$RUNNER_TEMP/$name.zip"
 
-            # `--clobber` replaces an asset of the same name instead of refusing it,
-            # so re-running after a failure lands the same two files rather than
-            # needing the release taken apart first.
+            # `--clobber` replaces an asset of the same name.
             - name: Attach to the release
               if: github.event_name == 'release'
               env:
@@ -117,8 +114,8 @@ jobs:
                   NAME: ${{ steps.package.outputs.name }}
               run: |
                   gh release upload "$TAG" \
-                    "deploy/$NAME.zip" \
-                    "deploy/$NAME.zip.sha256" \
+                    "$RUNNER_TEMP/$NAME.zip" \
+                    "$RUNNER_TEMP/$NAME.zip.sha256" \
                     --clobber
 
             - name: Keep the tree from a manual run
@@ -126,4 +123,6 @@ jobs:
               uses: actions/upload-artifact@v4
               with:
                   name: ${{ steps.package.outputs.name }}
-                  path: deploy/out
+                  path: |
+                      device/extensions
+                      device/documents
