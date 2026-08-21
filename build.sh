@@ -253,10 +253,6 @@ relink() {
 VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
 [ -n "$VERSION" ] || { echo "error: could not read version from Cargo.toml" >&2; exit 1; }
 
-# No KUAL metadata: KUAL does not exist on any Scribe firmware, so the
-# home-screen tile is the only way in and menu.json/config.xml would be dead
-# files. Everything the menus would have reached is in the app itself.
-
 # Stamp the build so a log on the device names the binary that wrote it.
 # Diagnosing a stale copy as though it were the current one costs a round trip
 # and a reboot every time.
@@ -416,6 +412,15 @@ for abi in $ABIS; do
     cp "$ROOT/target/$(abi_target "$abi")/release/karyll" "$EXT/bin/$(abi_binary "$abi")"
     chmod 755 "$EXT/bin/$(abi_binary "$abi")"
 done
+
+# The KUAL entry's version, held at Cargo.toml's. config.xml and menu.json are
+# written by hand and tracked, and this one field is all a release changes in
+# them: a menu naming a version the binary beside it does not report is a
+# support question nobody can answer. Written through a second file because
+# `sed -i` means different things on the two systems this script runs on.
+sed "s|<version>[^<]*</version>|<version>$VERSION</version>|" \
+    "$EXT/config.xml" > "$EXT/config.xml.new"
+mv "$EXT/config.xml.new" "$EXT/config.xml"
 
 # The Bluetooth stack. Fetched here rather than committed: it is 49 MB of
 # someone else's release, it changes wholesale on every upstream bump, and the

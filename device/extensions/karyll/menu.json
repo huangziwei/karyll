@@ -1,0 +1,10 @@
+{
+	"items": [
+	{
+		"name": "Karyll",
+		"priority": 0,
+		"action": "bin/karyll.sh",
+		"exitmenu": true
+	}
+	]
+}
