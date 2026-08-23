@@ -13,35 +13,19 @@ path = "src/main.rs"
 [dependencies]
 karyll-core = { path = "../core" }
 
-# Every dependency below is pure Rust, with no C build script anywhere in the
-# graph. That is what lets rust-lld cross-link the binary statically against
-# musl with no zig and no C sysroot — the device has no /usr/include and does
-# not need one. Adding a crate that builds C would break the whole cross path,
-# not just that crate.
+# Every dependency here is pure Rust with no C build script. rust-lld
+# cross-links the binary statically against musl.
 
-# ab_glyph: TTF rasterizer over the device's own faces in /usr/java/lib/fonts,
-# so no font ships with the binary.
-#
-# Chosen over fontdue because it outlines a glyph when asked, where fontdue
-# outlines every glyph in a face's cmap at parse time and keeps the geometry.
-# On one 23.5 MB CJK face that measured 308 MB resident against ab_glyph's
-# 24 MB. This device has ~514 MB shared with the framework, so the difference
-# decides whether a second CJK face can be loaded at all — and this app needs
-# several, one per emphasis role.
+# ab_glyph: TTF rasterizer. Outlines one glyph on demand; a 23.5 MB CJK face
+# measures 24 MB resident.
 ab_glyph = "0.2"
 
-# x11rb: pure-Rust X11 client. RustConnection speaks the wire protocol over the
-# socket, so no libxcb and no C. A real WM-managed window means the framework
-# composites and tears it down cleanly, rather than fighting it over /dev/fb0.
-#
-# NB: no `allow-unsafe-code` feature — it pulls `as-raw-xcb-connection`, which
-# links the system libxcb (`-lxcb`) and breaks the static musl cross-link.
+# x11rb: pure-Rust X11 client over the socket. No `allow-unsafe-code` feature:
+# it pulls `as-raw-xcb-connection`, which links the system libxcb.
 x11rb = { version = "0.13", default-features = false }
 
-# libc: raw open/ioctl/mmap for evdev and the framebuffer. Pure Rust bindings,
-# no build script.
+# libc: open/ioctl/mmap for evdev and the framebuffer.
 libc = "0.2"
 
-# anyhow: error context through the on-device run loop, where a failure needs
-# to name the layer it came from.
+# anyhow: error context through the on-device run loop.
 anyhow = "1"

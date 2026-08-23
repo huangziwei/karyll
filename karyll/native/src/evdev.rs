@@ -1,18 +1,6 @@
-//! Reading input devices straight from `/dev/input/eventN` — the keyboard, and
-//! the accelerometer.
-//!
-//! Not through X. The editor's window never takes focus, and raw key codes are
-//! what the CJK engine wants, so going through X would mean translating twice.
-//! It also means the editor works without the udev rule that X's evdev backend
-//! needs before it will bind a new keyboard on this device.
-//!
-//! Nodes are found by reading `/proc/bus/input/devices` rather than by probing
-//! capability bits with an ioctl, because the parse can be tested against real
-//! captures from the device — and the captures below are real.
-//!
-//! Both devices share this file rather than having one each, because they share
-//! the wire format exactly. A second copy of the `struct input_event` layout is
-//! the kind of duplication that has already cost this project twice.
+//! `/dev/input/eventN` for the keyboard and the accelerometer. Nodes are found
+//! by parsing `/proc/bus/input/devices`, against the captures in `tests`. Both
+//! devices share one `struct input_event` decoder.
 
 use std::fs::File;
 use std::io::Read;
@@ -27,51 +15,32 @@ use crate::keymap::code;
 /// `_IOW('E', 0x90, int)`: direction(W=1)<<30 | size(4)<<16 | type('E')<<8 | nr.
 const EVIOCGRAB: libc::c_int = 0x4004_4590;
 
-/// `_IOR('E', 0x40 + ABS_TILT, struct input_absinfo)`: the same arithmetic with
-/// the direction reversed, over a struct of six `__s32` — value, minimum,
-/// maximum, fuzz, flat, resolution — so 24 bytes.
-///
-/// The first of those six is what this is for. The kernel keeps the last value
-/// carried on every absolute axis and hands it back here, which is how the
-/// accelerometer can be asked where the device is instead of waited on until it
-/// moves again.
+/// `_IOR('E', 0x40 + ABS_TILT, struct input_absinfo)`: six `__s32` over 24
+/// bytes — value, minimum, maximum, fuzz, flat, resolution. `position` reads
+/// the first, which the kernel latches from the last report on the axis.
 const EVIOCGABS_TILT: u32 = 0x8018_4558;
 
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
 
-/// `EV_*` as bits of the `B: EV=` bitmap, which is what
-/// `/proc/bus/input/devices` prints.
+/// `EV_*` as bits of the `B: EV=` bitmap in `/proc/bus/input/devices`.
 const EV_KEY_BIT: u32 = 1 << EV_KEY;
 const EV_ABS_BIT: u32 = 1 << EV_ABS;
 
-/// The three axes, and the fourth thing these drivers report.
-///
-/// `ABS=1000007` on the Scribe's `kx132-accel` sets bits 0, 1, 2 and **24**.
-/// The first three are `ABS_X`, `ABS_Y`, `ABS_Z`. Code 24 is `ABS_PRESSURE` in
-/// the kernel's own headers, which an accelerometer plainly does not have — the
-/// driver has repurposed a spare code, and given that it logs
-/// `KX132_1211_TSCP` and `Orientation state is face up` around the same events,
-/// it is very likely the tilt position.
-///
-/// A second Kindle says the same thing from the other direction. There the
-/// accelerometer is split in two: a polling node with the three axes and
-/// nothing else, and an interrupt node advertising **only** bits 24 and 25 —
-/// and it is the interrupt node that the framework's own udev rules hand to X,
-/// "to save power". A code that is the whole of what the rotation path carries
-/// on a part from a different maker is the rotation.
+/// The three axes and the tilt code. `ABS=1000007` on `kx132-accel` sets bits
+/// 0, 1, 2 and 24. Code 24 is `ABS_PRESSURE` in the kernel headers and carries
+/// the device position on these drivers.
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const ABS_Z: u16 = 0x02;
 const ABS_TILT: u16 = 0x18;
 
-/// Multitouch protocol B's per-contact identifier, which only a device that
-/// tracks several contacts has any use for.
+/// Multitouch protocol B's per-contact identifier.
 const ABS_MT_TRACKING_ID: u16 = 0x39;
 
-/// `struct timeval` is two C longs, so its width follows the target. The device
-/// is 32-bit, which makes `struct input_event` 16 bytes there.
+/// `struct timeval` is two C longs, and its width follows the target. On a
+/// 32-bit device `struct input_event` is 16 bytes.
 const TIME_BYTES: usize = 2 * size_of::<libc::c_long>();
 pub const EVENT_BYTES: usize = TIME_BYTES + 2 + 2 + 4;
 
@@ -84,10 +53,8 @@ pub struct KeyEvent {
     pub repeat: bool,
 }
 
-/// Decode one `struct input_event` into `(type, code, value)`.
-///
-/// The one decoder every input device uses — the keyboard, the accelerometer,
-/// the touchscreen and the pen — so the struct layout is written down once.
+/// Decode one `struct input_event` into `(type, code, value)`. The keyboard,
+/// the accelerometer, the touchscreen and the pen all read through this.
 pub fn decode_raw(buf: &[u8]) -> Option<(u16, u16, i32)> {
     if buf.len() < EVENT_BYTES {
         return None;
@@ -116,17 +83,9 @@ fn decode(buf: &[u8]) -> Option<KeyEvent> {
     })
 }
 
-/// Whether a `B:` bitmap advertises a given code.
-///
-/// The words are printed most significant first, so word 0 — the one holding
-/// codes 0..31 — is last, and the count runs from the right. A code the bitmap
-/// is too short to describe is absent rather than an error: that is how a
-/// single-word `ABS=f000003` answers a question about `ABS_MT_TRACKING_ID`, and
-/// answering `false` is exactly right.
-///
-/// Words are `BITS_PER_LONG` wide, so 32 here — every Kindle this runs on is
-/// `armv7l`. On a 64-bit kernel the same dump would pack two of these words
-/// into one and a code above 31 would be read from the wrong place.
+/// Whether a `B:` bitmap advertises a given code. Words print most significant
+/// first and the count runs from the right; a code past the end is absent.
+/// Words are `BITS_PER_LONG` wide, 32 on `armv7l`.
 fn advertises(bitmap: &str, bit: u16) -> bool {
     let words: Vec<&str> = bitmap.split_whitespace().collect();
     let (word, shift) = (bit as usize / 32, bit % 32);
@@ -143,18 +102,15 @@ struct Block {
     handler: Option<String>,
     /// The `B: EV=` bitmap, which says which event types the device reports.
     ev: u32,
-    /// The `B: KEY=` bitmap, verbatim — its word width is not worth guessing.
+    /// The `B: KEY=` bitmap, verbatim.
     keys: String,
-    /// The `B: ABS=` bitmap, which is what separates a finger panel from a pen
-    /// and a real accelerometer from the other sensors on the bus.
+    /// The `B: ABS=` bitmap, read by `pick_touchscreen` and
+    /// `pick_accelerometer`.
     abs: String,
 }
 
-/// Split a `/proc/bus/input/devices` dump into its device blocks.
-///
-/// One parse, two selectors on top of it. A blank line ends a block, and the
-/// dump ends with one, but an extra is appended so a trailing block without it
-/// is still emitted.
+/// Split a `/proc/bus/input/devices` dump into its device blocks. A blank line
+/// ends a block; one extra is appended for a trailing block without it.
 fn blocks(raw: &str) -> Vec<Block> {
     let mut out = Vec::new();
     let mut current = Block::default();
@@ -181,12 +137,9 @@ fn blocks(raw: &str) -> Vec<Block> {
     out
 }
 
-/// Choose the keyboard, returning its `eventN` handler.
-///
-/// A device counts as a keyboard when it advertises **Q**. That rule was
-/// validated against this device's real bitmaps: it accepts a keyboard and
-/// rejects the WacomDigitizer, the stylus and the power key, which all carry
-/// `EV_KEY` for a handful of buttons.
+/// Choose the keyboard, returning its `eventN` handler. A device advertising
+/// `code::Q` is a keyboard; `WacomDigitizer`, `stylus-custom` and the power
+/// key carry `EV_KEY` for a handful of buttons and fail it.
 fn pick_keyboard(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
@@ -194,26 +147,9 @@ fn pick_keyboard(raw: &str) -> Option<String> {
         .and_then(|b| b.handler)
 }
 
-/// Choose the touchscreen, returning its `eventN` handler.
-///
-/// **The finger panel is the one that tracks more than one finger.** Every
-/// Kindle's panel speaks multitouch protocol B and so advertises
-/// `ABS_MT_TRACKING_ID`; no pen node does, the Scribe's digitizer and its
-/// `stylus-custom` mirror both being single-touch `ABS=f000003`. One bit
-/// separates them on every device seen:
-///
-/// | device | `ABS=` | |
-/// |---|---|---|
-/// | `pt_mt` | `ee18000 0` | **picked** |
-/// | `fts_ts` | `2618000 0` | **picked** |
-/// | `cyttsp5_mt` | `6608000 0` | **picked** |
-/// | `WacomDigitizer`, `stylus-custom` | `f000003` | rejected |
-///
-/// **By capability, never by a list of panel names.** The controller varies
-/// across Kindles — `pt_mt`, `fts_ts` and `cyttsp5_mt` are three of them — and
-/// the shape of the device does not, so a name list silently leaves touch dead
-/// on the first panel it has no entry for. The accelerometer rule below is
-/// written the same way for the same reason.
+/// Choose the touchscreen, returning its `eventN` handler. The finger panel
+/// advertises `ABS_MT_TRACKING_ID`: `pt_mt`, `fts_ts` and `cyttsp5_mt` all do,
+/// and the single-touch `f000003` pen nodes do not.
 pub fn pick_touchscreen(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
@@ -221,39 +157,9 @@ pub fn pick_touchscreen(raw: &str) -> Option<String> {
         .and_then(|b| b.handler)
 }
 
-/// Choose the node that says which way the device is being held, returning its
-/// `eventN` handler.
-///
-/// **The rule is [`ABS_TILT`] and no keys**, which is to say: karyll wants the
-/// node that carries the one code it reads, and a pen carries that code too but
-/// carries buttons with it.
-///
-/// | device | `EV=` | `ABS=` | has KEY | |
-/// |---|---|---|---|---|
-/// | `bd71828-pwrkey` | `3` | — | yes | rejected |
-/// | `kx132-accel` | `9` | `1000007` | no | **picked** |
-/// | `bma_interrupt` | `d` | `3000000` | no | **picked** |
-/// | `bma2x2` | `9` | `100 7` | no | rejected |
-/// | `max44009_als` | `9` | `100 0` | no | rejected |
-/// | `WacomDigitizer`, `pt_mt`, `stylus-custom` | `b`/`f` | `f000003` | yes | rejected |
-///
-/// **The three spatial axes are the wrong rule**, though they look like the
-/// obvious one and were tried first. On the Scribe they come on the same node
-/// as the tilt code, so the two rules agree and neither is tested; on a Kindle
-/// whose accelerometer is split in two they disagree, and the axes pick the
-/// polling node — which reports the vector nothing may depend on, does not
-/// report the tilt at all, and is the node the framework's own udev rules
-/// deliberately do not use, "to save power". The result would be an editor that
-/// never turns over.
-///
-/// A light sensor is rejected by the same rule that a moment ago needed the
-/// axes to reject it: `max44009_als` advertises `ABS_MISC` and nothing else,
-/// and a device that has one lists it first, so before any of this the editor
-/// opened it and read brightness as orientation.
-///
-/// Matching on the name would have been easier and wrong: the udev rules ship
-/// `60-kx132.rules`, `60-bma2x2.rules` and `60-bma4xy.rules`, so the part
-/// varies across Kindles even though the shape of the device does not.
+/// Choose the node reporting which way the device is held, returning its
+/// `eventN` handler. The rule is [`ABS_TILT`] with no keys: `kx132-accel` and
+/// `bma_interrupt` pass; `bma2x2`, `max44009_als` and the pen nodes fail.
 fn pick_accelerometer(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
@@ -265,8 +171,7 @@ pub struct Keyboard {
     file: File,
     path: PathBuf,
     grabbed: bool,
-    /// Bytes of a partially read event, kept across reads because a read can
-    /// return a fraction of one.
+    /// Bytes of a partially read event, kept across reads.
     pending: Vec<u8>,
 }
 
@@ -285,8 +190,7 @@ impl Keyboard {
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
 
         // The kernel reads the argument as "non-zero grabs, zero releases".
-        // A failed grab is not fatal — we still read the device — but the
-        // framework goes on seeing the same keys, so say so.
+        // A failed grab leaves the node readable and the keys shared.
         let grabbed = unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB as _, 1) } == 0;
         if !grabbed {
             eprintln!(
@@ -306,16 +210,9 @@ impl Keyboard {
         &self.path
     }
 
-    /// Whether udev has tagged this node `ID_INPUT_KEYBOARD`.
-    ///
-    /// karyll does not need the tag: it reads the node directly. X's
-    /// `evdev_drv.so` binds nothing without it, and this device's udev applies
-    /// no such tag on its own — so the tag is the difference between a keyboard
-    /// that works everywhere and one that works only in the editor. A session
-    /// log silent on it cannot tell those two apart.
-    ///
-    /// Read from udev's own database at `/run/udev/data/c<major>:<minor>`, one
-    /// `E:` line per property. `None` when udev has no record of the node.
+    /// Whether udev has tagged this node `ID_INPUT_KEYBOARD`, read from
+    /// `/run/udev/data/c<major>:<minor>`, one `E:` line per property. `None`
+    /// when udev has no record of the node. X's `evdev_drv.so` needs the tag.
     pub fn tagged_for_x(&self) -> Option<bool> {
         let rdev = self.file.metadata().ok()?.rdev();
         // The glibc split: both halves are non-contiguous in the encoded value.
@@ -325,17 +222,14 @@ impl Keyboard {
         Some(data.lines().any(|line| line == "E:ID_INPUT_KEYBOARD=1"))
     }
 
-    /// The node's descriptor, so a caller can wait on it alongside the X
-    /// connection instead of choosing one to block on.
+    /// The node's descriptor, for a caller waiting on it alongside the X
+    /// connection.
     pub fn fd(&self) -> std::os::unix::io::RawFd {
         self.file.as_raw_fd()
     }
 
     /// Block until at least one key event arrives, then return everything that
-    /// was ready.
-    ///
-    /// Returning a batch matters on eink: a burst of keystrokes should cost one
-    /// repaint, not one per key.
+    /// was ready. On eink a burst of keystrokes costs one repaint.
     pub fn read_batch(&mut self) -> Result<Vec<KeyEvent>> {
         let mut buf = [0u8; EVENT_BYTES * 16];
         let n = self.file.read(&mut buf).context("read keyboard")?;
@@ -364,40 +258,26 @@ impl Drop for Keyboard {
     }
 }
 
-/// One complete accelerometer report, latched at `EV_SYN`.
-///
-/// Events arrive one axis at a time and only mean something together, so a
-/// caller must never act on a partial set — the same mistake that made the
-/// touchscreen report every press one position behind.
-///
-/// **`x`, `y` and `z` are always zero on this firmware.** The driver advertises
-/// all three and has never once sent a value for any of them, over two device
-/// runs; [`tilt`](Self::tilt) is the whole signal. They are still collected
-/// because collecting them is free and their being zero is a fact worth being
-/// able to re-check, but nothing may depend on them. A first pass derived the
-/// orientation from the gravity vector they were expected to carry, and all of
-/// that work went in the bin.
+/// One complete accelerometer report, latched at `EV_SYN`. Axes arrive one at
+/// a time and mean something only together. `x`, `y` and `z` read zero on this
+/// firmware; [`tilt`](Self::tilt) carries the signal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sample {
     pub x: i32,
     pub y: i32,
     pub z: i32,
-    /// The position code, on ABS code 24. See [`ABS_TILT`], and
-    /// `orientation::Orientation::from_tilt` for what the values mean.
+    /// The position code, on ABS code 24. See [`ABS_TILT`] and
+    /// `orientation::Orientation::from_tilt`.
     pub tilt: i32,
 }
 
-/// The accelerometer.
-///
-/// **Never grabbed.** The framework reads this device too — it is how the stock
-/// reader flips 180° — and taking input away from the framework is what cost a
-/// 30-second hard reset when the touchscreen was grabbed. evdev is happy with
-/// several readers; open it and leave it alone.
+/// The accelerometer, opened without `EVIOCGRAB`. evdev takes several readers
+/// on one node.
 pub struct Accelerometer {
     file: File,
     path: PathBuf,
     pending: Vec<u8>,
-    /// Axes accumulate here and are latched out whole on `EV_SYN`.
+    /// Axes accumulate here and latch out whole on `EV_SYN`.
     building: Sample,
 }
 
@@ -427,20 +307,9 @@ impl Accelerometer {
         self.file.as_raw_fd()
     }
 
-    /// The position code the sensor is holding right now, without waiting for
-    /// it to report again.
-    ///
-    /// **The sensor only speaks when the device turns.** A Kindle that has been
-    /// still on a stand for an hour has said nothing for an hour, so a reader
-    /// that has only [`read_batch`](Self::read_batch) learns which way up it is
-    /// no sooner than the next time somebody picks it up. Asking the axis for
-    /// its last value is the whole of how a session can open the way the device
-    /// is being held.
-    ///
-    /// `None` when the ioctl fails. A zero — no report since boot — is a code
-    /// like any other and is left to
-    /// `orientation::Orientation::from_tilt` to reject, along with the codes
-    /// for lying flat, which name no orientation either.
+    /// The position code the sensor holds, without waiting on the next report.
+    /// The sensor speaks only when the device turns. `None` when the ioctl
+    /// fails; a zero is a code like any other, judged by `from_tilt`.
     pub fn position(&self) -> Option<i32> {
         let mut absinfo = [0i32; 6];
         let rc = unsafe {
@@ -473,7 +342,7 @@ impl Accelerometer {
                 (EV_ABS, ABS_Y) => self.building.y = value,
                 (EV_ABS, ABS_Z) => self.building.z = value,
                 (EV_ABS, ABS_TILT) => self.building.tilt = value,
-                // The report is only complete here.
+                // The report completes here.
                 (EV_SYN, _) => out.push(self.building),
                 _ => {}
             }
@@ -487,8 +356,8 @@ impl Accelerometer {
 mod tests {
     use super::*;
 
-    /// The Scribe's own `/proc/bus/input/devices`, captured with a keyboard
-    /// present. Trimmed to the lines the parse reads.
+    /// One `/proc/bus/input/devices` captured with a keyboard present, trimmed
+    /// to the lines `blocks` reads.
     const CAPTURE: &str = "\
 I: Bus=0019 Vendor=0001 Product=0001 Version=0100
 N: Name=\"bd71828-pwrkey\"
@@ -545,8 +414,7 @@ B: KEY=3ffffff fffffffc
 
     #[test]
     fn the_pen_stylus_and_power_key_are_not_keyboards() {
-        // All three carry EV_KEY for a few buttons, which is why the rule tests
-        // for a letter rather than for EV_KEY at all.
+        // All three carry EV_KEY for a few buttons.
         let baseline = CAPTURE.split("I: Bus=0003").next().unwrap();
         assert_eq!(pick_keyboard(baseline), None);
     }
@@ -563,11 +431,11 @@ B: KEY=3ffffff fffffffc
 
     #[test]
     fn a_code_above_the_first_word_is_read_from_the_right() {
-        // ABS_MT_TRACKING_ID is 57, so word 1 — the first of two — and bit 25.
+        // ABS_MT_TRACKING_ID is 57: word 1, the first of two, and bit 25.
         assert!(advertises("ee18000 0", ABS_MT_TRACKING_ID));
         assert!(advertises("2618000 0", ABS_MT_TRACKING_ID));
         assert!(advertises("6608000 0", ABS_MT_TRACKING_ID));
-        // A bitmap too short to describe code 57 answers no rather than panics.
+        // A bitmap too short to describe code 57 answers no.
         assert!(!advertises("f000003", ABS_MT_TRACKING_ID));
         assert!(!advertises("", ABS_MT_TRACKING_ID));
         // `100 7` sets bit 40, not 57 — the two are eight apart in the same word.
@@ -588,11 +456,8 @@ B: KEY=3ffffff fffffffc
         assert_eq!(pick_touchscreen("I: Bus=0000\nN: Name=\"pwrkey\"\n"), None);
     }
 
-    /// **The node that carries the tilt code, not the one that looks like an
-    /// accelerometer.** One Kindle puts both on `kx132-accel`; the other splits
-    /// them, and there the axes are on `event7` and the tilt is on `event8`.
-    /// Picking by the axes takes `event7`, which never reports a tilt — an
-    /// editor that quietly stops turning over.
+    /// `CAPTURE` puts the axes and the tilt on one node; `OASIS2` splits them
+    /// across `event7` and `event8`, and `event8` carries the tilt.
     #[test]
     fn the_tilt_is_picked_over_the_other_sensors() {
         assert_eq!(pick_accelerometer(CAPTURE).as_deref(), Some("event1"));
@@ -606,12 +471,11 @@ B: KEY=3ffffff fffffffc
 
     #[test]
     fn page_turn_buttons_are_not_a_keyboard() {
-        // KEY_PAGEUP and KEY_PAGEDOWN, three words up and nowhere near Q.
+        // KEY_PAGEUP and KEY_PAGEDOWN sit three words up from `code::Q`.
         assert_eq!(pick_keyboard(OASIS2), None);
     }
 
-    /// The Colorsoft's own `/proc/bus/input/devices`: a power key and a panel,
-    /// and nothing else at all.
+    /// A `/proc/bus/input/devices` holding a power key and a panel.
     const COLORSOFT: &str = "\
 I: Bus=0019 Vendor=0001 Product=0001 Version=0100
 N: Name=\"bd71828-pwrkey\"
@@ -630,9 +494,8 @@ B: ABS=2618000 0
 
 ";
 
-    /// The Oasis 2's, trimmed to the blocks that decide something: two power
-    /// keys, the page-turn pair, two light sensors, the accelerometer in both
-    /// the forms it is published in, and the panel.
+    /// A `/proc/bus/input/devices` holding two power keys, a page-turn pair,
+    /// two light sensors, an accelerometer split across two nodes, and a panel.
     const OASIS2: &str = "\
 I: Bus=0019 Vendor=0000 Product=0000 Version=0000
 N: Name=\"30370000.snvs:snvs-powerkey\"
@@ -741,17 +604,14 @@ B: ABS=6608000 0
     mod accelerometer {
         use super::*;
 
-        /// The rule is "absolute axes and no keys". Against the five real
-        /// devices on this Scribe that picks exactly one — and picking by name
-        /// would have been wrong, because the udev rules ship drivers for
-        /// kx132, bma2x2 and bma4xy.
+        /// Absolute axes and no keys picks one device out of the six in
+        /// `CAPTURE`.
         #[test]
         fn the_accelerometer_is_the_one_device_with_axes_and_no_keys() {
             assert_eq!(pick_accelerometer(CAPTURE).as_deref(), Some("event1"));
         }
 
-        /// The pen and the touchscreen both report absolute axes, so an
-        /// ABS-only rule would have taken whichever came first.
+        /// The pen and the touchscreen report absolute axes and carry keys.
         #[test]
         fn the_pen_and_the_touchscreen_are_not_accelerometers() {
             for block in blocks(CAPTURE) {
@@ -766,9 +626,7 @@ B: ABS=6608000 0
             }
         }
 
-        /// Every device in the dump is seen, and each keeps its own bitmaps —
-        /// the failure mode of a hand-rolled block parser is bleeding one
-        /// device's fields into the next.
+        /// Every device in `CAPTURE` is seen, each holding its own bitmaps.
         #[test]
         fn every_block_is_parsed_with_its_own_fields() {
             let all = blocks(CAPTURE);
@@ -779,9 +637,7 @@ B: ABS=6608000 0
             assert_eq!(all[5].keys, "3ffffff fffffffc", "the keyboard");
         }
 
-        /// Axes arrive as separate events and only mean something together, so
-        /// a report is latched at EV_SYN and never before. Reporting on a
-        /// partial set puts every touch one position behind.
+        /// Axes arrive as separate events; a report latches at `EV_SYN`.
         #[test]
         fn a_report_is_latched_whole_at_syn() {
             let mut stream = Vec::new();
@@ -795,8 +651,7 @@ B: ABS=6608000 0
                 stream.extend_from_slice(&event(kind, code, value));
             }
 
-            // Feed it the way a read would, then check only one sample came out
-            // and it has every axis.
+            // One sample comes out, carrying every axis.
             let mut building = Sample::default();
             let mut out = Vec::new();
             for i in 0..stream.len() / EVENT_BYTES {
@@ -822,11 +677,8 @@ B: ABS=6608000 0
         }
     }
 
-    /// An ioctl request is four fields packed into a word, and a wrong digit in
-    /// any of them is a different call the kernel answers `EINVAL` to — which
-    /// reads as a sensor that never knows where it is. Both numbers are checked
-    /// against the arithmetic, so a transposition in either is a failure here
-    /// rather than a silent one on the device.
+    /// An ioctl request packs four fields into a word. `EVIOCGRAB` and
+    /// `EVIOCGABS_TILT` are checked against that arithmetic.
     #[test]
     fn the_absinfo_request_is_the_number_the_kernel_answers() {
         let request =
@@ -837,8 +689,7 @@ B: ABS=6608000 0
 
     #[test]
     fn the_event_struct_is_16_bytes_on_the_device() {
-        // armv7 has 32-bit longs, so timeval is 8 bytes and the event is 16 —
-        // which is what `od` showed when the input chain was proven.
+        // armv7 has 32-bit longs: timeval is 8 bytes and the event is 16.
         assert_eq!(TIME_BYTES + 8, EVENT_BYTES);
         if cfg!(target_pointer_width = "32") {
             assert_eq!(EVENT_BYTES, 16);

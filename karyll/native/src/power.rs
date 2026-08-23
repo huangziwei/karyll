@@ -1,55 +1,14 @@
-//! Keeping the device awake while the editor is open.
-//!
-//! karyll grabs the keyboard with `EVIOCGRAB`, so keystrokes never reach the
-//! framework and cannot reset `powerd`'s idle timer. Only touches do, and
-//! writing does not involve touching the glass, so the device sleeps
-//! mid-sentence.
-//!
-//! `preventScreenSaver` is the lever — `rw Int` on `com.lab126.powerd`. The
-//! screensaver is the first step of the *idle* chain and the suspend follows
-//! it, so holding it off holds off both.
-//!
-//! **The power button is a separate path and is not affected.** It is its own
-//! input device (`bd71828-pwrkey`), and powerd reports `prevent_screen_saver`,
-//! `defer_suspend` and `suspend_grace` as three distinct states with
-//! `deferSuspend` and `abortSuspend` as the suspend-level controls. So a
-//! deliberate press still sleeps the device while this latch is held, which is
-//! what makes holding it for a whole session acceptable.
-//!
-//! It is a latch rather than a one-shot, so releasing it matters more than
-//! setting it: it also holds WiFi awake, and a session that leaves it set has
-//! changed the device's behaviour after karyll is gone. It is released on every
-//! exit path in `run`, and again by the launcher's trap, which fires even for
-//! the aborts that skip Rust's own cleanup.
-//!
-//! **And released while the session is still open, once the writer stops.**
-//! Held for the whole session it fixes the interruption and buys a Kindle that
-//! cannot sleep: leave the editor open on a desk and a device rated in weeks of
-//! standby is flat by morning. It is a latch on
-//! *writing*, not on the app being on screen, so [`crate::Editor`] gives it back
-//! after [`IDLE_SLEEP`] with no key and no touch, and takes it again on the next
-//! one.
+//! `preventScreenSaver` on `com.lab126.powerd`, held while writing is under
+//! way. One latch covers the screensaver and the suspend behind it, and holds
+//! WiFi awake with them.
 
 use std::process::Command;
 
-/// How long the writer has to be away before the device may sleep.
-///
-/// **Generous, because the cost is asymmetric.** Sleeping on someone who paused
-/// to think is the interruption this whole module exists to prevent, and waking
-/// the device again means the power button or the glass — a Bluetooth keystroke
-/// will not do it, since the daemon carrying it is suspended too. A quarter of
-/// an hour is longer than any pause in writing and far shorter than a night.
+/// Time without a key or a touch before `prevent_screensaver(false)`.
 pub const IDLE_SLEEP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Hold the screensaver off, or let it come back.
-///
-/// The write is checked rather than assumed. A latch that quietly failed to
-/// set means the device sleeps mid-sentence again; one that quietly failed to
-/// release means a Kindle that never sleeps and a battery that goes flat
-/// overnight. Neither announces itself, so both are read back and logged.
-///
-/// Best-effort otherwise: off-device there is no `lipc-set-prop` at all, and
-/// failing here is a device that sleeps rather than a session that cannot run.
+/// Hold the screensaver off, or release it. `status` is read back: a set or a
+/// release that failed is silent.
 pub fn prevent_screensaver(on: bool) {
     let value = if on { "1" } else { "0" };
     if let Err(err) = Command::new("lipc-set-prop")
@@ -66,7 +25,7 @@ pub fn prevent_screensaver(on: bool) {
     }
 }
 
-/// The daemon's own report of what it is doing.
+/// `com.lab126.powerd`'s `status` property.
 fn status() -> Option<String> {
     let out = Command::new("lipc-get-prop")
         .args(["com.lab126.powerd", "status"])
@@ -77,12 +36,8 @@ fn status() -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Whether the latch is held, read out of the daemon's status report.
-///
-/// The report spells the field `prevent_screen_saver` where the writable
-/// property is `preventScreenSaver`. They are one latch under two spellings,
-/// which is the only reason this needs its own parse rather than reading the
-/// property straight back.
+/// Whether the latch is held. `status` spells the field
+/// `prevent_screen_saver`; the writable property is `preventScreenSaver`.
 fn latched(status: &str) -> Option<bool> {
     let value = status
         .lines()
@@ -94,8 +49,7 @@ fn latched(status: &str) -> Option<bool> {
 mod tests {
     use super::*;
 
-    /// Verbatim from a device probe, so the parse is written against what the
-    /// daemon actually prints rather than against a guess at its shape.
+    /// One `lipc-get-prop com.lab126.powerd status` output, verbatim.
     const REPORT: &str = "Powerd state: Active\n\
                           Remaining time in this state: 589.624499\n\
                           defer_suspend:0\n\

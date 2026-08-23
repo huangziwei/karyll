@@ -1,20 +1,6 @@
-//! On-screen UI.
-//!
-//! Conventions shared with the other apps on this device, proven on this
-//! hardware, rather than invented ones:
-//!
-//! - **Geometry comes from the font**, not from magic pixel constants. Rows are
-//!   `(line_height * 2).max(96)`, the title sits `line_height * 3` down. A
-//!   larger face therefore gives larger targets rather than a broken layout.
-//! - **A full-width strip along the bottom** carries the actions. In a panel it
-//!   is `[ Done ]`; in the editor it is the way to Files and Config.
-//! - **Pure hit-testing over a measured layout**, so it is testable against a
-//!   stub metric without a screen or the device's faces. [`Layout::row_at`]
-//!   answers the vertical axis; [`hit`] adds the horizontal one, which a page
-//!   of settings needs because its controls sit side by side.
-//!
-//! Coordinates arriving here are already in window space: [`crate::orientation`]
-//! has been applied before any corner or row test.
+//! On-screen UI. Geometry is derived from the face in use, a full-width strip
+//! carries the actions, and hit-testing is a pure function over a measured
+//! [`Layout`]. Coordinates arrive in window space.
 
 use anyhow::Result;
 use karyll_core::script::{Role, chrome_role_for, script_of};
@@ -42,9 +28,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// `text_lh` and `title_lh` are the line heights of the faces actually
-    /// drawn, so nothing has to be guessed from the body size. Spacing derived
-    /// from the wrong face overlaps the title and the status line.
+    /// `text_lh` and `title_lh` are the line heights of the faces drawn.
     pub fn compute(text_lh: u16, title_lh: u16, height: u16) -> Self {
         let lh = text_lh.max(1);
         let title_lh = title_lh.max(1);
@@ -54,30 +38,22 @@ impl Layout {
             line_height: lh,
             title_top,
             status_top,
-            // A clear line of air between the status and the first row, so the
-            // list reads as a separate thing from the heading.
+            // A line of air between the status and the first row.
             rows_top: status_top + lh * 2,
-            // Generous tap targets — a 96 px floor whatever the font size.
+            // Tap targets hold a 96 px floor at every font size.
             row_h: (lh * 2).max(96),
             strip_top: height.saturating_sub(STRIP_H),
         }
     }
 
-    /// How many rows fit between the top of the list and the strip.
-    ///
-    /// **The panel does not scroll**, so a list longer than this has to be
-    /// paged — and the caller can only page it if it can ask how much fits.
-    /// Without it [`paint_items`] stops drawing at the foot of the page and
-    /// everything past that is invisible and unreachable: on a landscape panel,
-    /// the seventeenth document onwards.
+    /// How many rows fit between the top of the list and the strip. A panel
+    /// does not scroll, and a longer list is paged by the caller.
     pub fn capacity(&self) -> usize {
         (self.strip_top.saturating_sub(self.rows_top) / self.row_h.max(1)) as usize
     }
 
-    /// Which row a tap at `y` fell on, or `None` above the list.
-    ///
-    /// The strip is the caller's business: it spans the full bottom width and
-    /// is checked before this.
+    /// Which row a tap at `y` fell on, or `None` above the list. The strip
+    /// spans the full bottom width and belongs to the caller.
     pub fn row_at(&self, y: u16, rows: usize) -> Option<usize> {
         if y >= self.strip_top || y < self.rows_top {
             return None;
@@ -86,8 +62,7 @@ impl Layout {
         (row < rows).then_some(row)
     }
 
-    /// The list region, for repainting a selection change without touching the
-    /// rest of the screen.
+    /// The list region, for repainting a selection change on its own.
     pub fn rows_rect(&self, width: u16) -> Rect {
         Rect {
             x: 0,
@@ -107,36 +82,20 @@ impl Layout {
     }
 }
 
-/// One line of a panel.
-///
-/// **A settings page is not a list.** Built out of one, Config is eleven
-/// identical rules with no shape to it — five languages, four faces and a
-/// keyboard, all the same weight, each hiding its choices behind a tap that
-/// cycles them one at a time. This panel is 1860 px across on a 10.2″ panel:
-/// there is room to show every option at once and say what belongs with what,
-/// and no reason to make a writer tap three times to see three faces.
+/// One line of a panel. A `Choice` shows every option side by side, each its
+/// own tap target.
 pub enum Item {
-    /// A section heading, with a rule under it. Not tappable: it names what
-    /// follows rather than doing anything.
+    /// A section heading, with a rule under it. Not tappable.
     Heading(String),
-    /// A tappable line with something to say about itself: a name on the left,
-    /// what is worth knowing about it in the detail column, and whether it is
-    /// the one in use. The Files panel is a list of these.
-    ///
-    /// **The detail sits in the same column the chips do**, so a page of files
-    /// and a page of settings are laid out to one grid rather than two.
+    /// A tappable line: a name on the left, a detail column, and whether it is
+    /// the one in use. The detail sits in the column the chips use.
     Row {
         label: String,
         detail: String,
-        /// Drawn bold — the current one, marked the way this page marks any
-        /// current thing, and without spending a column on saying so.
+        /// Drawn bold: the current one.
         on: bool,
-        /// One chip of its own, pinned to the right margin.
-        ///
-        /// **For the destructive one, and it is right-aligned because of
-        /// that.** Tapping a row opens it, so a control that removes it wants
-        /// to be as far from the name as the row is wide — a thumb reaching for
-        /// a filename on a 10.2″ page is nowhere near the other edge of it.
+        /// One chip of its own, pinned to the right margin, carrying the
+        /// destructive action a row width away from the name that opens it.
         action: Option<String>,
     },
     /// A setting: a label, and the values it can take, drawn side by side.
@@ -144,23 +103,15 @@ pub enum Item {
     Choice {
         label: String,
         options: Vec<String>,
-        /// One per option, and the reason this is not a single index: the
-        /// language row is a set with several on, the type rows are a single
-        /// pick, and a control that navigates has none.
+        /// One per option. A language row carries several on, a type row one,
+        /// a navigating control none.
         on: Vec<bool>,
-        /// Options that say where the row stands rather than offering to change
-        /// it. Drawn in [`QUIET`] and not tappable — the word stays so the rows
-        /// read as one column, and the grey is what says it is not a control.
-        ///
-        /// Short is fine and empty is the common case: an option past the end
-        /// of this is live, the way one past the end of `on` is off.
+        /// Options that report a state. Drawn in [`QUIET`] and not tappable.
+        /// An option past the end of this is live, as one past the end of `on`
+        /// is off.
         inert: Vec<bool>,
     },
-    /// A colour setting: the same row, with the values drawn *as* themselves.
-    ///
-    /// A chip reading "Yellow" says what it is; a yellow circle shows it, and
-    /// on the one panel this row appears on there is a colour to show. iA
-    /// Writer's picker is a line of filled circles and this is the same line.
+    /// A colour setting: the same row, its values drawn as filled circles.
     Swatches {
         label: String,
         /// One [`crate::window::ink`] index per swatch, in the order drawn.
@@ -170,23 +121,16 @@ pub enum Item {
 }
 
 /// Which line of a panel the keyboard is on, and which of that line's chips.
-///
-/// **Page-relative, like everything else that draws**: the row indexes the
-/// items handed to the paint rather than the whole list, so a focus mark cannot
-/// land a page away from the row it belongs to.
-///
-/// `chip` means nothing on a row that has none, and is left at zero there.
+/// `row` indexes the items handed to the paint. `chip` is zero on a row with
+/// no chips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Focus {
     pub row: usize,
     pub chip: usize,
 }
 
-/// The chips of `item` a press can actually take, in the order they are drawn.
-///
-/// A row's own action chip is not among them: it is reached by the key that
-/// names what it does rather than by arrowing onto it, which keeps a
-/// destructive control off the path between one setting and the next.
+/// The chips of `item` a press can take, in the order they are drawn. A row's
+/// own action chip is reached by its named key, not by arrowing onto it.
 pub fn takeable(item: &Item) -> Vec<usize> {
     match item {
         Item::Choice { options, inert, .. } => (0..options.len())
@@ -211,15 +155,11 @@ pub struct Panel<'a> {
     pub title: &'a str,
     pub status: &'a str,
     pub items: &'a [Item],
-    /// Buttons along the bottom, left to right. Owned strings because some of
-    /// them say what was typed rather than a fixed word — the find bar's field
-    /// and its count.
+    /// Buttons along the bottom, left to right. Owned strings: the find bar's
+    /// field and its count carry what was typed.
     pub strip: &'a [String],
-    /// What the IME is offering, if a word is being composed into this panel.
-    ///
-    /// A panel takes text too — a filename is typed on one — so it needs the
-    /// same box the page has. Empty whenever nothing is being composed, which
-    /// is every panel but Naming and most of the time on that one.
+    /// What the IME is offering for a word composed into this panel. Empty
+    /// while nothing is being composed.
     pub overlay: Overlay<'a>,
     /// Which line the keyboard is on, when a keyboard is being used on it.
     pub focus: Option<Focus>,
@@ -254,9 +194,8 @@ impl Panel<'_> {
         }
         paint_items(window, fonts, layout, self.items, self.focus);
         paint_strip(window, fonts, layout, self.strip);
-        // Last, over everything, and hung off the status line — which on the
-        // Naming panel *is* the field, the same way the caret is the field on
-        // the page. The empty body below it is where the box lands.
+        // Last, over everything, hung off the status line. The empty body
+        // below it is where the box lands.
         let labels = self.overlay.labels();
         let anchor = Rect {
             x: MARGIN_X,
@@ -284,12 +223,9 @@ pub const ROW_INSET: u16 = MARGIN_X + 24;
 /// How wide the bar marking the line the keyboard is on.
 const FOCUS_BAR: u16 = 8;
 
-/// The gap between a chip and the ring marking it, and how thick that ring is.
-///
-/// Outside the chip rather than inside it, because a chip has two states of its
-/// own already — filled when it is what the setting is on, outlined when it is
-/// merely available — and a mark drawn *in* one of them would have to compete
-/// with both. The row's own bar says which line; this says which chip on it.
+/// The gap between a chip and the ring marking it, and the ring's thickness.
+/// The ring sits outside the chip, which is filled when on and outlined when
+/// available.
 const RING_GAP: u16 = 5;
 const RING: u16 = 3;
 
@@ -298,28 +234,10 @@ const CHIP_PAD: u16 = 24;
 /// Between one chip and the next.
 const CHIP_GAP: u16 = 20;
 
-/// Where the second column of *every* row starts — the chips, the swatches and
-/// a row's detail alike.
-///
-/// One column across the whole panel, from the widest label on it, so the
-/// values line up down the page instead of stepping in and out behind labels
-/// of different lengths — which is most of what makes a settings page read as
-/// a table rather than as a pile.
-///
-/// **Measured against the panel it is drawn on, not against a fixed fraction of
-/// it.** The column is pulled back far enough that the widest thing in the
-/// second column — a detail, a run of chips, a row of swatches — still finishes
-/// inside the right margin, so a page is given whatever width its own content
-/// leaves it. The same list therefore lays itself out differently on a 1272 px
-/// portrait panel and a 1696 px landscape one, which on Help is the difference
-/// between two columns and one column written over another.
-///
-/// **Between a third and half of the line.** Past half, a page has stopped
-/// being a table and the label gives way instead — [`elided`] cuts it, which
-/// matters for the labels karyll does not choose: a Bluetooth keyboard is named
-/// by whoever made it and a document by whoever wrote it. The floor is the same
-/// rule from the other side: one long detail may not squeeze every label on the
-/// page.
+/// Where the second column starts on every row — chips, swatches and details
+/// alike. Taken from the widest label, pulled back far enough that the widest
+/// second column finishes inside the right margin, and held between a third
+/// and half the line. Past half, [`elided`] cuts the label.
 pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str) -> u16) -> u16 {
     let widest = items
         .iter()
@@ -327,8 +245,7 @@ pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str
             Item::Choice { label, .. } | Item::Row { label, .. } | Item::Swatches { label, .. } => {
                 Some(measure_text(label))
             }
-            // A heading is not a label; it starts at the margin and owns its
-            // whole line, so however long it is it moves nothing.
+            // A heading starts at the margin and owns its whole line.
             Item::Heading(_) => None,
         })
         .max()
@@ -344,11 +261,8 @@ pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str
     wanted.min(room.max(width / 3).min(width / 2))
 }
 
-/// The furthest right this row's second column may start and still finish
-/// inside the right margin.
-///
-/// [`u16::MAX`] for a row with no second column at all: it constrains nothing,
-/// and a page of them lets the labels have the whole band.
+/// The furthest right this row's second column may start and finish inside the
+/// right margin. [`u16::MAX`] for a row with no second column.
 fn second_column_room(item: &Item, width: u16, measure_text: &mut impl FnMut(&str) -> u16) -> u16 {
     let right = width.saturating_sub(MARGIN_X);
     match item {
@@ -357,8 +271,8 @@ fn second_column_room(item: &Item, width: u16, measure_text: &mut impl FnMut(&st
             if detail.is_empty() {
                 return u16::MAX;
             }
-            // The action chip holds the right margin whatever the row is
-            // called, so the detail's room ends a gap short of it.
+            // The action chip holds the right margin; the detail's room ends
+            // a gap short of it.
             let right = match action {
                 Some(label) => right
                     .saturating_sub(action_width(label, measure_text))
@@ -384,12 +298,8 @@ fn chip_widths(options: &[String], measure_text: &mut impl FnMut(&str) -> u16) -
         .collect()
 }
 
-/// How wide a row of cells is once tiled, the gaps between them included.
-///
-/// The one place that arithmetic lives, because [`chip_column`] has to know
-/// what [`chip_bounds`] and [`swatch_bounds`] are about to lay out: a second
-/// copy of it would leave room for a run of a different length than the one
-/// drawn.
+/// How wide a row of cells is once tiled, gaps included. [`chip_column`],
+/// [`chip_bounds`] and [`swatch_bounds`] all measure through this.
 fn run_width(widths: impl IntoIterator<Item = u16>) -> u16 {
     let mut total = 0u16;
     let mut cells = 0u16;
@@ -400,13 +310,8 @@ fn run_width(widths: impl IntoIterator<Item = u16>) -> u16 {
     total.saturating_add(CHIP_GAP.saturating_mul(cells.saturating_sub(1)))
 }
 
-/// How much of its line a row's label may be drawn on before it runs into its
-/// own value — a gap short of it, so the two columns read as two even on the
-/// panel that only just has room for both.
-///
-/// **Drawing and press feedback both come through here**, for the reason
-/// [`chip_bounds`] is shared between drawing and hit-testing: a label cut at
-/// rest and drawn whole under the finger would change length as it is touched.
+/// How much of its line a row's label may take, ending a gap short of its own
+/// value. Drawing and press feedback both measure through this.
 pub fn label_room(
     item: &Item,
     column: u16,
@@ -416,14 +321,13 @@ pub fn label_room(
     let right = width.saturating_sub(MARGIN_X);
     let gap = |start: u16| start.saturating_sub(ROW_INSET + CHIP_GAP);
     match item {
-        // Not a label: it starts at the margin and owns its whole line.
+        // A heading starts at the margin and owns its whole line.
         Item::Heading(_) => right.saturating_sub(MARGIN_X),
         Item::Row { detail, action, .. } => {
             if !detail.is_empty() {
                 return gap(column);
             }
-            // Nothing in the second column: the whole line, up to its own
-            // action chip.
+            // Nothing in the second column: the line runs to the action chip.
             match action {
                 Some(text) => right
                     .saturating_sub(action_width(text, measure_text))
@@ -432,8 +336,8 @@ pub fn label_room(
             }
             .saturating_sub(ROW_INSET)
         }
-        // Its own chips rather than the column, because a row that could not
-        // afford the column keeps them just past its label.
+        // Its own chips, which a row too narrow for the column keeps just
+        // past its label.
         Item::Choice { label, options, .. } => {
             gap(chip_bounds(column, width, label, options, measure_text)
                 .first()
@@ -443,15 +347,8 @@ pub fn label_room(
     }
 }
 
-/// `text`, cut to `room` with an ellipsis, or whole when it fits.
-///
-/// **What a label runs into is its own value** — a filename over its word
-/// count, a keyboard's name over the button that forgets it — so a label too
-/// long for its column is cut rather than drawn on top of the thing it names.
-/// Nothing else on a panel is drawn past its bounds either: a chip too wide for
-/// the margin is dropped, and a candidate bar too wide for the panel is paged.
-///
-/// Cut by character, so a label in Chinese loses characters rather than bytes.
+/// `text`, cut to `room` with an ellipsis, or whole when it fits. The cut runs
+/// by character, and a label in Chinese loses characters.
 pub fn elided(text: &str, room: u16, mut measure_text: impl FnMut(&str) -> u16) -> String {
     if measure_text(text) <= room {
         return text.to_string();
@@ -471,7 +368,7 @@ pub fn elided(text: &str, room: u16, mut measure_text: impl FnMut(&str) -> u16) 
         used += w;
         kept.push(ch);
     }
-    // A space before the mark reads as a gap rather than as a cut.
+    // A space before the mark is trimmed.
     while kept.ends_with(' ') {
         kept.pop();
     }
@@ -483,18 +380,9 @@ pub fn elided(text: &str, room: u16, mut measure_text: impl FnMut(&str) -> u16) 
 ///
 /// **The single source for drawing, hit-testing and press feedback**, for the
 /// reason [`cell_bounds`] is: a chip is only as wide as its own text, so
-/// anything that measured them a second time would put a finger on a different
-/// one. A chip that runs past the right margin is dropped rather than shrunk,
-/// the rule the candidate bar follows in [`candidate_pages`].
-///
-/// **The shared column is a courtesy, and a row that cannot afford it keeps its
-/// own.** [`chip_column`] leaves room for the widest run on the page, so this
-/// is the case where a row is not that one and still cannot fit — the column
-/// having been floored at a third of the line to keep the labels readable. Such
-/// a row starts its chips just past its own label instead, which on a short
-/// label like `Size` is a long way further left. It steps that row out of the
-/// table, and that is the trade the page is laid out under: a control that is
-/// not on the page is worse than a row that is not in line with its neighbours.
+/// drawing and hit-testing both measure through it. A chip past the right
+/// margin is dropped, the rule [`candidate_pages`] follows. A row too narrow
+/// for [`chip_column`] starts its chips just past its own label.
 pub fn chip_bounds(
     column: u16,
     width: u16,
@@ -505,9 +393,7 @@ pub fn chip_bounds(
     let right = width.saturating_sub(MARGIN_X);
     let widths = chip_widths(options, &mut measure_text);
     let wanted = run_width(widths.iter().copied());
-    // Its own label only when that is further left than the column: a row with
-    // the longest label on the page is the one the column was measured from,
-    // and starting after it again would gain nothing.
+    // Its own label only where that sits further left than the column.
     let mut x = if column.saturating_add(wanted) <= right {
         column
     } else {
@@ -524,14 +410,11 @@ pub fn chip_bounds(
     out
 }
 
-/// A swatch's slot, wide enough to be a thumb's target rather than a dot.
+/// A swatch's slot, wide enough for a thumb.
 const SWATCH_W: u16 = 72;
 
-/// Where a row of swatches sits, from the same column the chips start at.
-///
-/// Fixed width rather than measured: a swatch has no text to be as wide as, and
-/// six circles of one size read as a set of choices where six of different
-/// sizes would read as a ranking.
+/// Where a row of swatches sits, from the column the chips start at. Every
+/// swatch is [`SWATCH_CELL`] wide.
 pub fn swatch_bounds(column: u16, width: u16, count: usize) -> Vec<(u16, u16)> {
     let right = width.saturating_sub(MARGIN_X);
     let mut x = column;
@@ -552,12 +435,8 @@ pub fn chip_rect(layout: Layout, item: usize, bounds: &[(u16, u16)], option: usi
     chip_slot(layout, item, x, width)
 }
 
-/// Where a row's own action chip sits: the right margin, and the same height
-/// and vertical placing as any other chip.
-///
-/// It is measured from the right rather than laid out from the left, so it
-/// holds the same edge whatever the row is called — a column of them lines up
-/// down the page, and none of them moves when a document is renamed.
+/// Where a row's own action chip sits: the right margin, at the height and
+/// vertical placing of any other chip. Measured from the right edge.
 pub fn action_rect(
     layout: Layout,
     item: usize,
@@ -599,15 +478,9 @@ pub enum Hit {
     Option(usize, usize),
 }
 
-/// The one function that decides what a tap is on.
-///
-/// Drawing and dispatch both come through here, because they have to: a second
-/// copy of this arithmetic puts the invert on one control and runs another. See
-/// [`cell_bounds`].
-///
-/// `None` for a heading, for a label, and for the space past the last chip.
-/// None of them is a control, and a settings page where the gaps do something
-/// is a settings page you cannot rest a hand on.
+/// What a tap is on. Drawing and dispatch both come through here; see
+/// [`cell_bounds`]. `None` for a heading, a label, and the space past the last
+/// chip.
 pub fn hit(
     items: &[Item],
     layout: Layout,
@@ -619,9 +492,7 @@ pub fn hit(
     let index = layout.row_at(y, items.len())?;
     match &items[index] {
         Item::Heading(_) => None,
-        // The action chip is asked before the row it sits on, the same way the
-        // candidate box is asked before the page it covers: a tap on the chip is
-        // pressing it, not opening whatever it happens to be pinned to.
+        // The action chip is asked ahead of the row it sits on.
         Item::Row { action, .. } => {
             if let Some(label) = action
                 && inside(
@@ -665,22 +536,17 @@ pub fn paint_items(
     let width = window.width();
     window.fill(layout.rows_rect(width), WHITE);
     let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
-    // `capacity` rather than a break inside the loop, because that is the
-    // number the caller pages by. Two ways of saying where the list stops is
-    // two ways for them to disagree, and this one would hide a document.
+    // `capacity` is the number the caller pages by, and the one place the
+    // list's end is decided.
     for i in 0..items.len().min(layout.capacity()) {
         let chip = focus.filter(|f| f.row == i).map(|f| f.chip);
         draw_item(window, fonts, layout, items, i, column, chip);
     }
 }
 
-/// Redraw one line of the list, with whatever focus mark it now carries.
-///
-/// **The rest of the page is left alone.** Moving the keyboard down a list
-/// touches the line it left and the line it arrived on; a panel-wide repaint
-/// for a mark that moves on every press is half a second of ink to change two
-/// rows of it. Full width, so a ring drawn outside the last chip is inside what
-/// this erases.
+/// Redraw one line of the list with the focus mark it carries, leaving the
+/// rest of the page. Full width, which covers a ring drawn outside the last
+/// chip.
 pub fn paint_focus_row(
     window: &mut Window,
     fonts: &mut Fonts,
@@ -716,8 +582,7 @@ fn draw_item(
         return;
     };
     let top = layout.rows_top + i as u16 * layout.row_h;
-    // The band a row's chips are centred in, so a 한글 label and the chips
-    // beside it share one optical centre.
+    // The band a row's chips are centred in, shared with its label.
     let band = Rect {
         x: MARGIN_X,
         y: top,
@@ -726,9 +591,7 @@ fn draw_item(
     };
     let middle = |fonts: &mut Fonts, label: &str| centred_top(fonts, band, label, TEXT_PX);
     if focus.is_some() {
-        // In the air [`ROW_INSET`] leaves, so the mark sits beside the label
-        // rather than pushing it along: a line that shifts when it takes focus
-        // is a list that shuffles as you walk down it.
+        // In the air [`ROW_INSET`] leaves. The label holds its position.
         let height = layout.row_h / 2;
         window.fill(
             Rect {
@@ -741,11 +604,9 @@ fn draw_item(
         );
     }
     match item {
-        // The text sits at the foot of its row and the rule directly under
-        // it, so the empty half above reads as the gap between sections.
-        // Rows are a uniform height — `row_at` divides by one number — so
-        // the air has to come from inside the row rather than from a taller
-        // one.
+        // The text sits at the foot of its row and the rule under it, leaving
+        // the empty half above as the gap between sections. Rows are a
+        // uniform height: `row_at` divides by one number.
         Item::Heading(text) => {
             let baseline = top + layout.row_h.saturating_sub(TEXT_PX as u16 + 20);
             draw_line(
@@ -768,9 +629,8 @@ fn draw_item(
                 BLACK,
             );
         }
-        // No rule of its own: a rule above every entry is a stack of
-        // identical bars saying nothing. What separates one line from the
-        // next is the detail beside it, which is the part worth reading.
+        // No rule of its own. The detail column separates one line from the
+        // next.
         Item::Row {
             label,
             detail,
@@ -791,14 +651,11 @@ fn draw_item(
                 let rect = action_rect(layout, i, width, text, |s| {
                     measure(fonts, s, TEXT_PX) as u16
                 });
-                // Never filled at rest. A chip that removes something must
-                // not look like the marked, current, on thing — filled is
-                // what this page says "yes, this one" with.
+                // Never filled at rest. A fill marks the current value.
                 draw_chip(window, fonts, rect, text, ChipState::default());
             }
         }
-        // No rule: the chips are visibly bounded already, and a line under
-        // every setting buries the structure of the page.
+        // No rule: the chips carry their own bounds.
         Item::Choice {
             label,
             options,
@@ -881,14 +738,8 @@ fn draw_ring(window: &mut Window, rect: Rect) {
     }
 }
 
-/// One swatch: a filled circle, with a hole punched in the chosen one.
-///
-/// **Not the page's filled-versus-outlined idiom**, because that idiom spends
-/// the fill on saying "this one" and here the fill *is* the value — an
-/// unfilled swatch would be a colour setting with no colour in it. iA Writer
-/// marks its own picker with a dot in the middle and so does this, which
-/// survives the one thing that could take the colour away: on a panel showing
-/// these in grey, the mark is still a mark.
+/// One swatch: a filled circle carrying the value, with a hole punched in the
+/// chosen one. The mark survives a panel drawing these in grey.
 fn draw_swatch(window: &mut Window, rect: Rect, ink: u8, on: bool) {
     let radius = rect.width.min(rect.height) / 2;
     let cx = rect.x + rect.width / 2;
@@ -899,13 +750,8 @@ fn draw_swatch(window: &mut Window, rect: Rect, ink: u8, on: bool) {
     }
 }
 
-/// A filled circle, scanline by scanline.
-///
-/// Shared with the page, which marks Han emphasis with one.
-///
-/// Coverage is one bit everywhere else on this panel and it is one bit here:
-/// the edge is hard, which at this size reads as a circle and not as a
-/// staircase.
+/// A filled circle, scanline by scanline, shared with the Han emphasis mark.
+/// Coverage is one bit and the edge is hard.
 pub fn disc(window: &mut Window, cx: u16, cy: u16, radius: u16, value: u8) {
     let r = radius as i32;
     for dy in -r..=r {
@@ -927,40 +773,31 @@ pub fn disc(window: &mut Window, cx: u16, cy: u16, radius: u16, value: u8) {
     }
 }
 
-/// What a chip is, and what is happening to it. Every one of these is off by
-/// default: a chip that says nothing about itself is one the setting is not on,
-/// nothing is touching, and the keyboard is elsewhere.
+/// What a chip is, and what is happening to it. Every flag defaults off.
 #[derive(Debug, Clone, Copy, Default)]
 struct ChipState {
     /// What the setting is currently on.
     on: bool,
     /// Held under a finger.
     pressed: bool,
-    /// Saying where the row stands rather than offering to change it.
+    /// Reporting a state, with no press behind it.
     inert: bool,
     /// Where the keyboard is.
     focused: bool,
 }
 
-/// One chip: filled when it is what the setting is currently on, outlined when
-/// it is merely available.
-///
-/// **Filled, not ticked.** The renderer cuts coverage to one bit, so a tick or
-/// a grey wash is a smudge at this size; an inverted block is unambiguous
-/// across the room, and it is the idiom the strip already uses for a press.
+/// One chip: filled when the setting is on it, outlined when it is available.
+/// The renderer cuts coverage to one bit, and an inverted block survives that.
 fn draw_chip(window: &mut Window, fonts: &mut Fonts, rect: Rect, label: &str, state: ChipState) {
     if state.focused {
         draw_ring(window, rect);
     }
-    // A press inverts whatever the chip already was, so the feedback reads the
-    // same on a chip that is on as on one that is off.
+    // A press inverts whatever the chip was, on or off alike.
     let filled = state.on != state.pressed;
     let (ground, ink) = if filled {
         (BLACK, WHITE)
     } else if state.inert {
-        // Border and word both recede. A chip that cannot be pressed drawn in
-        // the same black as one that can is the page offering an action it does
-        // not have.
+        // Border and word both recede on a chip with no press behind it.
         (WHITE, QUIET)
     } else {
         (WHITE, BLACK)
@@ -1050,8 +887,7 @@ pub fn paint_chip(
             );
             rect
         }
-        // A press marks the swatch the way a chosen one is marked, so the
-        // feedback reads the same on the current colour as on any other.
+        // A press marks the swatch the way a chosen one is marked.
         Some(Item::Swatches { inks, on, .. }) => {
             let column = chip_column(items, width, |s| measure(fonts, s, TEXT_PX) as u16);
             let bounds = swatch_bounds(column, width, inks.len());
@@ -1072,55 +908,26 @@ pub fn paint_chip(
 }
 
 /// Draw a panel's bottom strip: a rule, then its buttons packed from the left.
-///
-/// A panel has no status line — its title and its own status row say what this
-/// screen is, and repeating a word count under a list of files would be
-/// answering a question nobody asked there.
+/// A panel carries no status line; its title and status row name the screen.
 pub fn paint_strip(window: &mut Window, fonts: &mut Fonts, layout: Layout, cells: &[String]) {
     let cells: Vec<String> = cells.iter().map(|label| format!("[ {label} ]")).collect();
     paint_cells(window, fonts, layout, &cells, &[], "");
 }
 
-/// The least blank a cell may keep either side of its text.
-///
-/// **Padding is what a strip gives up before it gives up a control.** Six
-/// cells at [`CELL_PAD`] spend 312 px on air, which on a 10.2″ panel is what
-/// makes the bar look deliberate and on a 7″ one is the difference between
-/// `[ Done ]` being on the strip and not being anywhere. A cramped button is
-/// still a button.
+/// The least blank a cell may keep either side of its text. Six cells at
+/// [`CELL_PAD`] spend 312 px on air, and a narrow panel gives that up ahead
+/// of a control.
 const CELL_PAD_MIN: u16 = 8;
 
 /// Blank space either side of a cell's text.
 const CELL_PAD: u16 = 26;
 
-/// Where each cell starts and how wide it is, in window x.
-///
-/// **Every cell is its own text's width**, packed from the left. Three short
-/// labels stretched across a ten-inch panel look accidental, and chrome should
-/// take only the room it needs — the same argument that hides it while writing.
-/// Even division leaves `[ Exit ]` 620 px wide in landscape.
-///
-/// `stretch` names the cells that absorb whatever is left over, for the bar
-/// that has a *field* on it rather than only buttons: the find bar's query grows
-/// as it is typed into, so packing it like a label would shove the buttons along
-/// under the writer's finger and eventually push `[ Done ]` off the end. Giving
-/// it the slack instead holds every button still. Empty leaves the remainder
-/// unclaimed, which is what the status line fills.
-///
-/// **Several of them share the slack equally**: the replace bar has two fields
-/// and a writer comparing `colour` with `color` has to see both. Equal shares
-/// and not shares by content, or a field would move its neighbour as it was
-/// typed into.
-///
-/// **The single source for drawing, hit-testing and press feedback**, and it has
-/// to be, because cells are *dropped* when the width runs out: the number drawn
-/// is not `cells.len()`, so anything that divided the width for itself would
-/// disagree about which cell a finger is on.
-///
-/// `measure_text` supplies the drawn width of a label, the way `wrap` takes its
-/// metric: the packing arithmetic is then testable against a stub, which matters
-/// because the device's faces do not exist on a development machine and this is
-/// exactly the arithmetic that failed there.
+/// Where each cell starts and how wide it is, in window x. Every cell is its
+/// own text's width, packed from the left. `stretch` names the cells that
+/// absorb the remainder, in equal shares; empty leaves it to the status line.
+/// Cells are dropped when the width runs out, so drawing, hit-testing and
+/// press feedback all measure through this. `measure_text` supplies a label's
+/// drawn width, which makes the packing testable against a stub metric.
 pub fn cell_bounds(
     width: u16,
     cells: &[String],
@@ -1130,9 +937,8 @@ pub fn cell_bounds(
     if cells.is_empty() {
         return Vec::new();
     }
-    // The fixed cells first, because the elastic ones are defined as what they
-    // leave — asking one how wide it wants to be would be circular, since its
-    // text is trimmed to fit the room it is given.
+    // The fixed cells first. An elastic cell's width is what they leave, and
+    // its text is trimmed to that.
     let text: u16 = cells
         .iter()
         .enumerate()
@@ -1162,8 +968,7 @@ pub fn cell_bounds(
         out.push((x, w));
         x = x.saturating_add(w);
     }
-    // One cell wider than the whole strip is still drawn, clipped, rather than
-    // leaving the bar blank with something in progress on it.
+    // A cell wider than the whole strip is drawn clipped.
     if out.is_empty() {
         out.push((0, width));
     }
@@ -1175,33 +980,22 @@ fn fitted(label: &str, pad: u16, measure_text: &mut impl FnMut(&str) -> u16) -> 
     measure_text(label).saturating_add(pad * 2)
 }
 
-/// The blank this strip can afford either side of each cell.
-///
-/// [`CELL_PAD`] whenever the words fit with it, and as little as
-/// [`CELL_PAD_MIN`] when they do not — the whole strip tightening together, so
-/// that it still reads as one bar rather than as cells of two kinds.
-///
-/// **`text` is the fixed cells' text and nothing else.** A stretch cell counts
-/// towards `cells`, because it needs padding like any other, but its words are
-/// trimmed to the room left over — so measuring what it currently says would
-/// make the padding depend on what has been typed into it, and the two places
-/// that ask for it are on opposite sides of that trimming. What each of them
-/// wants instead is [`FIELD_MIN`], claimed here before any of the slack is
-/// spent on air.
+/// The blank this strip can afford either side of each cell: [`CELL_PAD`] where
+/// the words fit with it, down to [`CELL_PAD_MIN`] where they do not, one value
+/// across the whole strip. `text` holds the fixed cells' text alone; a stretch
+/// cell counts towards `cells` and claims [`FIELD_MIN`] ahead of the slack.
 fn cell_pad(width: u16, text: u16, cells: usize, elastic: usize) -> u16 {
     let wanted = text.saturating_add(FIELD_MIN * elastic as u16);
     let each = width.saturating_sub(wanted) / (2 * cells.max(1)) as u16;
     each.clamp(CELL_PAD_MIN, CELL_PAD)
 }
 
-/// The least text a stretch cell is worth giving: eight Latin characters at
-/// [`TEXT_PX`], which is a search query you can still read. Below that the
-/// field is present and useless, which is a worse answer than a tighter bar.
+/// The least width a stretch cell is given: eight Latin characters at
+/// [`TEXT_PX`].
 pub const FIELD_MIN: u16 = (TEXT_PX * 8.0 / 2.0) as u16;
 
-/// What one elastic cell gets of the room the fixed ones leave.
-///
-/// Zero when nothing is elastic, so the remainder falls to the status line.
+/// What one elastic cell gets of the room the fixed ones leave. Zero with
+/// nothing elastic, leaving the remainder to the status line.
 fn share(width: u16, fixed: u16, elastic: usize) -> u16 {
     if elastic == 0 {
         return 0;
@@ -1209,14 +1003,9 @@ fn share(width: u16, fixed: u16, elastic: usize) -> u16 {
     width.saturating_sub(fixed) / elastic as u16
 }
 
-/// How much *text* each stretch cell will have room for, given what the others
-/// say.
-///
-/// The stretch cells' own labels are deliberately not among `others` and could
-/// not be: their text is trimmed to fit the room they are given, so asking how
-/// wide one wants to be first is circular. This is the same arithmetic
-/// [`cell_bounds`] does, said once so the caller that has to trim cannot arrive
-/// at a different answer from the layout that will draw it.
+/// How much text each stretch cell has room for, given `others`. A stretch
+/// cell's own label is not among them; its text is trimmed to what it is
+/// given. The same arithmetic [`cell_bounds`] lays out with.
 pub fn stretch_room(
     width: u16,
     others: &[String],
@@ -1241,36 +1030,18 @@ pub fn cells_end(bounds: &[(u16, u16)]) -> u16 {
     bounds.last().map_or(0, |(x, w)| x.saturating_add(*w))
 }
 
-/// Which cell a tap at `x` fell on, or `None` for space no cell occupies.
-///
-/// `None` matters for a fitted bar: the strip runs the full width but the
-/// candidates may not fill it, and a tap on the empty tail should do nothing
-/// rather than commit the last candidate.
+/// Which cell a tap at `x` fell on, or `None` for space no cell occupies. The
+/// strip runs the full width and its cells may leave a tail.
 pub fn cell_at(bounds: &[(u16, u16)], x: u16) -> Option<usize> {
     bounds
         .iter()
         .position(|(cx, w)| x >= *cx && x < cx.saturating_add(*w))
 }
 
-/// Draw cells along the bottom, with the text given.
-///
-/// The action strip and the find bar are both this, differing only in what
-/// their cells say and which of them is elastic. The geometry is written once
-/// on purpose: two copies of this arithmetic drift the moment one is adjusted.
-///
-/// **The rule runs the full width, and there are no rules between the cells.**
-/// Dividers make a table of the buttons, and a table's last cell wants a right
-/// wall it cannot have, so the row reads as unfinished. They are also a second
-/// delimiter for a boundary the brackets already draw.
-///
-/// **The rule runs the full width**, not out to the last cell. The band is
-/// full width because `status` lives in the other end of it, and the section
-/// headings on the panel directly above rule the whole width — a strip that
-/// stopped short would be the one line on screen that did not.
-///
-/// `status` is right-aligned and quiet — the same band rather than a second one
-/// stacked under it, and a thing you look at when you stop rather than while
-/// typing.
+/// Draw cells along the bottom, with the text given. The action strip and the
+/// find bar are both this, differing in what their cells say and which of them
+/// is elastic. The rule runs the full width and no rules sit between cells;
+/// `status` is right-aligned and quiet in the other end of the same band.
 pub fn paint_cells(
     window: &mut Window,
     fonts: &mut Fonts,
@@ -1311,20 +1082,13 @@ pub fn paint_cells(
     paint_status(window, fonts, layout, cells_end(&bounds), status);
 }
 
-/// Where a line of strip text sits, so the buttons and the status line share one
-/// baseline instead of each finding their own.
+/// Where a line of strip text sits. The buttons and the status line share it.
 fn cell_text_top(layout: Layout) -> i32 {
     layout.strip_top as i32 + (STRIP_H as i32 - TEXT_PX as i32) / 2 - 4
 }
 
-/// The status line, in the room the buttons leave.
-///
-/// **Right-aligned against the far margin**, so it reads as the other end of the
-/// band rather than as a fourth button that lost its brackets. Quiet, because it
-/// is something to glance at: the buttons are what the finger is looking for.
-///
-/// Dropped entirely when the buttons have taken the width — a status crushed
-/// into forty pixels is worse than none.
+/// The status line, in the room the buttons leave: right-aligned against the
+/// far margin and drawn quiet. Dropped where the buttons have taken the width.
 fn paint_status(window: &mut Window, fonts: &mut Fonts, layout: Layout, from: u16, status: &str) {
     if status.is_empty() {
         return;
@@ -1350,10 +1114,7 @@ fn paint_status(window: &mut Window, fonts: &mut Fonts, layout: Layout, from: u1
     );
 }
 
-/// The rectangle of one strip cell, given the bounds it was laid out at.
-///
-/// Takes the bounds rather than recomputing them, so a caller that has already
-/// asked [`cell_bounds`] cannot get a second, different answer.
+/// The rectangle of one strip cell, from the bounds [`cell_bounds`] laid out.
 pub fn strip_cell_rect(layout: Layout, bounds: &[(u16, u16)], index: usize) -> Rect {
     let (x, w) = bounds.get(index).copied().unwrap_or((0, 0));
     Rect {
@@ -1374,11 +1135,8 @@ pub fn row_rect(layout: Layout, width: u16, index: usize) -> Rect {
     }
 }
 
-/// Redraw one strip cell, inverted while held.
-///
-/// This is the only acknowledgement a tap gets while the finger is still down.
-/// Whatever the press does lands later — a panel repaint, a scan starting — so
-/// without it a tap that registered looks exactly like one that missed.
+/// Redraw one strip cell, inverted while held. The one acknowledgement a tap
+/// gets while the finger is down.
 pub fn paint_strip_cell(
     window: &mut Window,
     fonts: &mut Fonts,
@@ -1391,9 +1149,8 @@ pub fn paint_strip_cell(
     let width = window.width();
     let bounds = cell_bounds(width, cells, stretch, |s| measure(fonts, s, TEXT_PX) as u16);
     let rect = strip_cell_rect(layout, &bounds, index);
-    // A cell with nothing in it is nothing to press. The find bar's count is
-    // blank until something has been typed, and inverting it would flash a
-    // black block where there is no button.
+    // An empty cell is nothing to press. The find bar's count is blank until
+    // something has been typed into it.
     if cells.get(index).is_none_or(|text| text.is_empty()) {
         return rect;
     }
@@ -1403,9 +1160,8 @@ pub fn paint_strip_cell(
         (WHITE, BLACK)
     };
     window.fill(rect, ground);
-    // The label exactly as [`paint_cells`] draws it, brackets included: adding
-    // them again reads `[ [ Close ] ]` and jumps wider under the finger. Press
-    // feedback must differ from the resting state only by the inversion.
+    // The label exactly as [`paint_cells`] draws it, brackets included. Press
+    // feedback differs from the resting state by the inversion alone.
     let Some(text) = cells.get(index) else {
         return rect;
     };
@@ -1462,10 +1218,8 @@ pub fn paint_row(
         if !detail.is_empty() {
             draw_line(window, fonts, detail, column, baseline, TEXT_PX, false, ink);
         }
-        // Drawn at rest even while the row around it is inverted, which is the
-        // point: it says the chip is not the thing being pressed. Filling over
-        // it instead would flash the whole row black including a control the
-        // finger deliberately missed.
+        // Drawn at rest while the row around it is inverted, which marks the
+        // chip as not the thing being pressed.
         if let Some(text) = action {
             let chip = action_rect(layout, index, width, text, |s| {
                 measure(fonts, s, TEXT_PX) as u16
@@ -1495,9 +1249,8 @@ pub fn draw_line(
     ink: u8,
 ) {
     let mut pen = x as f32;
-    // The baseline sits low enough for the faces this label uses. A Han label —
-    // the language button, a candidate, a Chinese filename — is taller than the
-    // Latin face's ascent, and that ascent would draw it above its own row.
+    // The baseline sits low enough for every face this label uses. A Han
+    // label stands taller than the Latin face's ascent.
     let roles: Vec<Role> = text
         .chars()
         .map(|ch| chrome_role_for(bold, script_of(ch)))
@@ -1521,24 +1274,10 @@ pub fn draw_line(
 }
 
 /// Where the candidate box goes, or `None` with nothing to choose from and no
-/// room to put it.
-///
-/// It is drawn against the text being composed rather than in the action strip
-/// at the foot of the page. Every desktop IME does it this way, and the reason
-/// is the eye: you are writing in the middle of a ten-inch page, and choosing a
-/// character should not mean looking 1740 px away and back. It also keeps
-/// composing from dragging the auto-hidden chrome back on screen for every word.
-///
-/// **`anchor` is whatever is being typed into** — the caret on the page, the
-/// find bar's field on the strip, the status line a filename goes into. A
-/// rectangle and a type size rather than a page, because the box is a widget
-/// and not a feature of the document: composing happens in the panels too, and
-/// a writer who can only name files in Latin has the same gap this box exists
-/// to close. `bottom` is the last row it may occupy.
-///
-/// Separate from the drawing because the damage rectangle has to know where the
-/// box will be *before* anything is painted — including on the paths where
-/// nothing is painted at all.
+/// room for it. `anchor` is whatever is being typed into — the caret on the
+/// page, the find bar's field, the status line a filename goes into — given as
+/// a rectangle and a type size. `bottom` is the last row it may occupy. The
+/// damage rectangle is taken from here ahead of any painting.
 pub fn overlay_rect(
     surface_width: u16,
     fonts: &mut impl Metrics,
@@ -1554,28 +1293,23 @@ pub fn overlay_rect(
     let (pad_x, pad_y) = padding(px);
     let gap = (px * 0.25) as u16;
 
-    // **Each cell is its label plus the same padding on both sides**, and the
-    // box is exactly the cells. Padding added once per label *and* again to the
-    // total would leave `pad/2` at the left edge and one and a half at the
-    // right, so the box must not take it twice.
+    // Each cell is its label plus the same padding either side, and the box is
+    // exactly the cells. The padding is counted once.
     let cells: Vec<u16> = labels
         .iter()
         .map(|label| label_width(fonts, label, px) + pad_x * 2)
         .collect();
     let width = cells.iter().sum::<u16>().min(surface_width);
-    // The tallest label's own glyph box, not a leaded row: leading is the space
-    // between lines of prose and there is only one line here. Using it put all
-    // of the extra space below the text and stood the label on the box's top
-    // edge — the same mistake the page itself made before half-leading.
+    // The tallest label's own glyph box. Leading is the space between lines of
+    // prose, and the box holds one line.
     let text_box = labels
         .iter()
         .map(|label| glyph_box(fonts, label, px))
         .fold(0, u16::max);
     let height = text_box + pad_y * 2;
 
-    // Below the anchor when it fits and above it otherwise — composing on the
-    // last line of a page must not put the choices off the bottom of it, and
-    // the find bar sits on the strip, where there is no below at all.
+    // Below the anchor where it fits, above it where it does not. The find bar
+    // sits on the strip, with nothing below.
     let below = anchor.y as i32 + anchor.height as i32 + gap as i32;
     let y = if below + height as i32 <= bottom as i32 {
         below
@@ -1585,8 +1319,7 @@ pub fn overlay_rect(
     if y < 0 {
         return None;
     }
-    // Pulled left by however much it overhangs, so the last candidate is never
-    // cut off by the edge of the panel.
+    // Pulled left by whatever it overhangs, keeping the last candidate whole.
     let x = anchor.x.min(surface_width.saturating_sub(width));
     Some(Rect {
         x,
@@ -1596,11 +1329,8 @@ pub fn overlay_rect(
     })
 }
 
-/// Space inside the box, horizontally and vertically.
-///
-/// Wider than it is tall, which is how a label in a box reads as deliberate
-/// rather than cramped; equal padding on all four sides looks loose at the top
-/// and bottom for a single line of text.
+/// Space inside the box, wider horizontally than vertically for one line of
+/// text.
 fn padding(px: f32) -> (u16, u16) {
     (
         (px * 0.30).round() as u16,
@@ -1630,10 +1360,8 @@ fn label_roles(label: &str) -> Vec<Role> {
         .collect()
 }
 
-/// How wide a label draws. The same sum `ui::measure` does, but against
-/// `Metrics` rather than the concrete faces, so the geometry above can be
-/// checked on the host — which is the only place it ever is, the device's faces
-/// not existing on a development machine.
+/// How wide a label draws. The sum `ui::measure` does, over `Metrics`, which
+/// makes the geometry above checkable against a stub.
 pub fn label_width(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
     let width: f32 = label
         .chars()
@@ -1642,10 +1370,8 @@ pub fn label_width(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
     width.round() as u16
 }
 
-/// Where each label sits inside the box, in absolute window x.
-///
-/// The one source for drawing and for the tap test, because they must agree
-/// about which cell a finger is on.
+/// Where each label sits inside the box, in absolute window x. Drawing and the
+/// tap test both measure through this.
 pub fn overlay_cells(
     fonts: &mut impl Metrics,
     rect: Rect,
@@ -1664,25 +1390,11 @@ pub fn overlay_cells(
     out
 }
 
-/// Where each page of candidates starts, given what the panel can hold.
-///
-/// **Ten is what the number row can pick, not what the panel can show.** The
-/// box is drawn beside the caret at the writer's own type size, so ten
-/// four-character phrases want more width than a 7″ panel has — and more than a
-/// 10.2″ one has at the larger body sizes. What happened then was that
-/// [`overlay_rect`] clamped the box to the panel and [`overlay_cells`] went on
-/// laying candidates out past its edge: the last of them were drawn off the
-/// screen while the number row went on selecting them. **Committing something
-/// you cannot see is worse than not being offered it**, and paging is the way
-/// out, because the writer can already reach the next page with an arrow.
-///
-/// So a page is as many as fit, at most `most`. The starts are worked out for
-/// the whole list at once and kept, because the page a candidate is on is the
-/// one thing drawing, tapping and the number row all have to agree about — the
-/// rule [`cell_bounds`] follows for the same reason.
-///
-/// Empty for no candidates, and otherwise never empty: a candidate wider than
-/// the whole panel gets a page to itself rather than no page at all.
+/// Where each page of candidates starts, given what the panel can hold. A page
+/// is as many as fit, at most `most`; the number row picks ten. The starts are
+/// worked out for the whole list at once, and drawing, tapping and the number
+/// row all read the page from here. Empty for no candidates; a candidate wider
+/// than the panel takes a page to itself.
 pub fn candidate_pages(
     fonts: &mut impl Metrics,
     surface_width: u16,
@@ -1695,9 +1407,8 @@ pub fn candidate_pages(
     let mut starts = Vec::new();
     let (mut start, mut used) = (0usize, 0u16);
     for (i, text) in candidates.iter().enumerate() {
-        // Measured with a number in front, because that is what gets drawn.
-        // Any digit is as wide as any other, so the tenth's `0` stands for all
-        // of them.
+        // Measured with the number in front that gets drawn. Every digit is
+        // one width, and the tenth's `0` stands for all of them.
         let cell = label_width(fonts, &format!("0 {text}"), px) + pad_x * 2;
         if i > start && (used.saturating_add(cell) > surface_width || i - start == most) {
             starts.push(start);
@@ -1720,9 +1431,8 @@ pub fn draw_overlay(
 ) {
     let px = body_px * CANDIDATE_SCALE;
     let (pad_x, _) = padding(px);
-    // A filled panel with a rule around it: on one bit there is no shadow and
-    // no tint, so the border is the only thing saying this floats above the
-    // page rather than belonging to it.
+    // A filled panel with a rule around it. One bit of coverage carries no
+    // shadow and no tint, and the border is what lifts it off the page.
     window.fill(rect, WHITE);
     frame_rect(window, rect, BORDER);
 
@@ -1750,36 +1460,29 @@ fn frame_rect(window: &mut Window, rect: Rect, thickness: u16) {
     }
 }
 
-/// Candidates are set smaller than the prose: they are a tool rather than part
-/// of the writing, and a box of body-sized Han would cover a third of the page.
+/// Candidates are set smaller than the prose.
 pub const CANDIDATE_SCALE: f32 = 0.72;
 
 /// Thickness of the candidate box's border.
 const BORDER: u16 = 2;
-/// The small box that appears next to the caret.
-///
-/// One slot, because the two things that use it cannot both apply: switching
-/// language abandons any composition, so there is never a language to announce
-/// *and* a word being converted.
+/// The small box that appears next to the caret. One slot: switching language
+/// abandons any composition.
 pub enum Overlay<'a> {
     None,
     /// Numbered choices from the IME.
     Candidates(&'a [String]),
-    /// A single unnumbered label, for saying which language the keyboard just
-    /// became — the strip is hidden while writing and cannot say it.
+    /// A single unnumbered label naming the language the keyboard became. The
+    /// strip is hidden while writing.
     Notice(&'a str),
 }
 
 impl Overlay<'_> {
-    /// The cells to draw, numbered or not.
-    ///
-    /// Numbering happens here rather than inside the drawing, so that the
-    /// widths measured for the box are the widths of the strings actually put
-    /// on screen — the same rule the strip already follows.
+    /// The cells to draw, numbered or not. The numbering lands here, and the
+    /// widths measured for the box are the widths of these strings.
     pub fn labels(&self) -> Vec<String> {
         match self {
             Self::None => Vec::new(),
-            // The tenth is picked with 0, as in every other pinyin IME.
+            // The tenth is picked with 0.
             Self::Candidates(items) => items
                 .iter()
                 .enumerate()
@@ -1804,8 +1507,7 @@ mod tests {
 
     #[test]
     fn the_title_status_and_rows_never_overlap() {
-        // They did: spacing was derived from the body face while the title was
-        // drawn much larger, so the status line was painted through it.
+        // Spacing comes from the title face, not the body face.
         let l = layout();
         assert!(l.status_top >= l.title_top + 58, "status clears the title");
         assert!(l.rows_top >= l.status_top + 44, "rows clear the status");
@@ -1814,7 +1516,7 @@ mod tests {
 
     #[test]
     fn geometry_follows_the_faces_in_use() {
-        // A larger face pushes everything down rather than colliding.
+        // A larger face pushes everything down.
         let small = Layout::compute(30, 40, HEIGHT);
         let large = Layout::compute(60, 80, HEIGHT);
         assert!(large.title_top > small.title_top);
@@ -1825,8 +1527,7 @@ mod tests {
 
     #[test]
     fn a_small_face_still_gets_a_reachable_row() {
-        // The 96 px floor keeps a modest font from making tap targets a finger
-        // cannot hit.
+        // The 96 px floor holds under a small font.
         assert_eq!(Layout::compute(20, 30, HEIGHT).row_h, 96);
         assert_eq!(layout().row_h, 96);
     }
@@ -1850,8 +1551,7 @@ mod tests {
         assert_eq!(l.row_at(l.rows_top + 10, 0), None);
     }
 
-    /// A stub metric, as `wrap`'s tests use: ten pixels a character, so the
-    /// arithmetic is checkable by hand.
+    /// A stub metric, as `wrap`'s tests use: ten pixels a character.
     fn stub(text: &str) -> u16 {
         text.chars().count() as u16 * 10
     }
@@ -1870,7 +1570,7 @@ mod tests {
         }
     }
 
-    /// A row that opens something, as every line of the Files list does.
+    /// A row that opens something, as a Files line does.
     fn opener() -> Item {
         Item::Row {
             label: "draft.md".into(),
@@ -1880,9 +1580,8 @@ mod tests {
         }
     }
 
-    /// The chips the arrows walk are the ones a finger could press, and a row's
-    /// own action chip is not among them: Delete is reached by the key that
-    /// says so, not by arrowing past it on the way to the next document.
+    /// The chips the arrows walk are the ones a finger can press. A row's own
+    /// action chip is reached by its named key.
     #[test]
     fn the_keyboard_walks_the_chips_a_press_could_take() {
         assert_eq!(takeable(&choice(3)), vec![0, 1, 2]);
@@ -1900,8 +1599,7 @@ mod tests {
         assert_eq!(current(&opener()), None);
     }
 
-    /// Buttons take the width their own text needs, packed from the left. Even
-    /// division leaves `[ Exit ]` 620 px wide in landscape.
+    /// Buttons take the width their own text needs, packed from the left.
     #[test]
     fn buttons_take_their_own_width_and_leave_the_rest() {
         let cells = strings(&["[ Exit ]", "[ Config ]", "[ Files ]"]);
@@ -1922,8 +1620,8 @@ mod tests {
         );
     }
 
-    /// The whole point of packing left: the tail is the status line's, and a
-    /// tap on a line that only reports must not run the button nearest it.
+    /// The tail past the last cell belongs to the status line, and a tap on it
+    /// resolves to nothing.
     #[test]
     fn a_tap_past_the_last_button_hits_nothing() {
         let cells = strings(&["[ Exit ]", "[ Config ]"]);
@@ -1932,10 +1630,8 @@ mod tests {
         assert_eq!(cell_at(&bounds, WIDTH - 1), None);
     }
 
-    /// The find bar's field grows as it is typed into. Packing it like a label
-    /// would shove `Previous`, `Next` and `Done` along under the writer's
-    /// finger and eventually push them off the strip; giving it the slack
-    /// instead holds every button still.
+    /// The find bar's field takes the slack, and every button holds its place
+    /// as the field is typed into.
     #[test]
     fn the_stretch_cell_takes_the_slack_and_the_buttons_hold_still() {
         let short = strings(&["[ Find: a_ ]", "[ 1 of 3 ]", "[ Next ]", "[ Done ]"]);
@@ -1962,8 +1658,8 @@ mod tests {
         );
     }
 
-    /// What the field may hold is the same subtraction the layout does, or the
-    /// text is trimmed against one width and drawn into another.
+    /// `field_room` and `cell_bounds` do one subtraction: the text is trimmed
+    /// against the width it is drawn into.
     #[test]
     fn the_room_offered_matches_the_cell_given() {
         let others = strings(&["[ 1 of 3 ]", "[ Previous ]", "[ Next ]", "[ Done ]"]);
@@ -1994,8 +1690,7 @@ mod tests {
         assert_eq!(bounds[0].1, bounds[1].1, "and the two fields are one size");
         let fixed: u16 = cells[2..].iter().map(|s| stub(s) + CELL_PAD * 2).sum();
         assert_eq!(bounds[0].1, (WIDTH - fixed) / 2);
-        // Typing into either one moves nothing: the width is the slack, not the
-        // text.
+        // The width is the slack, not the text.
         let mut typed = cells.clone();
         typed[1] = "[ With: color and then some_ ]".into();
         assert_eq!(cell_bounds(WIDTH, &typed, &[0, 1], stub), bounds);
@@ -2007,8 +1702,7 @@ mod tests {
         );
     }
 
-    /// Better clipped than blank: a field long enough to fill the strip still
-    /// has to show, because what has been typed is nowhere else on screen.
+    /// A field long enough to fill the strip is drawn clipped.
     #[test]
     fn one_over_wide_cell_is_still_drawn() {
         let cells = strings(&["a very long composition indeed"]);
@@ -2025,16 +1719,14 @@ mod tests {
         assert_eq!(cells_end(&[]), 0);
     }
 
-    /// The panel does not scroll, so what fits is what exists — and a list
-    /// longer than this was simply invisible past the last row that did fit,
-    /// which on a landscape panel is the seventeenth document onwards.
+    /// The panel does not scroll, and `capacity` is what the caller pages by.
     #[test]
     fn what_fits_is_what_the_caller_pages_by() {
         let l = layout();
         let fits = l.capacity();
         assert!(fits > 0);
-        // The last row that fits resolves; the first that does not is nothing,
-        // which is the same boundary `paint_items` draws to.
+        // The last row that fits resolves; the first that does not is nothing.
+        // `paint_items` draws to the same boundary.
         assert_eq!(
             l.row_at(l.rows_top + (fits as u16 - 1) * l.row_h, fits),
             Some(fits - 1)
@@ -2044,8 +1736,7 @@ mod tests {
 
     #[test]
     fn the_rows_region_stops_short_of_the_strip() {
-        // Or a list would paint under the buttons and look tappable when it is
-        // not.
+        // The list stops above the strip.
         let l = layout();
         let rect = l.rows_rect(WIDTH);
         assert_eq!(rect.y, l.rows_top);
@@ -2054,8 +1745,7 @@ mod tests {
 
     #[test]
     fn a_pressed_cell_covers_its_own_slot_and_no_other() {
-        // The invert has to land exactly on the cell under the finger, or a
-        // press smears into its neighbour.
+        // The invert lands exactly on the cell under the finger.
         let l = layout();
         let cells = strings(&["[ Exit ]", "[ Config ]", "[ Files ]"]);
         let bounds = cell_bounds(WIDTH, &cells, &[], stub);
@@ -2068,9 +1758,8 @@ mod tests {
         assert!(b.width > a.width, "the longer label gets the wider cell");
     }
 
-    /// A row opens what it names, so the chip that removes it is pinned to the
-    /// far margin — and has to be asked about *before* the row it sits on, or a
-    /// tap meant to delete a document would open it instead.
+    /// The chip that removes a row is pinned to the far margin, and [`hit`]
+    /// asks it ahead of the row it sits on.
     #[test]
     fn a_rows_action_chip_is_hit_before_the_row_under_it() {
         let l = layout();
@@ -2093,7 +1782,7 @@ mod tests {
             Some(Hit::Row(0)),
             "and the name is still the row"
         );
-        // Which is only safe because they are nowhere near each other.
+        // The two sit at opposite ends of the row.
         assert!(
             chip.x > WIDTH / 2,
             "the chip is at the far margin, not beside the name: {chip:?}"
@@ -2101,22 +1790,21 @@ mod tests {
         assert_eq!(chip.x + chip.width, WIDTH - MARGIN_X);
     }
 
-    /// The chip holds one edge whatever the row is called, so a column of them
-    /// lines up and none of them moves when a document is renamed.
+    /// The chip holds one edge whatever the row is called.
     #[test]
     fn action_chips_line_up_however_long_the_names_are() {
         let l = layout();
         let short = action_rect(l, 0, WIDTH, "Delete", stub);
         let same = action_rect(l, 3, WIDTH, "Delete", stub);
         assert_eq!(short.x, same.x);
-        // And an armed one grows leftward rather than off the edge.
+        // An armed one grows leftward.
         let armed = action_rect(l, 0, WIDTH, "Delete?", stub);
         assert_eq!(armed.x + armed.width, short.x + short.width);
         assert!(armed.x < short.x);
     }
 
-    /// A row with no action is untouched by any of it: every tap on it is the
-    /// row, including one at the far margin where another row's chip would be.
+    /// On a row with no action chip, every tap resolves to the row, including
+    /// one at the far margin.
     #[test]
     fn a_row_without_an_action_has_no_dead_corner() {
         let l = layout();
@@ -2168,10 +1856,8 @@ mod tests {
         ]
     }
 
-    /// Chips and details line up down the page rather than stepping in and out
-    /// behind labels of different lengths, which is most of what makes it read
-    /// as a page and not a pile. **One column for both kinds of line**, so a
-    /// list of files and a page of settings are laid out to the same grid.
+    /// Chips and details line up down the page in one column, shared by a list
+    /// of files and a page of settings.
     #[test]
     fn every_line_starts_its_second_column_in_the_same_place() {
         let items = settings();
@@ -2180,8 +1866,7 @@ mod tests {
         assert!(column > ROW_INSET + stub("Latin"));
         assert!(column > ROW_INSET + stub("draft.md"), "rows count too");
 
-        // A heading is not a label — it starts at the margin and owns its whole
-        // line, so however long it is it moves nothing.
+        // A heading starts at the margin and moves the column nothing.
         let mut longer = settings();
         longer.push(Item::Heading("A Very Long Section Heading Indeed".into()));
         assert_eq!(chip_column(&longer, WIDTH, stub), column);
@@ -2196,10 +1881,8 @@ mod tests {
         assert!(chip_column(&longer, WIDTH, stub) > column);
     }
 
-    /// **The same list is laid out differently on different panels.** A wide one
-    /// has room to put the column where the labels want it; a narrow one has to
-    /// pull it back until the second column finishes inside the right margin.
-    /// Nothing about the list changes — only how much of the panel is left.
+    /// One list lays out to a different column per panel width: a narrow panel
+    /// pulls it back until the second column finishes inside the right margin.
     #[test]
     fn a_column_is_placed_from_what_the_panel_has_left() {
         let items = vec![Item::Row {
@@ -2231,10 +1914,8 @@ mod tests {
         }
     }
 
-    /// A run of chips is what a settings row has instead of a detail, and it
-    /// binds the column the same way: the seven type sizes are the widest run
-    /// karyll draws, and on the narrow panel they are what decides where the
-    /// labels stop.
+    /// A settings row carries a run of chips where a file row carries a
+    /// detail, and both bind the column. Seven type sizes is the widest run.
     #[test]
     fn a_row_of_chips_leaves_the_column_as_much_room_as_a_detail_does() {
         let sizes: Vec<String> = crate::render::SIZES
@@ -2263,9 +1944,8 @@ mod tests {
         }
     }
 
-    /// **A label is cut rather than drawn over its own value.** Nothing else on
-    /// a panel is drawn past its bounds either: a chip too wide for the margin
-    /// is dropped and a candidate bar too wide for the panel is paged.
+    /// A label is cut at its own value. A chip too wide for the margin is
+    /// dropped, and a candidate bar too wide for the panel is paged.
     #[test]
     fn a_label_too_long_for_its_room_is_cut_at_the_mark() {
         assert_eq!(elided("draft.md", 200, stub), "draft.md", "it fits, whole");
@@ -2274,16 +1954,14 @@ mod tests {
         assert_eq!(elided("a-long-filename.md", 65, stub), "a-lon…");
         // Cut by character, so a Chinese name loses characters and not bytes.
         assert_eq!(elided("第一章的草稿", 45, stub), "第一章…");
-        // A space before the mark reads as a gap rather than as a cut.
+        // A space before the mark is trimmed.
         assert_eq!(elided("Focus on this", 75, stub), "Focus…");
-        // Not even the mark fits, and half a mark is worse than none.
+        // Below the mark's own width, nothing is drawn.
         assert_eq!(elided("draft.md", 5, stub), "");
     }
 
-    /// One label on this page is not karyll's to choose — a Bluetooth keyboard
-    /// carries whatever name its maker gave it. Unbounded, a long one pushes the
-    /// chips past the right margin, `chip_bounds` drops them, and the writer is
-    /// left with a keyboard they cannot forget. The name gives way instead.
+    /// A Bluetooth keyboard's name comes from the keyboard. `elided` cuts a
+    /// long one, and its chips stay inside the right margin.
     #[test]
     fn a_label_nobody_chose_cannot_push_its_own_controls_off_the_page() {
         let items = vec![Item::Choice {
@@ -2307,8 +1985,7 @@ mod tests {
                 "{panel} px panel: {drawn:?} reaches its own Connect chip"
             );
         }
-        // The 7″ panel is the one with no room for the whole name, and there it
-        // is the name that gives way rather than the buttons.
+        // On `NARROW` the name gives way and the buttons hold.
         let column = chip_column(&items, NARROW, stub);
         let room = label_room(&items[0], column, NARROW, &mut stub);
         assert!(elided(label, room, stub).ends_with('…'));
@@ -2338,9 +2015,8 @@ mod tests {
         assert!(bounds.len() < options.len());
     }
 
-    /// **The narrow-panel rule.** Three chips that do not fit from the shared
-    /// column do fit from the row's own label, so the row steps out of the
-    /// table rather than dropping a setting off the page.
+    /// Three chips that miss the shared column fit from the row's own label,
+    /// and the row keeps every setting.
     #[test]
     fn a_row_that_cannot_afford_the_column_keeps_its_own() {
         let options = strings(&["Ember", "Bookerly", "Caecilia"]);
@@ -2389,8 +2065,8 @@ mod tests {
     #[test]
     fn a_tap_reported_on_a_swatch_is_inside_the_swatch_that_gets_drawn() {
         let l = layout();
-        // The narrow panel, because it is the one where six of anything is a
-        // question: the colour row only ever appears on a 1272 px Colorsoft.
+        // The colour row appears on a 1272 px panel, where six cells is the
+        // tight case.
         const COLORSOFT: u16 = 1272;
         let items = vec![Item::Swatches {
             label: "Highlight".into(),
@@ -2443,10 +2119,8 @@ mod tests {
         );
     }
 
-    /// An inert chip is a word in grey, and the tap has to stop at [`hit`].
-    /// Nothing downstream can tell it apart: the action list a Config row
-    /// carries is index-parallel to the options, so an inert option that
-    /// reported a hit would fire whatever sits at its index.
+    /// An inert chip is a word in grey, and the tap stops at [`hit`]. A Config
+    /// row's action list is index-parallel to its options.
     #[test]
     fn a_chip_marked_inert_is_a_state_and_not_a_target() {
         let l = layout();
@@ -2541,8 +2215,7 @@ mod tests {
 
     #[test]
     fn a_notice_is_one_cell_and_carries_no_number() {
-        // It is not a choice, so numbering it would invite a tap that does
-        // nothing.
+        // A notice carries no choice and no number.
         assert_eq!(Overlay::Notice("日本語").labels(), ["日本語"]);
         assert!(Overlay::None.labels().is_empty());
     }
@@ -2567,10 +2240,8 @@ mod tests {
 
     #[test]
     fn the_label_sits_in_the_middle_of_its_box_both_ways() {
-        // The label leans to the upper left when the box adds its padding once
-        // per label and once more to the total — half a pad at the left and one
-        // and a half at the right — and when its height is a leaded row with
-        // the text at the top rather than half-leaded.
+        // The label sits centred: the box counts its padding once, and its
+        // height is the glyph box with the text half-leaded.
 
         let labels = vec!["简体".to_string()];
         let rect =
@@ -2661,10 +2332,8 @@ mod tests {
 
     #[test]
     fn a_box_anchored_to_the_find_bar_goes_above_it() {
-        // The find bar is the strip, so there is never room below it. This is
-        // the same fallback as composing on the last line of a page, and the
-        // reason the box takes an anchor rather than reading the caret: while
-        // finding, the caret is at the last match and the typing is down here.
+        // The find bar is the strip, with no room below it. While finding, the
+        // caret is at the last match and the typing is in the field.
         let px = TEXT_PX;
         let list = vec!["你好".to_string(), "尼豪".to_string()];
         let field = Rect {
@@ -2807,8 +2476,8 @@ mod tests {
         }
     }
 
-    /// Nothing to show is no pages, and a candidate too wide for the whole
-    /// panel still gets one — refusing to show it at all would lose it.
+    /// Nothing to show is no pages; a candidate too wide for the panel takes
+    /// a page of its own.
     #[test]
     fn there_is_a_page_for_anything_the_engine_offers() {
         assert!(

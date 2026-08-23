@@ -25,26 +25,14 @@ use karyll_core::{Dict, Document};
 use font::Metrics as _;
 use keymap::{Action, Mods};
 
-/// Stamped in by `build.sh` so a log says which binary wrote it.
-/// Without it there is no way to tell a stale copy on the device from a fresh
-/// one, and every symptom has to be diagnosed twice.
+/// Stamped in by `build.sh`. Printed at start-up, naming the binary in a log.
 const BUILD: &str = match option_env!("KARYLL_BUILD") {
     Some(stamp) => stamp,
     None => "dev",
 };
 
-/// The document named on the command line, or an empty one where there is no
-/// file yet.
-///
-/// **A file that is not there is a document that has not been written yet**,
-/// which is what the launcher hands over on a Kindle karyll has never run on:
-/// it names the welcome document before anything has created it. Refusing to
-/// start is the worst answer available: the editor would exit before drawing
-/// anything, so the writer would see a tile that does nothing.
-///
-/// Anything else is still an error. A file that exists and cannot be read is a
-/// permission or a disk fault, and opening an empty page over the top of it
-/// would invite the writer to save an empty page over their draft.
+/// The document named on the command line. A missing file opens empty; any
+/// other error is returned, leaving an unreadable draft untouched.
 fn read_document(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
@@ -66,8 +54,7 @@ fn main() -> Result<()> {
     }
     catch_signals();
     let fonts = font::Fonts::load(read_choices())?;
-    // A firmware that has moved or dropped a face otherwise shows up only as
-    // text drawn in the wrong style, so say what was found.
+    // The faces found, named in the log.
     for path in fonts.present() {
         eprintln!("font: {path}");
     }
@@ -80,12 +67,7 @@ fn main() -> Result<()> {
         );
     }
 
-    // **Nothing else makes this.** It sits outside the extension so that an
-    // update cannot take a draft with it, which also means no install step
-    // creates it — on a Kindle karyll has never run on it is simply not there,
-    // and then the file list is empty, a new draft cannot be written, and the
-    // welcome document has nowhere to land. karyll owns the directory, so
-    // karyll makes it, however it was started.
+    // [`DOCUMENTS`] sits outside the extension, and no install step creates it.
     if let Err(e) = std::fs::create_dir_all(DOCUMENTS) {
         eprintln!("documents: cannot create {DOCUMENTS}: {e}");
     }
@@ -102,32 +84,16 @@ fn main() -> Result<()> {
         doc.set_cursor(at);
     }
 
-    // Bring the Bluetooth stack up ourselves. There is no kernel Bluetooth on
-    // this device, so a userspace daemon is the only route to a keyboard, and
-    // karyll owns its lifetime: starting it displaces the stock stack, and by
-    // default it is stopped again on exit so Audible and VoiceView only go away
-    // while the editor is open.
-    //
-    // The writer can say otherwise — see [`hid::Hid::set_keep_alive`]. The
-    // setting is read before `start`, which needs it to tell an adoption from a
-    // replacement.
-    //
-    // A failure here is reported and not fatal. The editor is still worth
-    // opening — the document is readable, and a keyboard paired later is
-    // picked up without a restart.
-    // Tag the keyboard for X before the daemon creates it, so a keyboard that
-    // arrives while karyll runs is one kterm and the home screen can read the
-    // moment karyll lets go of it. karyll itself needs nothing from this, and a
-    // failure costs only that reach — see [`udev`].
+    // The tag goes in ahead of the daemon that creates the node. karyll reads
+    // the node directly; a failure here costs the tag alone — see [`udev`].
     match udev::ensure() {
         Ok(udev::Outcome::Present) => {}
         Ok(udev::Outcome::Installed) => eprintln!("udev: installed {}", udev::PATH),
         Err(err) => eprintln!("udev: {err:#} — the keyboard will reach karyll only"),
     }
 
-    // Spawned and left to come up on its own — see [`hid::Hid::poll_up`]. The
-    // window is what a tap on the tile is waiting for, and it must not wait for
-    // a radio.
+    // Spawned and left to come up on its own — see [`hid::Hid::poll_up`].
+    // `set_keep_alive` runs ahead of `start`, which reads it.
     let mut bluetooth = hid::Hid::beside_executable()?;
     bluetooth.set_keep_alive(read_keep_bluetooth());
     if let Err(err) = bluetooth.start() {
@@ -149,9 +115,7 @@ fn main() -> Result<()> {
         }
     };
 
-    // Touch is what makes karyll reachable — and escapable — before a keyboard
-    // exists. Without it the only way out is a key chord on a keyboard that has
-    // not been paired yet.
+    // The way in and out of karyll before a keyboard is paired.
     let touch = match touch::Touchscreen::open() {
         Ok(touch) => Some(touch),
         Err(err) => {
@@ -160,10 +124,7 @@ fn main() -> Result<()> {
         }
     };
 
-    // The pen is a second pointer, not a second input method: it places the
-    // cursor between two characters, which a fingertip several millimetres
-    // across cannot. Absent on a Scribe without one in the room, and nothing
-    // depends on it.
+    // A second pointer: it places the cursor between two characters. Optional.
     let pen = match pen::Pen::open() {
         Ok(pen) => Some(pen),
         Err(err) => {
@@ -172,9 +133,8 @@ fn main() -> Result<()> {
         }
     };
 
-    // Opened before the window, because it is what decides which way up the
-    // window opens. A missing accelerometer is not worth a word to the user:
-    // the Kindle that has none offers the choice in Config instead.
+    // Opened ahead of the window, which opens the way this reads. A device
+    // with no accelerometer takes the orientation from Config.
     let accel = match evdev::Accelerometer::open() {
         Ok(accel) => {
             eprintln!("accel: {}", accel.path().display());
@@ -190,8 +150,7 @@ fn main() -> Result<()> {
 
     let orientation = read_orientation(accel.as_ref());
     let mut window = window::Window::open("karyll", orientation)?;
-    // Only ever narrows what the panel offered: on the two grey Kindles the
-    // capability is absent and this is a no-op.
+    // A no-op on a panel with no colour.
     window.set_colours(read_colours());
     window.set_colour(read_colour());
     eprintln!("window: {}x{}", window.width(), window.height());
@@ -258,10 +217,8 @@ fn main() -> Result<()> {
 }
 
 /// Wait until one of `fds` has something to read, or `timeout_ms` passes
-/// (negative for no timeout), and report which are ready.
-///
-/// A signal interrupting the wait is not an error and not a descriptor: it
-/// reports nothing ready, and the caller goes round once and sees why.
+/// (negative for no timeout), and report which are ready. An interrupting
+/// signal reports nothing ready.
 fn wait(fds: &[std::os::unix::io::RawFd], timeout_ms: i32) -> Result<Vec<bool>> {
     let mut poll: Vec<libc::pollfd> = fds
         .iter()
@@ -273,38 +230,21 @@ fn wait(fds: &[std::os::unix::io::RawFd], timeout_ms: i32) -> Result<Vec<bool>> 
         .collect();
     let n = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, timeout_ms) };
     if n >= 0 {
-        // **Any `revents`, not just `POLLIN`.** A Bluetooth keyboard's
-        // `/dev/input/eventN` is destroyed the moment the link drops, and
-        // the kernel reports that as `POLLHUP`/`POLLERR` — never as
-        // readable. Testing `POLLIN` alone would never read the node, so the
-        // read would never fail, so the descriptor would never be dropped and
-        // the search for a replacement would never restart: **the app goes
-        // deaf for the rest of the session**, and nothing short of a relaunch
-        // reaches it — not reconnecting from Config, not power-cycling the
-        // keyboard, not forgetting and re-pairing. Reporting the hangup lets
-        // the read fail, which is what the "lost — looking for another" path
-        // waits for.
+        // Any `revents`, `POLLIN` included. A destroyed `/dev/input/eventN`
+        // reports `POLLHUP`/`POLLERR` and never readable, and the read that
+        // follows is what drops the descriptor.
         return Ok(poll.iter().map(|p| p.revents != 0).collect());
     }
     let err = std::io::Error::last_os_error();
     if err.kind() != std::io::ErrorKind::Interrupted {
         return Err(err).context("poll keyboard and display");
     }
-    // **A signal is an answer.** Waiting again here would block with the flag
-    // [`on_signal`] just set and unread, and the editor would go on running
-    // until something else happened to it. Nothing is ready, and the caller is
-    // free to look at why it woke.
+    // Nothing is ready, and the caller reads the flag [`on_signal`] set.
     Ok(vec![false; poll.len()])
 }
 
-/// Set when the editor has been asked to stop.
-///
-/// **A killed editor still has work to do**: the document is only written by
-/// autosave a couple of seconds after the last keystroke, the Bluetooth daemon
-/// is a child that outlives it and holds both the radio and its API port, and
-/// powerd is holding the screen awake at karyll's request. A launch replaces
-/// the editor that is running by killing it — see the launcher — so this is the
-/// ordinary way karyll ends, not an emergency.
+/// Set when the editor has been asked to stop. The run loop reads it, saves,
+/// stops the daemon and releases the screensaver latch.
 static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Async-signal-safe by construction: one relaxed store and nothing else.
@@ -319,32 +259,23 @@ fn catch_signals() {
     }
 }
 
-/// An input source: what Ctrl+Space and the language button move between.
-///
-/// One cycle rather than a layout switch and an IME switch, because they are
-/// one decision to the writer — "I am writing German now" — and two controls
-/// for one decision is the same trap as two lists for one thing.
-///
-/// This is macOS's model, which is the reference for input behaviour here: the
-/// list holds keyboards *and* input methods together, and one shortcut walks it.
+/// An input source: what `Ctrl+Space` and the language button move between.
+/// One cycle carries the layouts and the input methods together.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Language {
     #[default]
-    /// English. Named for the language rather than for the `US` layout it is
-    /// written on — the layout is what [`Language::layout`] answers, and `US`
-    /// is not a language.
+    /// English. [`Language::layout`] names the layout it is written on.
     English,
     German,
     Chinese,
-    /// Traditional Chinese. The same pinyin engine — there is only one Chinese
-    /// dictionary on the device and it is Simplified — with the engine's own
+    /// Traditional Chinese: the Simplified pinyin engine, with its own
     /// converter applied to every candidate.
     ChineseTraditional,
-    /// Japanese: romaji typed, kana and kanji out. A different engine from
-    /// Chinese's — Omron iWnn rather than XT9 — behind the same plugin ABI.
+    /// Japanese: romaji typed, kana and kanji out. Omron iWnn behind the same
+    /// plugin ABI XT9 uses.
     Japanese,
-    /// Korean: 두벌식 typed, Hangul out. No engine at all — a syllable is
-    /// arithmetic on a code point, so karyll composes it itself.
+    /// Korean: 두벌식 typed, Hangul out. A syllable is arithmetic on a code
+    /// point, composed in [`crate::ime`].
     Korean,
 }
 
@@ -358,11 +289,7 @@ impl Language {
         Language::Korean,
     ];
 
-    /// What the button says. Each names itself the way its writers would, and
-    /// the CJK entries name themselves in their own script.
-    ///
-    /// **One character each**, so the six chips are one width. 한 is what the
-    /// 한/영 key carries; 简, 繁 and 日 name 简体字, 繁體字 and 日本語.
+    /// What the button says: one character each, in the language's own script.
     fn label(self) -> &'static str {
         match self {
             Language::English => "EN",
@@ -412,14 +339,8 @@ impl Language {
         }
     }
 
-    /// Which regional convention the Han faces should follow while this
-    /// language is selected.
-    ///
-    /// The Latin languages keep whatever was last set rather than forcing a
-    /// convention of their own: switching to English to type a word in the
-    /// middle of a Japanese paragraph must not re-cut the kanji around it.
-    /// Korean names none either: Hangul carries no unification, and 한자 in
-    /// Korean prose is drawn by whichever convention the document holds.
+    /// Which regional convention the Han faces follow under this language.
+    /// `None` holds the convention the document already carries.
     fn region(self) -> Option<karyll_core::script::Region> {
         match self {
             Language::Chinese => Some(karyll_core::script::Region::Simplified),
@@ -429,11 +350,8 @@ impl Language {
         }
     }
 
-    /// Which font row in the Config panel this language is set from.
-    ///
-    /// One row per writing system: English and German share the Latin faces,
-    /// the three Han conventions have one each, and Korean has a row no
-    /// convention touches.
+    /// Which font row in Config this language is set from. One row per writing
+    /// system: Latin, one per Han convention, and Hangul.
     fn font_group(self) -> font::Group {
         match self.region() {
             Some(region) => font::Group::Han(region),
@@ -442,17 +360,8 @@ impl Language {
         }
     }
 
-    /// The next input source in the cycle, among those switched on.
-    ///
-    /// **Cycling only the enabled ones is the whole point of enabling them.**
-    /// This writer uses five; someone who writes only English should not press
-    /// `Ctrl+Space` four times to arrive back where they started. The order is
-    /// `ALL`'s, so turning one off closes the gap rather than reshuffling the
-    /// rest.
-    ///
-    /// A source that is not itself enabled still cycles forward from where it
-    /// sits in `ALL` — that is what makes turning off the *current* language
-    /// leave somewhere sensible to go.
+    /// The next input source among those in `enabled`, in `ALL`'s order. A
+    /// source outside `enabled` cycles forward from where it sits in `ALL`.
     fn next(self, enabled: &[Language]) -> Language {
         let from = Language::ALL.iter().position(|l| *l == self).unwrap_or(0);
         Language::ALL
@@ -465,18 +374,9 @@ impl Language {
             .unwrap_or(self)
     }
 
-    /// The keyboard arrangement this language is written on.
-    ///
-    /// **A language determines its layout — they are not two settings.** There
-    /// is no layout control anywhere in karyll, only this: choosing German
-    /// chooses QWERTZ, and a French entry would choose AZERTY.
-    ///
-    /// The CJK three are US. Pinyin, romaji and 두벌식 are all defined against
-    /// the QWERTY letter arrangement — that is what every IME assumes and what
-    /// macOS does regardless of the hardware underneath — so they do not
-    /// inherit whatever keyboard was last used for prose. [`ime::Korean`] maps
-    /// the letter this layout resolves onto a jamo, which leaves Korean's ASCII
-    /// punctuation, digits and Ctrl chords where every other language has them.
+    /// The keyboard arrangement this language is written on. A language names
+    /// its layout, and no separate control selects one. Pinyin, romaji and
+    /// 두벌식 are defined against the QWERTY letter arrangement.
     fn layout(self) -> keymap::Layout {
         match self {
             Language::German => keymap::Layout::German,
@@ -485,28 +385,9 @@ impl Language {
     }
 }
 
-/// Watches for accelerometer readings that mean nothing to us.
-///
-/// **Almost silent on purpose, and that took two device runs to earn.** What
-/// the runs established:
-///
-/// * **`ABS_X`, `ABS_Y` and `ABS_Z` are never sent.** The driver advertises all
-///   three and reports `0` for every one forever, so there is no gravity vector
-///   and the axes on [`evdev::Sample`] have nothing to work with on this
-///   firmware.
-///   The position code is the entire signal.
-/// * **The sensor reports transitions, not a stream.** It is quiet while the
-///   device is still and emits one event when it is turned, so silence is the
-///   normal state and must not be reported as a fault.
-/// * **It emits a settling burst on power-up**, before the device has been
-///   touched. Those codes are real ones, so they cannot be filtered by value;
-///   they are harmless because turning to an orientation you are already in
-///   does nothing.
-///
-/// What is left worth saying is an *unrecognised* code, which would mean this
-/// firmware encodes positions differently and the mapping in
-/// [`orientation::Orientation::from_tilt`] needs redoing. Reported once per
-/// distinct code, because a firmware that did that would do it continuously.
+/// Reports an accelerometer code [`orientation::Orientation::from_tilt`] does
+/// not name, once per distinct code. Silence is the sensor's resting state:
+/// it reports transitions, and a settling burst on power-up.
 #[derive(Default)]
 struct AccelWatch {
     unknown: Vec<i32>,
@@ -528,15 +409,12 @@ impl AccelWatch {
     }
 }
 
-/// What the screen is showing. The menus are modal: they take the whole
-/// surface, because a finger needs room and the document has nothing useful to
-/// say behind them.
+/// What the screen is showing. Every panel is modal and takes the whole
+/// surface.
 enum Mode {
     Writing,
-    /// The file list: every `.md` under the documents directory, with what the
-    /// panel says about each. New and Rename are on the strip rather than in
-    /// here — they are actions, and a list of documents that also holds two
-    /// things that are not documents is the mistake the Keyboard row made.
+    /// The file list: every `.md` under [`DOCUMENTS`]. New and Rename sit on
+    /// the strip.
     Files(Vec<Listing>),
     /// Typing a name. Holds what has been typed and what it is for.
     Naming {
@@ -544,28 +422,13 @@ enum Mode {
         name: String,
     },
     /// Settings: the keyboard, the input sources, and the faces they set in.
-    ///
-    /// **Pairing is the first section, not a panel behind a row.** It is the
-    /// first thing a new writer has to do — there is no keyboard until they do
-    /// it — so it cannot sit one tap deeper than the font list.
+    /// Pairing is the first section.
     Config,
-    /// What the keys and the glass do.
-    ///
-    /// **Everything this app is good at is invisible.** The chrome hides while
-    /// you write, the gestures are unannounced, and the shortcuts are only in
-    /// the source — so a writer who does not already know them has an editor
-    /// with three buttons on it. This page is the answer, and the reason it has
-    /// a button of its own rather than only a shortcut: a help page you can
-    /// reach only by knowing a shortcut is the joke it exists to fix.
+    /// What the keys and the glass do. Reached from the strip and from
+    /// `Ctrl`/`⌘` + `H`.
     Help,
-    /// The headings of the open document, in order, to jump between.
-    ///
-    /// **Find answers "where is that word"; this answers "take me to the third
-    /// section"**, which a search cannot serve: it would need a word from the
-    /// heading being looked for.
-    ///
-    /// Read when the panel opens, like the Files list, and for the same reason:
-    /// the list is a fact about the document at the moment it was asked for.
+    /// The headings of the open document, in order, to jump between. Read when
+    /// the panel opens.
     Outline(Vec<Section>),
 }
 
@@ -574,7 +437,8 @@ enum Mode {
 struct Section {
     /// `#` through `######`, for the indent.
     level: u8,
-    /// The heading with its markup taken out — see [`karyll_core::markdown::plain`].
+    /// The heading with its markup taken out, by
+    /// [`karyll_core::markdown::plain`].
     text: String,
     /// Where its line starts, in document characters. The jump lands here.
     at: usize,
@@ -582,17 +446,9 @@ struct Section {
     words: usize,
 }
 
-/// Where typed text lands.
-///
-/// There is one IME, one composition and one candidate box. The only thing that
-/// differs between typing into the page, into the find bar and into a filename
-/// is where a finished word goes and where the half-typed one is shown — so
-/// that difference is named once, here, and every path that commits text asks.
-///
-/// The alternative is a second copy of the compose loop per field, which is
-/// "one list, not two" with the IME attached: the engine holds one composition
-/// whichever field is being typed into, and two places deciding what to do with
-/// it would disagree the first time one of them was changed.
+/// Where typed text lands. One IME, one composition and one candidate box
+/// serve the page, the find bar and a filename alike; this names which of them
+/// a finished word goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sink {
     /// The document.
@@ -623,9 +479,8 @@ enum Composed {
 
 struct Editor {
     doc: Document,
-    /// The word list for the current regional convention, when the device has
-    /// one and a convention has been chosen. Selection in Han falls back to
-    /// whole runs without it.
+    /// The word list for the current regional convention. Han selection falls
+    /// back to whole runs with `None`.
     dict: Option<Dict>,
     dict_region: Option<Region>,
     path: Option<PathBuf>,
@@ -641,9 +496,7 @@ struct Editor {
     roles: Vec<karyll_core::script::Role>,
     /// Column the arrow keys are holding across a run of vertical moves.
     goal: Option<f32>,
-    /// Cut and copied text. Ours, because the device has no system clipboard
-    /// and nothing to share one with — and in memory only, so it does not
-    /// survive a quit. Whether it should is not yet worth guessing at.
+    /// Cut and copied text, in memory for the length of the session.
     clipboard: String,
     /// Where a finger went down on the page. There are no motion events, so
     /// this and the lift position are the whole of a drag.
@@ -657,89 +510,51 @@ struct Editor {
     mode: Mode,
     /// When the running scan began, if one is.
     scanning: Option<std::time::Instant>,
-    /// What the running scan has turned up that is not already paired. Cleared
-    /// when Config opens, so a list of keyboards that were in the room an hour
-    /// ago is not offered as if they still are.
+    /// What the running scan has turned up outside `paired`. Cleared when
+    /// Config opens.
     found: Vec<hid::Device>,
-    /// Which page of a long panel list is showing. Reset whenever a panel
-    /// opens, because arriving on page 3 of a list you have not seen is not
-    /// where anybody wants to start.
+    /// Which page of a long panel list is showing. Reset when a panel opens.
     panel_page: usize,
-    /// Which line of the open panel the keyboard is on.
-    ///
-    /// **`None` until a key is pressed on the panel**, so a list opened with a
-    /// finger and worked with a finger never grows a mark that means nothing to
-    /// it. A tap sets it to what was touched, which is what keeps the two ways
-    /// of working on one place in the list rather than two.
+    /// Which line of the open panel the keyboard is on. `None` until a key is
+    /// pressed on the panel; a tap sets it to what was touched.
     panel_focus: Option<PanelFocus>,
     /// The search, while one is open.
     find: Option<Find>,
-    /// When it was last asked about. The loop ticks five times a second, and
-    /// asking that often opened 242 connections during one scan — enough to
-    /// disturb the very thing being measured on a single-threaded daemon.
+    /// When the daemon was last asked. The loop ticks five times a second and
+    /// the daemon is single-threaded.
     polled: Option<std::time::Instant>,
     /// What is inverted under the finger right now, and when it was shown.
     holding: Option<(Target, std::time::Instant)>,
-    /// How the panel maps onto the window *right now*.
-    ///
-    /// Not the same as what we asked the window manager for. The framework
-    /// flips the display 180° on its own from the accelerometer, and does not
-    /// tell us — after which taps arrive mirrored and nothing on screen
-    /// responds. So this follows what the manager reports, while the request
-    /// lives on the window.
+    /// How the panel maps onto the window, following what the window manager
+    /// reports. The window carries the request.
     touch_orientation: orientation::Orientation,
-    /// Whether this Kindle turns its own page over, which is to say whether it
-    /// has an accelerometer. The one that does not needs [`SCREENS`] on the
-    /// settings page instead, and the one that does must not have it.
+    /// Whether this device has an accelerometer. [`SCREENS`] appears in Config
+    /// where it does not.
     turns_itself: bool,
     /// When that was last checked, since asking costs a subprocess.
     orientation_checked: std::time::Instant,
-    /// Whether the page is set back around the sentence being written.
-    ///
-    /// iA Writer's signature, and the reason `window::QUIET` exists at all.
-    /// Remembered across sessions, like the language and the last position.
+    /// Whether the page is set back around the sentence being written, drawn
+    /// in `window::QUIET`. Remembered across sessions.
     focus: bool,
-    /// Whether a word may be divided at the end of a line.
-    ///
-    /// Held here rather than on the theme, beside `focus` and for the same
-    /// reason: it decides what the page is drawn *with*, and the dictionary it
-    /// reaches for follows the language, which the theme knows nothing about.
+    /// Whether a word may be divided at the end of a line. The dictionary it
+    /// reaches for follows the language.
     hyphenate: bool,
     /// Which input sources `Ctrl+Space` cycles through, in `Language::ALL`'s
     /// order. Never empty — see [`read_languages`].
     enabled: Vec<Language>,
     /// Whether the language just changed and has not been written with yet.
-    ///
-    /// **Cleared by the next keystroke rather than by a timer.** A timer would
-    /// cost a repaint of its own for nothing; going when you type costs the
-    /// repaint that was happening anyway, and by then the script on the page
-    /// answers the question without being asked. The mode is only ambiguous
-    /// between switching and typing, which is exactly how long this lasts.
+    /// Cleared by the next keystroke.
     announcing: bool,
-    /// Whether the action strip is out of the way while writing.
-    ///
-    /// iA Writer's chrome goes on the first keystroke and comes back when you
-    /// reach for it, in both normal and focus mode — its captures show a
-    /// toolbar on a freshly opened document and none at all after typing.
-    ///
-    /// **Never true without a keyboard.** With nothing paired the strip is the
-    /// only way out of the app, and the only way in; hiding it would leave a
-    /// writer with no control at all. See [`Editor::strip_visible`].
+    /// Whether the action strip is out of the way while writing. Never true
+    /// without a keyboard — see [`Editor::strip_visible`].
     chrome_hidden: bool,
-    /// How far the page is scrolled down, in pixels.
-    ///
-    /// **Kept, rather than derived from the cursor each paint.** Deriving it
-    /// makes ordinary writing behave as half a focus mode: with nowhere to
-    /// remember the page's position, every paint has to place it from the
-    /// cursor, and the only stable way to do that is to pin the cursor. Holding
-    /// the offset is what lets the caret travel down the page while the text
-    /// stays where it is.
+    /// How far the page is scrolled down, in pixels. Held here, which lets the
+    /// caret travel down the page while the text holds its position.
     scroll: i32,
     /// Whether a keyboard is attached right now, for the panel to report.
     keyboard_present: bool,
-    /// Keyboards the daemon already knows, refreshed when the panel opens and
-    /// after anything changes them. Kept here rather than fetched per tap,
-    /// because working out what a finger is on must not make an HTTP request.
+    /// Keyboards the daemon knows, refreshed when the panel opens and after
+    /// anything changes them. Hit-testing a tap reads this, never the daemon.
     paired: Vec<hid::Device>,
     /// Which of `paired` holds the link, from [`hid::Hid::connected`] and
     /// refreshed with it. `keyboard_present` says a keyboard is attached; this
@@ -749,87 +564,49 @@ struct Editor {
     /// Both drive autosave; see [`Editor::poll_autosave`].
     last_edit: Option<std::time::Instant>,
     dirty_since: Option<std::time::Instant>,
-    /// Amazon's predictor plugins, each loaded the first time its language is
-    /// asked for. Empty while none has been wanted, and a language that failed
-    /// to load is simply absent — typing Latin must not depend on any of them.
-    ///
-    /// **Loaded engines are kept, not swapped.** Chinese and Japanese are
-    /// separate plugins with separate dictionaries, so switching between them
-    /// could unload one and load the other; but a plugin's `load()` runs the
-    /// whole engine initialisation and `prv_unload` tears it down, and nothing
-    /// says the pair is re-runnable within one process. Holding both costs
-    /// mapped dictionary pages, which the kernel can evict; getting it wrong
-    /// costs a crash mid-sentence.
+    /// The predictor plugins, each loaded the first time its language is asked
+    /// for and kept for the session. A plugin that failed to load is absent,
+    /// and Latin reaches none of them.
     engines: Vec<(ime::Script, Box<dyn ime::Ime>)>,
-    /// The Hangul syllable being typed. A few bytes of state with no plugin,
-    /// no dictionary and no candidate list behind them, so it is always
-    /// available and never loaded.
+    /// The Hangul syllable being typed: a few bytes of state, with no plugin
+    /// and no dictionary behind them.
     korean: ime::Korean,
     /// Whether keys are going to an input method at all. Ctrl+Space toggles it.
     cjk: bool,
     /// The keys sent towards the current word, what the engine makes of them,
-    /// and what it offers for it.
-    ///
-    /// `typed` and `preedit` are the same string for Chinese, where pinyin *is*
-    /// what was typed, and differ for Japanese, where `nihon` is typed and
-    /// にほん is composed. `preedit` is what the bar shows and what Enter
-    /// commits; `typed` is what F10 gives back.
-    ///
-    /// A candidate that converts only the front of a word rebases both onto
-    /// what is left of the reading, and there the letters as struck are gone —
-    /// the engine holds a remainder, not a history of how it was spelled.
+    /// and what it offers. `preedit` is what the bar shows and what `Enter`
+    /// commits; `typed` is what `F10` gives back. A candidate converting the
+    /// front of a word rebases both onto the remainder of the reading.
     typed: String,
     preedit: String,
     candidates: Vec<String>,
-    /// Which page of them is on the bar. The word wanted is often not on the
-    /// first page, which is what the arrows are for while composing.
+    /// Which page of them is on the bar, walked by the arrows while composing.
     page: usize,
     /// Where each page starts, from [`ui::candidate_pages`]. A page is as many
-    /// as the panel can show rather than a fixed ten, so this is the only thing
-    /// that knows which candidate a digit picks.
+    /// as the panel can show, and this decides which candidate a digit picks.
     pages: Vec<usize>,
     /// Which way the next quotation mark faces. Chinese quotes are directional
-    /// and share one key, so the same keystroke has to alternate.
+    /// and share one key.
     punctuation: ime::Punctuation,
-    /// What the bottom strip currently has drawn on it, so it is repainted when
-    /// — and only when — it would look different. Typing damages the page above
-    /// the strip, so redrawing it every keystroke would throw away the damage
-    /// rectangle the page just computed.
+    /// What the bottom strip has drawn on it. The strip is repainted where
+    /// this differs, which leaves the page's damage rectangle intact.
     strip_drawn: Vec<String>,
-    /// Set when karyll changed what the strip says without being asked to, so
-    /// that the next tap on it is spent looking rather than pressing.
-    ///
-    /// **The same rule as the reveal, for the same reason**: a button that was
-    /// not on screen when the finger came down must not be pressed, and one
-    /// that changed its mind is no different. Pairing is where it happens — it
-    /// leaves Config on its own once the keyboard is up, so a writer reaching
-    /// for the `[ Done ]` they have been looking at finds `[ Exit ]` under
-    /// their finger and the editor closes.
+    /// Set where the strip changed without a tap asking for it. The next tap
+    /// on it is spent looking. See `strip_drawn`.
     strip_changed: bool,
-    /// And what the status line beside them said, for the same reason. Kept
-    /// apart from the cells because it is not one: it holds the room the
-    /// buttons leave rather than a cell of its own, and nothing hit-tests it.
+    /// What the status line beside them said. It holds the room the buttons
+    /// leave, and nothing hit-tests it.
     status_drawn: String,
-    /// When a key or a finger last arrived, and whether the screensaver is
-    /// currently being held off.
-    ///
-    /// The pair rather than the instant alone, so the latch is written on the
-    /// two transitions and not on every keystroke: setting it shells out to
-    /// `lipc-set-prop` and reads the daemon's answer back.
+    /// When a key or a finger last arrived, and whether the screensaver latch
+    /// is held. The pair writes the latch on its two transitions;
+    /// `power::prevent_screensaver` shells out to `lipc-set-prop`.
     last_input: std::time::Instant,
     holding_awake: bool,
-    /// Whether the next paint is arriving somewhere the writer chose from the
-    /// outline, rather than following a cursor that walked there.
-    ///
-    /// One paint's worth, cleared by the paint that honours it. Held longer, the
-    /// page would stay pinned to the heading while they wrote under it.
+    /// Whether the next paint lands somewhere chosen from the outline. One
+    /// paint's worth, cleared by the paint that honours it.
     landing: bool,
-    /// The document whose Delete chip has been tapped once.
-    ///
-    /// **The path rather than a row number**, which is what makes a stale one
-    /// harmless: the second tap is honoured only if it lands on the same
-    /// document, so a list that has been paged, re-read or re-sorted underneath
-    /// this cannot turn a confirmation into a deletion of something else.
+    /// The document whose Delete chip has been tapped once. The second tap is
+    /// honoured on the same path, whatever the list has done underneath.
     arming: Option<PathBuf>,
     /// The selected input source: which keyboard, and whether Chinese input is
     /// on. Remembered in `var/language`.
@@ -837,22 +614,9 @@ struct Editor {
 }
 
 impl Editor {
-    /// Read keys and repaint until asked to quit.
-    ///
-    /// Waits on the keyboard and the X connection together. Blocking on the
-    /// keyboard alone would leave the window unable to answer an expose, and
-    /// blocking on X alone would drop keystrokes.
-    ///
-    /// One repaint per batch of keys rather than per key: a burst of typing on
-    /// eink should cost one update, and the reader hands back everything that
-    /// was ready at once.
-    /// Run a writing session, and remember where it left off.
-    ///
-    /// The loop has several ways out — the Close button, `Ctrl+Q`, the window
-    /// going away, an error — and the place in the draft has to be kept for all
-    /// of them. Wrapping is what makes that true by construction; patching each
-    /// `return` is how one of them gets missed. There is no `Drop` to use
-    /// instead: this binary aborts on panic.
+    /// Run a writing session, then save, remember the position and release the
+    /// screensaver latch. `session` has several ways out and this wraps all of
+    /// them; `panic = "abort"` leaves no `Drop` to use.
     fn run(
         mut self,
         keyboard: Option<evdev::Keyboard>,
@@ -860,20 +624,12 @@ impl Editor {
         pen: Option<pen::Pen>,
         accel: Option<evdev::Accelerometer>,
     ) -> Result<()> {
-        // Held for the whole session, because the keyboard is grabbed and
-        // typing therefore cannot reset the idle timer. Released below on
-        // every way out, the same reason `remember_position` lives here.
+        // The keyboard is grabbed, and typing reaches no idle timer.
         self.note_input();
         let result = self.session(keyboard, touch, pen, accel);
-        // **The last thing before the window goes.** Nothing wrote the document
-        // on the way out: autosave fires a couple of seconds after the writer
-        // stops, so leaving inside that window — which is exactly what `Exit`
-        // straight after finishing a sentence is — drops it. There is no Save
-        // button to fall back on.
-        //
-        // Reported rather than propagated, and after the session's own result
-        // is in hand: a failure here must not replace the reason the session
-        // ended, and the session ending badly is all the more reason to try.
+        // Autosave fires a couple of seconds after the last keystroke, and a
+        // session ending inside that window has not written. Reported after
+        // `result` is in hand, which keeps the session's own error.
         if let Err(err) = self.write_document("closing") {
             eprintln!("closing: could not save ({err:#})");
         }
@@ -896,9 +652,7 @@ impl Editor {
         self.paint()?;
 
         loop {
-            // Asked to stop — see [`STOPPING`]. Out through the same door as
-            // `[ Exit ]`, so the document is written, the daemon is stopped and
-            // the screen is let go of.
+            // Asked to stop — see [`STOPPING`]. Out through `run`'s own exit.
             if STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("signal: asked to stop");
                 return Ok(());
@@ -907,20 +661,13 @@ impl Editor {
             // already read leaves nothing on the socket for `poll` to report.
             match self.window.drain_events()? {
                 window::Surface::Gone => return Ok(()),
-                // A rotation arrives as a resize. Nothing measured against the
-                // previous shape still holds, so lay the page out again from
-                // nothing rather than repainting part of it.
+                // A rotation arrives as a resize, and the page is laid out
+                // again from nothing.
                 window::Surface::Live { resized: true, .. } => {
-                    // Logged, because a rotation is the only way the surface
-                    // changes shape and nothing else records the landscape
-                    // geometry. Without it the only source for what the page
-                    // measures sideways is counting pixels in a screenshot.
                     eprintln!("window: {}x{}", self.window.width(), self.window.height());
                     self.frame = None;
-                    // The candidate bar is paged by how much width there is,
-                    // and there is now a different amount. Nothing else here
-                    // survives a rotation either; this is the one piece of it
-                    // that is not rebuilt by the paint below.
+                    // The candidate bar is paged by the width, which the paint
+                    // below leaves alone.
                     let candidates = std::mem::take(&mut self.candidates);
                     self.set_candidates(candidates);
                     self.paint()?;
@@ -1311,29 +1058,8 @@ impl Editor {
             };
         }
         let mut cells = match self.mode {
-            // **Three, in the left corner** — a convention shared with the
-            // other apps on this device rather than an order invented here.
-            //
-            // No Save button: the status line says when the autosave ran, and a
-            // button duplicating it would be a redundant control paid for with
-            // an act of faith. `Ctrl`/`⌘`+`S` still works, because the habit
-            // costs nothing.
-            //
-            // The language button came off with UI-17's notice at the caret,
-            // which names the source you land in for one keystroke. Without a
-            // keyboard there is nothing to switch the language *of*.
-            //
-            // After the corner, the order is how often a writer reaches for it:
-            // Files is daily, Config is occasional, Help is read once.
-            //
-            // **Outline is a shortcut only.** karyll is keyboard-first — without
-            // one there is no way to enter text at all — so a control that earns
-            // its width on the strip has to be one a finger genuinely reaches
-            // for, and jumping between the headings of a long document is not
-            // that. `Ctrl`/`⌘`+`Shift`+`O` is the way to it, and the Help page
-            // says so. **Help has a button at all because it must** — it is the
-            // page that explains the shortcuts, and reaching it only by shortcut
-            // would be the same joke it exists to answer.
+            // Ordered by how often a finger reaches for it. The status line
+            // reports the autosave, and Outline is `Ctrl`/`⌘`+`Shift`+`O`.
             Mode::Writing => vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help],
             Mode::Naming { .. } => vec![Bar::Cancel],
             // The Files panel's own actions, on the strip rather than mixed
@@ -1351,19 +1077,10 @@ impl Editor {
         cells
     }
 
-    /// The strip's cells and their words together, cut to the panel it is on.
-    ///
-    /// **The cells and the words are one answer, so they are worked out in one
-    /// place.** Three consumers ask — drawing, hit-testing and press feedback —
-    /// and two of them disagreeing is how a tap lands on the wrong cell.
-    ///
-    /// The strip was laid out on a 10.2″ panel and the smaller Kindles are two
-    /// thirds of that width, where the find bar wants more than there is. What
-    /// it gives up, in order: its longer words, and then its readouts, which
-    /// are the only cells that are not controls. **A control is never
-    /// dropped** — which is exactly what [`ui::cell_bounds`] does when it runs
-    /// out of room, and what it drops is the tail, so on a 7″ panel the first
-    /// thing to go would be `[ Done ]`.
+    /// The strip's cells and their words together, cut to the panel width.
+    /// Drawing, hit-testing and press feedback all read this one answer. A
+    /// narrow panel gives up the longer words, then the readouts; every
+    /// control is kept, ahead of [`ui::cell_bounds`] dropping the tail.
     fn strip_fitted(&mut self) -> (Vec<Bar>, Vec<String>) {
         let wanted = self.strip_wanted();
         let readouts = self.readouts();
@@ -1490,25 +1207,10 @@ impl Editor {
         self.strip_labels().iter().map(|l| bracket(l)).collect()
     }
 
-    /// What one of the find bar's fields says, trimmed to what its cell can
-    /// hold.
-    ///
-    /// **The bar is the field**: what has been typed is on it, with a rule for
-    /// a caret so it reads as somewhere text goes rather than as a label that
-    /// happens to say a word.
-    ///
-    /// **The caret is on the field the keys are going into, and only that one.**
-    /// With two fields on the strip it is the whole of what says which is
-    /// listening.
-    ///
-    /// The composition is on the end of it, ahead of the caret, exactly where
-    /// it sits when the same word is typed into the page. It is shown but not
-    /// searched — see [`Editor::research`].
-    ///
-    /// Trimmed from the *left* into `room`, and measured rather than counted.
-    /// A character count cannot say when a query has outgrown its cell, because
-    /// 二十四文字 is twice the width of 24 letters. The tail is what is kept:
-    /// that is where the writer is typing.
+    /// What one of the find bar's fields says. A rule stands for the caret,
+    /// and only the field taking keys carries one. The composition sits ahead
+    /// of the caret, shown and not searched — see [`Editor::research`].
+    /// Trimmed from the left into `room`, measured rather than counted.
     fn find_field(&mut self, which: Field, room: u16) -> String {
         let Some(find) = &self.find else {
             return String::new();
@@ -2321,11 +2023,7 @@ impl Editor {
 
     fn leave_panel(&mut self) -> Result<()> {
         self.scanning = None;
-        // A half-tapped Delete does not survive leaving the list. Correctness
-        // does not need this — the second tap has to land on the same
-        // document's chip, so a stale arm cannot delete anything else — but a
-        // chip still reading `Delete?` on a list opened afresh would be the
-        // page remembering something the writer has moved on from.
+        // A half-tapped Delete does not survive leaving the list.
         self.arming = None;
         self.panel_focus = None;
         self.mode = Mode::Writing;
@@ -2825,8 +2523,8 @@ impl Editor {
         }
         let (range, text) = karyll_core::toggle_emphasis(&chars, span, marker);
         let width = marker.chars().count();
-        // Where the text itself ends up, markers excluded — which is the same
-        // span the next press has to find in order to undo this one.
+        // Where the text lands, markers excluded. The next press reads back
+        // this span to undo the wrap.
         let inner = if text.starts_with(marker) {
             range.start + width..range.start + text.chars().count() - width
         } else {
@@ -2928,8 +2626,7 @@ impl Editor {
             })
             .collect();
         items.push((ui::Item::Heading("Type".into()), ConfigRow::None));
-        // Size before the faces: it is the setting a writer reaches for first,
-        // and unlike them it applies to every writing system at once.
+        // Size ahead of the faces. It applies to every writing system at once.
         items.push((
             ui::Item::Choice {
                 label: "Size".into(),
@@ -3749,23 +3446,19 @@ impl Editor {
         self.window.set_orientation(want)?;
         self.touch_orientation = want;
         self.orientation_checked = std::time::Instant::now();
-        // Only where the orientation is a setting. A Kindle that reads its own
-        // position opens on that reading, and nothing there reads the file.
+        // Only where the orientation is a setting. A device with an
+        // accelerometer opens on its reading.
         if !self.turns_itself {
             write_orientation(want);
         }
-        // The window manager answers with a resize, which the loop picks up.
-        // Repaint anyway: if it declines, nothing else would.
+        // The window manager answers with a resize the loop picks up. This
+        // paint covers a request it declines.
         self.frame = None;
         self.paint()
     }
 
-    /// Notice when the Bluetooth stack finished coming up, or that it did not.
-    ///
-    /// **The Keyboard section has to be told.** Config reads what the daemon
-    /// remembers when it opens, and a writer who opens it in the seconds before
-    /// the daemon answers would otherwise be looking at a page that says they
-    /// have never paired anything.
+    /// Notice when the Bluetooth stack finished coming up, and refresh the
+    /// Keyboard section with what the daemon remembers.
     fn poll_bluetooth(&mut self) -> Result<()> {
         match self.bluetooth.poll_up() {
             Some(Ok(())) => {
@@ -3870,11 +3563,8 @@ impl Editor {
         self.doc.cursor() + self.page_preedit().chars().count()
     }
 
-    /// Turn a display index back into a document one.
-    ///
-    /// Anything at or after the preedit is that much further along in the
-    /// display than it is in the document. The preedit's own characters belong
-    /// to no document position, so they collapse onto the cursor.
+    /// Turn a display index back into a document one. The preedit's own
+    /// characters collapse onto the cursor.
     fn document_index(&self, display: usize) -> usize {
         document_index(
             display,
@@ -4784,8 +4474,7 @@ impl Editor {
         }
     }
 
-    /// Throw away the half-typed word, in the engine as well as here. Leaving
-    /// the engine holding symbols would make the next word start mid-syllable.
+    /// Throw away the half-typed word, in the engine as well as here.
     fn abandon_composition(&mut self) {
         if let Some(engine) = self.engine() {
             engine.clear();
@@ -5074,8 +4763,7 @@ impl Editor {
         let cells = self.strip_cells();
         let stretch = self.strip_stretch();
         let fonts = &mut self.fonts;
-        // Measured from the cells actually drawn, not from a second guess at
-        // the geometry: the box has to sit over the field it belongs to.
+        // Measured from the cells drawn, so the box sits over its own field.
         let bounds = ui::cell_bounds(width, &cells, &stretch, |s| {
             ui::measure(fonts, s, ui::TEXT_PX) as u16
         });
@@ -5083,10 +4771,7 @@ impl Editor {
     }
 
     /// Move the cursor by whole visual lines, dragging the selection along if
-    /// `extend`.
-    ///
-    /// Needs the wrapped layout, so it works off the last frame — which is the
-    /// same thing the reader is looking at.
+    /// `extend`. Reads the wrapped layout off the last frame.
     fn move_vertical(&mut self, delta: i32, extend: bool) {
         let Some(frame) = self.frame.take() else {
             return;
@@ -5341,10 +5026,8 @@ fn language_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/language")
 }
 
-/// The candidates on the bar: the page the writer has paged to.
-///
-/// The pages come from [`ui::candidate_pages`], which is what knows how many
-/// fit. Free of the editor for the same reason [`overlay`] is.
+/// The candidates on the bar: the page `page` names, from the starts
+/// [`ui::candidate_pages`] worked out.
 fn candidate_page<'a>(candidates: &'a [String], pages: &[usize], page: usize) -> &'a [String] {
     let Some(&from) = pages.get(page) else {
         return &[];
@@ -5353,13 +5036,9 @@ fn candidate_page<'a>(candidates: &'a [String], pages: &[usize], page: usize) ->
     &candidates[from.min(candidates.len())..to.min(candidates.len())]
 }
 
-/// What floats beside the caret right now.
-///
-/// Candidates outrank the language notice, though the two cannot really
-/// collide: switching language abandons any composition.
-///
-/// Takes the three things it reads rather than the editor, so that borrowing it
-/// does not borrow the window and the faces the same paint is about to write to.
+/// What floats beside the caret. Candidates outrank the language notice.
+/// Takes the three values it reads, leaving the window and the faces free for
+/// the paint around it.
 fn overlay(candidates: &[String], announcing: bool, language: Language) -> ui::Overlay<'_> {
     if !candidates.is_empty() {
         ui::Overlay::Candidates(candidates)
@@ -5370,8 +5049,7 @@ fn overlay(candidates: &[String], announcing: bool, language: Language) -> ui::O
     }
 }
 
-/// Which field a keystroke goes to. Free of the editor so the precedence can be
-/// stated once and checked without a window.
+/// Which field a keystroke goes to, in precedence order.
 fn sink_for(naming: bool, finding: bool) -> Sink {
     if naming {
         Sink::Name
@@ -5382,11 +5060,8 @@ fn sink_for(naming: bool, finding: bool) -> Sink {
     }
 }
 
-/// The composition as far as the document is concerned.
-///
-/// The engine holds one composition wherever it is being typed, and only the
-/// page splices it into text and shifts every index after the cursor. A
-/// composition bound anywhere else is not the page's to show or to count.
+/// The composition as far as the document is concerned. Only [`Sink::Page`]
+/// splices a preedit into the text and shifts the indices after the cursor.
 fn page_composition(preedit: &str, sink: Sink) -> &str {
     if sink == Sink::Page { preedit } else { "" }
 }
@@ -5599,14 +5274,8 @@ fn write_languages(enabled: &[Language]) {
     let _ = std::fs::write(languages_file(), letters);
 }
 
-/// Which writing systems the Config panel offers a face for.
-///
-/// **One row per system, not per language.** English and German are drawn by
-/// the same Latin faces, so a row each would be two controls over one setting;
-/// and a writer who has turned Japanese off should not be offered a Japanese
-/// face they will never see. Which is the dependency that put the enabled set
-/// first: this list is built from what is on, not from the five karyll can
-/// imagine.
+/// Which writing systems the Config panel offers a face for: one row per
+/// system, built from `enabled`.
 fn font_groups(enabled: &[Language]) -> Vec<font::Group> {
     let mut groups: Vec<font::Group> = Vec::new();
     for language in Language::ALL.into_iter().filter(|l| enabled.contains(l)) {
@@ -5618,29 +5287,13 @@ fn font_groups(enabled: &[Language]) -> Vec<font::Group> {
     groups
 }
 
-/// The most chips one settings row carries.
-///
-/// **[`ui::chip_bounds`] drops a chip that would cross the right margin**, and
-/// the same function hit-tests, so an option past the edge is neither drawn nor
-/// tappable — a face that is installed and cannot be chosen. The narrowest panel
-/// leaves about 990 px for chips once the shared label column is taken, and the
-/// Latin names run to some 200 px apiece with their padding: four is close
-/// enough to that budget to be riding on the length of the words, which is not a
-/// thing to hold a control on the page with.
-///
-/// A count rather than a fitted row. Chrome does not follow the document face,
-/// so the widths hold still; and fitting one would have to run in
-/// `Editor::config_items`, which is `&self` where measuring wants the faces
-/// mutably. Three is under the budget on every supported panel and splits the
-/// Latin list where it already divides — the writing faces, then the firmware's
-/// serifs.
+/// The most chips one settings row carries. [`ui::chip_bounds`] drops a chip
+/// crossing the right margin, and hit-tests the same bounds. The narrowest
+/// panel leaves about 990 px for chips, against some 200 px a Latin name.
 const CHIPS_PER_ROW: usize = 3;
 
-/// Split a row's options across as many rows as they need, evenly.
-///
-/// Even rather than filled-then-remainder: four families read as two and two,
-/// not as three and a stray. Nothing in, nothing out — a writing system with no
-/// family installed contributes no row at all.
+/// Split a row's options across as many rows as they need, in even shares.
+/// No options is no rows.
 fn chip_rows(options: &[usize]) -> Vec<Vec<usize>> {
     if options.is_empty() {
         return Vec::new();
@@ -5712,10 +5365,8 @@ fn hyphenate_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/hyphenate")
 }
 
-/// Whether words were being divided when the last session ended.
-///
-/// Off unless the file says otherwise: a division is a mark the writer did not
-/// type, and a page that has never been configured should show what was typed.
+/// Whether words were being divided when the last session ended. Off unless
+/// the file says otherwise.
 fn read_hyphenate() -> bool {
     std::fs::read_to_string(hyphenate_file()).is_ok_and(|s| s.trim() == "1")
 }
@@ -6005,7 +5656,6 @@ fn help_items() -> Vec<ui::Item> {
         row("Values on a setting, pages on a list", "← →"),
         row("Delete the document you are on", "Backspace, twice"),
         row("Clear the screen", "Ctrl/⌘ + R"),
-        // The rule, said once rather than repeated on every row above.
         row("Close it again", "The same shortcut, or Esc"),
         row("Leave karyll", "Ctrl/⌘ + Q"),
         heading("Writing in Chinese, Japanese and Korean"),
@@ -6013,22 +5663,15 @@ fn help_items() -> Vec<ui::Item> {
         row("Take a candidate", "Space, or 1 … 0"),
         row("Take the letters as typed", "Shift + Enter"),
         row("Drop the half-typed word", "Esc"),
-        // Korean offers no candidates, so this is the one key it reads
-        // differently from the two rows above.
         row("Take one jamo back, in Korean", "Backspace"),
         row("Emphasis, marked not slanted", "Ctrl/⌘ + I"),
         heading("Touch and pen"),
-        // First, because it is the only way through a long document with
-        // nothing paired, and the one thing here a reader needs before they
-        // need anything else.
         row("Back a screen, on a screen", "Tap the left, right margin"),
         row("Start, end of the document", "Tap the top, the foot"),
         row("Bring the buttons back", "Tap the foot of the page"),
         row("Select a word", "Tap it twice"),
         row("Select a run", "Press at one end, lift at the other"),
         row("Extend a selection", "Shift + tap"),
-        // Said plainly, because a Scribe owner will try it and should know
-        // what to expect before they do.
         row("The pen", "Places the cursor. It does not write."),
         row("Delete a document", "Its Delete chip, twice"),
         row("Replace every match", "Its All chip, twice"),
