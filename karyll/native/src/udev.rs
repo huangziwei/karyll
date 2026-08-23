@@ -1,36 +1,18 @@
-//! The udev rule that lets anything but karyll see the keyboard.
-//!
-//! karyll reads `/dev/input/eventN` directly and needs nothing from udev. Every
-//! X client does: `evdev_drv.so` binds only devices tagged `ID_INPUT_KEYBOARD`,
-//! and this device's udev runs no `input_id` step. Without a rule supplying the
-//! tag a Bluetooth keyboard is complete and delivering keys, and invisible to
-//! kterm and to the framework's own screens — the editor types and nothing else
-//! on the device does.
-//!
-//! **The rule matches on the device path.** Everything the Bluetooth daemon
-//! creates appears under `/devices/virtual/misc/uhid/`, and nothing else here
-//! does: the touchscreen, stylus and accelerometer are on i2c and the power key
-//! on gpio-keys. `capabilities/key` must be non-empty so a consumer-control
-//! page, which a keyboard also registers, is not announced as a keyboard.
-//!
-//! **Nothing outside the rootfs is involved, and that is the point.** A rule
-//! that calls a helper through `IMPORT{program}` puts half of itself on
-//! `/mnt/us`, which MTP rewrites; the import then fails, and a failed import
-//! imports nothing and logs nothing, so the rule reads as installed while
-//! tagging no device at all.
+//! A udev rule tagging the Bluetooth daemon's uhid input nodes
+//! `ID_INPUT_KEYBOARD`. `evdev_drv.so` binds nothing without the tag;
+//! [`crate::evdev`] reads the node directly. See [`RULE`] for the match.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-/// Where the rule goes. `99-` so it runs after the firmware's own rules.
+/// Where the rule goes. `99-` orders it after the rules in the directory.
 pub const PATH: &str = "/etc/udev/rules.d/99-uhid-keyboard.rules";
 
-/// The rule, compared byte for byte against what is on disk. A firmware update
-/// restores `/etc` and takes this with it, and an older build's rule differs
-/// from this one — both are repaired on the next launch, with no version to
-/// keep in step.
+/// The rule. Matched on the device path, which the daemon's nodes hold under
+/// `/uhid/` and the i2c and gpio-keys devices do not. `ensure` compares it byte
+/// for byte against `PATH` and rewrites a file that differs.
 const RULE: &str = concat!(
     r#"ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", DEVPATH=="*/uhid/*", "#,
     r#"ATTRS{capabilities/key}!="", "#,
@@ -40,15 +22,13 @@ const RULE: &str = concat!(
 
 /// What [`ensure`] found or did.
 pub enum Outcome {
-    /// The rule on disk is already this one.
+    /// The file at `PATH` matches [`RULE`].
     Present,
-    /// Written, and udev asked to re-tag what is already connected.
+    /// Written, with a `udevadm trigger` over the connected devices.
     Installed,
 }
 
-/// Put the rule in place if it is not already there.
-///
-/// Safe on every launch: the common path is one file read.
+/// Put the rule in place. A matching file costs one read.
 pub fn ensure() -> Result<Outcome> {
     if std::fs::read_to_string(PATH).is_ok_and(|have| have == RULE) {
         return Ok(Outcome::Present);
@@ -56,15 +36,14 @@ pub fn ensure() -> Result<Outcome> {
 
     remount("rw").context("make the rootfs writable")?;
     let wrote = write_rule();
-    // Read-only again whatever happened above. A rootfs left writable is the
-    // one outcome worse than a keyboard X cannot see.
+    // Read-only again whatever happened above.
     let restored = remount("ro").context("make the rootfs read-only again");
     wrote?;
     restored?;
 
     let _ = run("udevadm", &["control", "--reload-rules"]);
-    // Re-add what is already connected. A keyboard that arrived before the rule
-    // existed keeps its untagged properties, and X acts only on the add.
+    // Re-add the connected devices: a node created before the rule carries
+    // untagged properties, and X acts on the add.
     let _ = run(
         "udevadm",
         &["trigger", "--subsystem-match=input", "--action=add"],
@@ -82,10 +61,7 @@ fn write_rule() -> Result<()> {
     Ok(())
 }
 
-/// Remount the rootfs `rw` or `ro`.
-///
-/// `mntroot` is the firmware's own wrapper and is what this device expects;
-/// `mount` is there for a rootfs without it.
+/// Remount the rootfs `rw` or `ro`, through `mntroot` or `mount`.
 fn remount(how: &str) -> Result<()> {
     if run("mntroot", &[how]) {
         return Ok(());
@@ -96,10 +72,8 @@ fn remount(how: &str) -> Result<()> {
     bail!("neither mntroot nor mount would remount / {how}")
 }
 
-/// Run a command, returning whether it succeeded.
-///
-/// Output goes nowhere: the effect of each of these is read back off the
-/// filesystem, so what it printed is of no use to anything here.
+/// Run a command, returning whether it succeeded. Output is discarded; each
+/// effect is read back off the filesystem.
 fn run(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
@@ -116,8 +90,7 @@ mod tests {
 
     #[test]
     fn the_rule_is_one_line_and_sets_all_three_properties() {
-        // udev reads one rule per line, so a rule split across lines is three
-        // malformed rules. The `concat!` is for the source margin alone.
+        // udev reads one rule per line. The `concat!` is for the source margin.
         assert_eq!(RULE.lines().count(), 1);
         assert!(RULE.ends_with('\n'));
         for key in ["ID_INPUT", "ID_INPUT_KEY", "ID_INPUT_KEYBOARD"] {
@@ -130,8 +103,8 @@ mod tests {
 
     #[test]
     fn the_rule_matches_the_daemons_devices_and_nothing_else_on_this_device() {
-        // Device paths as they appear on this hardware: the first is a keyboard
-        // the daemon created, the rest are the five built-in input devices.
+        // Device paths from this hardware: one uhid keyboard, then the five
+        // built-in input devices.
         assert!(
             "/devices/virtual/misc/uhid/0005:0000:0000.0001/input/input5/event5".contains("/uhid/")
         );
