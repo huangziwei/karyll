@@ -520,7 +520,8 @@ pub fn hit(
     }
 }
 
-/// Draw the list. Separated so a selection change can repaint just these.
+/// Draw the list. Separate from the panel: a selection change repaints just
+/// these.
 pub fn paint_items(
     window: &mut Window,
     fonts: &mut Fonts,
@@ -1331,9 +1332,8 @@ fn glyph_box(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
     fonts.line_height(px, &label_roles(label)) as u16
 }
 
-/// The top edge to hand [`draw_line`] so `label`'s ink is centred in `rect`.
-/// [`draw_line`] places the baseline an ascent below that top, so the two are
-/// worked out together.
+/// The top edge that centres `label`'s ink in `rect` under [`draw_line`],
+/// which places the baseline an ascent below the top it is handed.
 fn centred_top(fonts: &mut impl Metrics, rect: Rect, label: &str, px: f32) -> i32 {
     let roles = label_roles(label);
     let (top, bottom) = fonts.ink_box(px, &roles);
@@ -1936,9 +1936,9 @@ mod tests {
     fn a_label_too_long_for_its_room_is_cut_at_the_mark() {
         assert_eq!(elided("draft.md", 200, stub), "draft.md", "it fits, whole");
         // Ten pixels a character, the mark included: five characters and the
-        // mark are 60, so 65 keeps five.
+        // mark are 60, and 65 keeps five.
         assert_eq!(elided("a-long-filename.md", 65, stub), "a-lon…");
-        // Cut by character, so a Chinese name loses characters and not bytes.
+        // Cut by character: a Chinese name loses characters and not bytes.
         assert_eq!(elided("第一章的草稿", 45, stub), "第一章…");
         // A space before the mark is trimmed.
         assert_eq!(elided("Focus on this", 75, stub), "Focus…");
@@ -2047,7 +2047,7 @@ mod tests {
     }
 
     /// The same bug class on the colour row, which has no text to be measured
-    /// from and so lays itself out by its own arithmetic.
+    /// from and lays itself out by its own arithmetic.
     #[test]
     fn a_tap_reported_on_a_swatch_is_inside_the_swatch_that_gets_drawn() {
         let l = layout();
@@ -2341,7 +2341,7 @@ mod tests {
 
     /// The two panel widths karyll has to fit: the one it was written on, and
     /// the smaller one it is not allowed to break on. The narrow one is the
-    /// wider of the two small panels, so the tighter one is a few pixels less.
+    /// wider of the two small panels; the tighter one is a few pixels less.
     const WIDE: u16 = 1860;
     const NARROW: u16 = 1272;
 

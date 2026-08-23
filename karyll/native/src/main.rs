@@ -184,7 +184,7 @@ fn main() -> Result<()> {
         focus: read_focus(),
         hyphenate: read_hyphenate(),
         enabled: read_languages(),
-        announcing: false,
+        notice: None,
         chrome_hidden: false,
         scroll: 0,
         keyboard_present: false,
@@ -327,8 +327,8 @@ impl Language {
         matches!(self, Language::ChineseTraditional)
     }
 
-    /// Which input method's rules apply, and so which engine to load. `None`
-    /// for the languages typed straight onto the page.
+    /// Which input method's rules apply, and which engine to load. `None` for
+    /// the languages typed straight onto the page.
     fn script(self) -> Option<ime::Script> {
         match self {
             Language::Chinese | Language::ChineseTraditional => Some(ime::Script::Chinese),
@@ -485,23 +485,23 @@ struct Editor {
     /// Which of the two keys beside the space bar this keyboard calls ⌘.
     /// Remembered across sessions.
     convention: Convention,
-    /// What was last drawn, so a keystroke presents one line and not the whole
+    /// What was last drawn: a keystroke presents one line and not the whole
     /// page. `None` until the first paint.
     frame: Option<render::Frame>,
-    /// The faces the last paint found in this document, so page movement sizes
+    /// The faces the last paint found in this document: page movement sizes
     /// its rows the same way the page does.
     roles: Vec<karyll_core::script::Role>,
     /// Column the arrow keys are holding across a run of vertical moves.
     goal: Option<f32>,
     /// Cut and copied text, in memory for the length of the session.
     clipboard: String,
-    /// Where a finger went down on the page. There are no motion events, so
-    /// this and the lift position are the whole of a drag.
+    /// Where a finger went down on the page. There are no motion events: this
+    /// and the lift position are the whole of a drag.
     touch_down: Option<(u16, u16)>,
     /// When and where the page was last tapped, for spotting the second tap of
     /// a pair.
     last_tap: Option<(std::time::Instant, (u16, u16))>,
-    /// The Bluetooth stack. Stopped when the editor drops, so the stock stack
+    /// The Bluetooth stack. Stopped when the editor drops: the stock stack
     /// comes back when karyll exits.
     bluetooth: hid::Hid,
     mode: Mode,
@@ -539,9 +539,9 @@ struct Editor {
     /// Which input sources `Ctrl+Space` cycles through, in `Language::ALL`'s
     /// order. Never empty — see [`read_languages`].
     enabled: Vec<Language>,
-    /// Whether the language just changed and has not been written with yet.
-    /// Cleared by the next keystroke.
-    announcing: bool,
+    /// What floats beside the caret until the next keystroke: the input
+    /// source, or the case Caps Lock gives.
+    notice: Option<&'static str>,
     /// Whether the action strip is out of the way while writing. Never true
     /// without a keyboard — see [`Editor::strip_visible`].
     chrome_hidden: bool,
@@ -653,7 +653,7 @@ impl Editor {
                 eprintln!("signal: asked to stop");
                 return Ok(());
             }
-            // Drain X first: x11rb decodes into its own buffer, so an event
+            // Drain X first. x11rb decodes into its own buffer, and an event
             // it has read leaves nothing on the socket for `poll` to report.
             match self.window.drain_events()? {
                 window::Surface::Gone => return Ok(()),
@@ -672,7 +672,7 @@ impl Editor {
                 window::Surface::Live { .. } => {}
             }
 
-            // A held finger produces no events, so waiting has to time out for
+            // A held finger produces no events: waiting has to time out for
             // the long press to be noticed at all. The same tick is what looks
             // for a keyboard that has not arrived yet.
             let mut fds = vec![self.window.fd()];
@@ -734,9 +734,9 @@ impl Editor {
                 && ready.get(slot).copied().unwrap_or(false)
             {
                 let extent = (device.x_extent, device.y_extent);
-                // A finger resets the framework's own idle timer, so this is
-                // not what keeps the page up — it is what takes the latch back
-                // after an idle spell, so the typing that follows is covered.
+                // A finger resets the framework's own idle timer: this is not
+                // what keeps the page up — it is what takes the latch back
+                // after an idle spell, and the typing that follows is covered.
                 self.note_input();
                 let taps = match device.read_batch() {
                     Ok(taps) => taps,
@@ -824,6 +824,9 @@ impl Editor {
                     eprintln!("keyboard: lost ({err:#}) — looking for another");
                     keyboard = None;
                     self.keyboard_present = false;
+                    // A modifier held as the link drops has no release to
+                    // follow, and leaves every key reading as a chord.
+                    self.mods = keymap::Mods::default();
                     // Say so. Config draws this keyboard's state from the flag
                     // just cleared, and a page reading `Disconnect` for a
                     // keyboard that has gone says the opposite of what happened.
@@ -836,7 +839,7 @@ impl Editor {
             // nothing — that is a finger's screen.
             if matches!(self.mode, Mode::Naming { .. }) {
                 // CJK gets first refusal here too: every letter reaches the
-                // engine while the mode is on, so a document can be named in
+                // engine while the mode is on, and a document can be named in
                 // Chinese. See [`Sink`].
                 let mut dirty = false;
                 for event in batch {
@@ -943,8 +946,8 @@ impl Editor {
                 // both modes: a freshly opened document has a toolbar and a
                 // document being typed into has none.
                 self.set_chrome_hidden(true);
-                // Chinese input gets first refusal. It only takes keys it has a
-                // use for, so English typing is untouched even while the engine
+                // Chinese input gets first refusal. It only takes keys it has
+                // a use for: English typing is untouched even while the engine
                 // is switched on.
                 if self.compose_key(&action) == Composed::Took {
                     dirty = true;
@@ -963,7 +966,10 @@ impl Editor {
     /// bound to nothing. One place: the page, the find bar, the name prompt and
     /// the panels all track the modifier state and resolve the same way.
     fn pressed_action(&mut self, event: &evdev::KeyEvent) -> Option<Action> {
-        if self.mods.track(event.code, event.pressed) || !event.pressed {
+        // Caps Lock latches in `track` and carries on to its binding: no lamp
+        // on a Bluetooth keyboard shows the latch.
+        let latch = event.code == keymap::code::CAPSLOCK;
+        if (self.mods.track(event.code, event.pressed) && !latch) || !event.pressed {
             return None;
         }
         // The writer is here. Every key comes through this, and a keystroke is
@@ -974,16 +980,21 @@ impl Editor {
         // them that pair from a keyboard sending either.
         let mods = self.convention.resolve(self.mods);
         let Some(action) = keymap::action(event.code, mods, self.language.layout()) else {
-            // Named, since a key that does nothing reads like one that never
-            // arrived. Compact keyboards have no `Home`, and whether their
-            // `fn`+← arrives as code 102 depends on the kernel's Apple quirk.
-            eprintln!("key: {} unbound ({mods:?})", event.code);
+            // Buttons are not keys and name no binding karyll lacks.
+            if event.code < keymap::code::BTN_MISC {
+                // Named, since a key that does nothing reads like one that
+                // never arrived. Compact keyboards have no `Home`, and whether
+                // `fn`+← arrives as code 102 depends on an Apple quirk.
+                eprintln!("key: {} unbound ({mods:?})", event.code);
+            }
             return None;
         };
-        // The language notice goes with the next keystroke: anything that is
-        // not another switch means the writer has read it. Here, since the
-        // panels take keys too and a notice raised on one is cleared here.
-        self.announcing = matches!(action, Action::CycleLanguage);
+        // A notice goes with the next keystroke: anything raising no new one
+        // means the writer has read it. Here, since the panels take keys too
+        // and a notice raised on one is cleared here.
+        if !matches!(action, Action::CycleLanguage | Action::CapsLock(_)) {
+            self.notice = None;
+        }
         Some(action)
     }
 
@@ -1025,14 +1036,14 @@ impl Editor {
             // reports the autosave, and Outline is `Ctrl`/`⌘`+`Shift`+`O`.
             Mode::Writing => vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help],
             Mode::Naming { .. } => vec![Bar::Cancel],
-            // The Files panel.s own actions, on the strip and not among the
+            // The Files panel's own actions, on the strip and not among the
             // documents they act on.
             Mode::Files(_) => vec![Bar::Done, Bar::New, Bar::Rename],
             Mode::Config | Mode::Help | Mode::Outline(_) => vec![Bar::Done],
         };
         // Only when there is somewhere to go. Both directions wrap, and both
-        // are there together, so the strip holds its width under a finger
-        // paging through a list.
+        // are there together: the strip holds its width under a finger paging
+        // through a list.
         if self.pages() > 1 {
             cells.extend([Bar::PageBack, Bar::PageAt, Bar::PageOn]);
         }
@@ -1088,9 +1099,9 @@ impl Editor {
             let room = ui::stretch_room(width, &others, fields.len(), |s| {
                 ui::measure(fonts, s, ui::TEXT_PX) as u16
             });
-            // Against the cell's own `Bar`, so the field a label is written for
+            // Against the cell's own `Bar`: the field a label is written for
             // is the field that cell *is*. A position is a second statement of
-            // the bar.s order.
+            // the bar's order.
             for cell in fields {
                 if let Some(which) = Field::of(bars[cell]) {
                     labels[cell] = self.find_field(which, room);
@@ -1225,8 +1236,8 @@ impl Editor {
         let size = (self.window.width(), self.window.height());
         let layout = self.layout();
         // The bottom strip outranks the list: it spans the full width. With
-        // the chrome hidden `page_bottom` is the foot of the panel, so nothing
-        // is ever on a strip that is not drawn.
+        // the chrome hidden `page_bottom` is the foot of the panel: nothing is
+        // ever on a strip that is not drawn.
         let bottom = self.page_bottom();
         let hit = if y >= bottom && y >= layout.strip_top {
             let cells = self.strip_cells();
@@ -1236,7 +1247,7 @@ impl Editor {
                 ui::measure(fonts, s, ui::TEXT_PX) as u16
             });
             // `None` past the last cell. The buttons are packed at their own
-            // width, so most of this band is the status line.s, and a tap on a
+            // width: most of this band is the status line, and a tap on a
             // line that only reports must not run the button nearest it.
             ui::cell_at(&bounds, x).map(Target::Strip)
         } else {
@@ -1304,8 +1315,8 @@ impl Editor {
     }
 
     /// Put the chrome away, or bring it back, repainting if that changed
-    /// anything. The page grows and shrinks with it, so every row moves and
-    /// there is no damage rectangle.
+    /// anything. The page grows and shrinks with it: every row moves and there
+    /// is no damage rectangle.
     fn set_chrome_hidden(&mut self, hidden: bool) {
         if self.chrome_hidden == hidden || !matches!(self.mode, Mode::Writing) {
             return;
@@ -1320,8 +1331,8 @@ impl Editor {
     /// The character a window point is nearest, against the frame on screen.
     fn index_at_point(&mut self, x: u16, y: u16) -> Option<usize> {
         let frame = self.frame.take()?;
-        // The buffer the frame was laid out from, so the glyph under the
-        // finger is the one that was drawn there.
+        // The buffer the frame was laid out from: the glyph under the finger
+        // is the one that was drawn there.
         let (chars, preedit) = self.display();
         let markup = karyll_core::markdown::analyze(&chars);
         let bottom = self.page_bottom();
@@ -1428,8 +1439,8 @@ impl Editor {
             match tap {
                 touch::Touch::Down { x, y } => self.pressed(x, y, extent)?,
                 touch::Touch::Up { x, y } => {
-                    // Restore first, and synchronously, so the button is
-                    // visibly released before whatever it does repaints over it.
+                    // Restore first, and synchronously: the button is visibly
+                    // released before whatever it does repaints over it.
                     self.release()?;
                     if self.tapped(x, y, extent)? {
                         return Ok(true);
@@ -1544,7 +1555,7 @@ impl Editor {
         let (x, y) = self.point(raw_x, raw_y, extent);
         // Any touch brings the chrome back. iA Writer reveals on mouse
         // movement; the nearest thing a touchscreen has is a finger arriving,
-        // so the reveal is the whole glass, not a band along the bottom.
+        // and the reveal is the whole glass, not a band along the bottom.
         let waking = !self.strip_visible();
         self.set_chrome_hidden(false);
         // A tap landing where the strip is about to appear reveals it and stops
@@ -1555,9 +1566,9 @@ impl Editor {
             self.touch_down = None;
             return self.paint().map(|()| false);
         }
-        // The candidate box floats over the page, so it is asked before the
-        // page is: a tap on a candidate is choosing it, not moving the cursor
-        // to whatever prose the box happens to be covering.
+        // The candidate box floats over the page, and it is asked before the
+        // page is: a tap on a candidate is choosing it, not moving the cursor to
+        // whatever prose the box happens to be covering.
         if let Some(n) = self.candidate_at(x, y) {
             self.touch_down = None;
             self.select_candidate(n);
@@ -1622,7 +1633,7 @@ impl Editor {
     /// dispatched against the whole list, not against the page of it drawn.
     fn take_row(&mut self, row: usize) -> Result<()> {
         match &self.mode {
-            // Every row is a document, so taking one opens it. There is no
+            // Every row is a document: taking one opens it. There is no
             // arithmetic past the end of the list to get wrong: there is
             // nothing past the end of it.
             Mode::Files(files) => {
@@ -1632,14 +1643,14 @@ impl Editor {
                 }
             }
             // Every row is a heading, and taking one goes there. The panel
-            // holds the list it drew, so a jump cannot land on a heading that
-            // has moved.
+            // holds the list it drew: a jump cannot land on a heading that has
+            // moved.
             Mode::Outline(sections) => {
                 if let Some(at) = sections.get(row).map(|s| s.at) {
                     self.jump_to(at)?;
                 }
             }
-            // Every line of Config is a chip, so a bare row is a heading or a
+            // Every line of Config is a chip: a bare row is a heading or a
             // label — nothing to run. Every line of Help is a fact, and a fact
             // does nothing when you press it.
             Mode::Config | Mode::Help | Mode::Writing | Mode::Naming { .. } => {}
@@ -1670,8 +1681,8 @@ impl Editor {
     }
 
     /// A document's Delete: arm it, or carry it out. Two presses, with no undo
-    /// and no bin. Arming another document disarms the first, so the second
-    /// press means aiming at the same document twice.
+    /// and no bin. Arming another document disarms the first: the second press
+    /// means aiming at the same document twice.
     fn arm_or_delete(&mut self, row: usize) -> Result<()> {
         let Mode::Files(files) = &self.mode else {
             return Ok(());
@@ -1765,7 +1776,7 @@ impl Editor {
     }
 
     /// Set the page to another margin. The white space is the setting and the
-    /// text column is the rest of the surface, so a wider margin is a shorter
+    /// text column is the rest of the surface: a wider margin is a shorter
     /// line. How many characters that line holds follows from the type size.
     fn set_margin(&mut self, percent: u16) -> Result<()> {
         if self.theme.margin == percent {
@@ -1790,7 +1801,7 @@ impl Editor {
             "page: {} punctuation",
             if on { "hanging" } else { "push-out" }
         );
-        // Every line below the first break can move, so there is no smaller
+        // Every line below the first break can move: there is no smaller
         // rectangle to find.
         self.frame = None;
         self.paint()
@@ -2059,7 +2070,7 @@ impl Editor {
     fn show_hit(&mut self) {
         let Some(find) = &self.find else { return };
         let Some(hit) = find.hits.get(find.at).cloned() else {
-            // Nothing matches, so nothing is highlighted. Leaving the last hit
+            // Nothing matches: nothing is highlighted. Leaving the last hit
             // inverted while the bar says "not found" shows the writer a match
             // for a search that has none.
             self.doc.clear_selection();
@@ -2101,7 +2112,7 @@ impl Editor {
     }
 
     /// A keystroke the IME did not want, while the find bar is open. True once
-    /// the bar has closed. Reached after [`Editor::compose_key`] has passed, so
+    /// the bar has closed. Reached after [`Editor::compose_key`] has passed:
     /// every arm here is the case with nothing being composed.
     fn typed_query(&mut self, action: &Action) -> Result<bool> {
         // The same rule the strip follows: the tap or key confirming `[ All ]`
@@ -2167,8 +2178,8 @@ impl Editor {
     }
 
     /// Change whichever of the bar's fields is taking keys, reporting whether
-    /// it was the query. One place, so a keystroke cannot land in the query
-    /// while the caret is on the replacement.
+    /// it was the query. One place: a keystroke cannot land in the query while
+    /// the caret is on the replacement.
     fn edit_field(&mut self, change: impl FnOnce(&mut String)) -> bool {
         let Some(find) = &mut self.find else {
             return false;
@@ -2275,7 +2286,7 @@ impl Editor {
     }
 
     /// Break the line, carrying a list or quote marker onto the next one. The
-    /// list the cursor is in is the line it sits on, so this reads the text
+    /// list the cursor is in is the line it sits on: this reads the text
     /// before the cursor, not the whole line.
     fn newline(&mut self) {
         let chars = self.doc.chars();
@@ -2286,7 +2297,7 @@ impl Editor {
             karyll_core::Continue::Marker(marker) => {
                 self.doc.insert(&format!("\n{marker}"));
             }
-            // The empty marker goes with the break, so Enter on a bare bullet
+            // The empty marker goes with the break: Enter on a bare bullet
             // leaves a clean blank line, not a stranded `- `.
             karyll_core::Continue::End(back) => {
                 for _ in 0..back {
@@ -2315,7 +2326,7 @@ impl Editor {
 
     /// Wrap the selection, or the word under the cursor, in `marker`. With
     /// nothing selected it takes the word, and the wrapped text is left
-    /// selected, so the same key is a round trip.
+    /// selected: the same key is a round trip.
     fn emphasise(&mut self, marker: &'static str) {
         let chars = self.doc.chars();
         let span = self
@@ -2757,7 +2768,7 @@ impl Editor {
         Ok(())
     }
 
-    /// A key or a finger just arrived: the writer is here, so hold the
+    /// A key or a finger just arrived: the writer is here. Holds the
     /// screensaver off.
     fn note_input(&mut self) {
         self.last_input = std::time::Instant::now();
@@ -2845,7 +2856,7 @@ impl Editor {
     }
 
     /// Which chip the keyboard sits on when it arrives at `row`: the value the
-    /// setting stands on, so the arrows move from there.
+    /// setting stands on. The arrows move from there.
     fn chip_on(&self, row: usize) -> usize {
         let items = self.panel_items();
         let Some(item) = items.get(row) else {
@@ -2963,9 +2974,9 @@ impl Editor {
         })
     }
 
-    /// The lines of the current panel that are on screen. Everything that draws
-    /// or hits the list comes through here, not through
-    /// [`Editor::panel_items`], so nothing can see a line the writer cannot.
+    /// The lines of the current panel that are on screen. Everything that
+    /// draws or hits the list comes through here, not through
+    /// [`Editor::panel_items`]. Nothing can see a line the writer cannot.
     fn visible_items(&mut self) -> Vec<ui::Item> {
         let window = self.page_window();
         self.panel_items()
@@ -3033,7 +3044,7 @@ impl Editor {
                         on: open,
                         // Two taps, and the chip says which one it is on.
                         // Deleting prose cannot be undone and this device has
-                        // no bin, so the first tap arms it.
+                        // no bin: the first tap arms it.
                         action: Some(
                             if self.arming.as_ref() == Some(&listing.path) {
                                 "Delete?"
@@ -3083,9 +3094,9 @@ impl Editor {
             // back on its own.
             self.show_status("Scanning disconnects the keyboard for a moment…")?;
         }
-        // Coming up is not a failure. The editor does not wait for the
-        // radio, so this chip can be tapped seconds before anything is
-        // listening, and the daemon is on its way.
+        // Coming up is not a failure. The editor does not wait for the radio:
+        // this chip can be tapped seconds before anything is listening, and
+        // the daemon is on its way.
         match self.bluetooth.ready() {
             hid::Ready::Starting => {
                 self.scanning = None;
@@ -3161,8 +3172,8 @@ impl Editor {
     }
 
     /// Follow the framework if it has turned the screen under us. The
-    /// compositor rotates our pixels, and the touchscreen is panel-fixed, so
-    /// the mapping is what changes.
+    /// compositor rotates our pixels, and the touchscreen is panel-fixed: the
+    /// mapping is what changes.
     fn poll_orientation(&mut self) {
         if self.orientation_checked.elapsed() < ORIENTATION_POLL {
             return;
@@ -3178,9 +3189,9 @@ impl Editor {
         }
     }
 
-    /// Where words may be divided: the writer.s setting, and the
-    /// dictionary for the source they are writing in. Every `Page` asks here,
-    /// so the frame on screen and the frame a hit test reads agree.
+    /// Where words may be divided: the writer's setting, and the dictionary
+    /// for the source they are writing in. Every `Page` asks here: the frame
+    /// on screen and the frame a hit test reads agree.
     fn dictionary(&self) -> Option<&'static karyll_core::Hyphenator> {
         self.hyphenate
             .then(|| hyphen::load(self.language))
@@ -3304,9 +3315,9 @@ impl Editor {
         self.show_status(&format!("Scanning… {elapsed}s"))
     }
 
-    /// A keystroke the IME did not want, while a name is being typed. True once
-    /// the name is settled. Reached after [`Editor::compose_key`] has passed,
-    /// so `Enter` here is the name and `Esc` is never mind.
+    /// A keystroke the IME did not want, while a name is being typed. True
+    /// once the name is settled. Reached after [`Editor::compose_key`] has
+    /// passed: `Enter` here is the name and `Esc` is never mind.
     fn typed_name(&mut self, action: &Action) -> Result<bool> {
         let Mode::Naming { for_new, name } = &mut self.mode else {
             return Ok(false);
@@ -3360,7 +3371,7 @@ impl Editor {
                 name.pop();
             }
             // As in the find bar: with a CJK engine on, every letter goes to
-            // the engine, so this is the only way back to a Latin filename.
+            // the engine. This is the only way back to a Latin filename.
             Action::CycleLanguage => {
                 self.mode = Mode::Naming { for_new, name };
                 self.cycle_language();
@@ -3479,7 +3490,7 @@ impl Editor {
         self.paint()
     }
 
-    /// Remove a paired keyboard, so it can be paired afresh.
+    /// Remove a paired keyboard: it can be paired afresh.
     fn forget(&mut self, device: &hid::Device) -> Result<()> {
         self.show_status(&format!("Forgetting {}…", device.name))?;
         if let Err(err) = self.bluetooth.remove(&device.address) {
@@ -3491,7 +3502,7 @@ impl Editor {
 
     fn pair_with(&mut self, device: &hid::Device) -> Result<()> {
         self.show_status(&format!("Pairing with {}…", device.name))?;
-        // Read the daemon's log from here on. A BLE keyboard has no display, so
+        // Read the daemon's log from here on. A BLE keyboard has no display:
         // the host shows a passkey and the daemon prints it to its log. Every
         // attempt makes a fresh one.
         let mark = self.bluetooth.log_mark();
@@ -3564,8 +3575,7 @@ impl Editor {
             strip: &strip,
             overlay: overlay(
                 candidate_page(&self.candidates, &self.pages, self.page),
-                self.announcing,
-                self.language,
+                self.notice,
             ),
             focus,
         }
@@ -3624,7 +3634,7 @@ impl Editor {
                     self.doc.delete_selection();
                 }
             }
-            // One `Edit` for the whole string, so a paste undoes as one step —
+            // One `Edit` for the whole string: a paste undoes as one step —
             // and `insert` replaces any selection, which is what pasting over
             // a selection has to do.
             Action::Paste => self.doc.insert(&self.clipboard),
@@ -3656,7 +3666,7 @@ impl Editor {
             // out the replacement, and [`Editor::typed_query`] takes it first.
             Action::Change => self.toggle_task(),
             Action::ChangeAll => {}
-            // Through the strip's own handlers, so a key and its button cannot
+            // Through the strip's own handlers: a key and its button cannot
             // come to mean different things — the panels each have setting up
             // to do beyond assigning the mode.
             Action::Files => {
@@ -3677,6 +3687,8 @@ impl Editor {
             Action::ResetSize => self.set_size(render::DEFAULT_SIZE)?,
             // The panel is untouched: the light sits behind it.
             Action::Brightness(up) => power::step_frontlight(up),
+            // The two cases, shown as themselves.
+            Action::CapsLock(on) => self.notice = Some(if on { "AB" } else { "ab" }),
             Action::CycleMargins => self.set_margin(render::step_margin(self.theme.margin))?,
             // Only means anything mid-composition, where `compose_key` takes
             // it. Reaching here is Shift+Enter with nothing being converted,
@@ -3685,7 +3697,7 @@ impl Editor {
             Action::Quit => {}
         }
         // Any movement that is not vertical abandons the column the arrow keys
-        // were holding, so the next Up or Down takes its column from here.
+        // were holding: the next Up or Down takes its column from here.
         if !matches!(
             action,
             Action::Up
@@ -3709,12 +3721,12 @@ impl Editor {
     }
 
     /// Move to the next input source. Ctrl+Space and the language button are
-    /// the same action, so they cannot disagree about what is selected.
+    /// the same action: they cannot disagree about what is selected.
     fn cycle_language(&mut self) {
         self.set_language(self.language.next(&self.enabled));
-        // Say which one, beside the caret. The strip is hidden while writing,
-        // so nothing else answers it and `Ctrl+Space` cycles blind.
-        self.announcing = true;
+        // Say which one, beside the caret. The strip is hidden while writing:
+        // nothing else answers it and `Ctrl+Space` cycles blind.
+        self.notice = Some(self.language.label());
     }
 
     /// Take up the language the last session ended in, through
@@ -3816,7 +3828,7 @@ impl Editor {
         if !self.cjk {
             return Composed::Passed;
         }
-        // Asked of [`Editor::composing`] and not of `typed`, so one answer
+        // Asked of [`Editor::composing`] and not of `typed`. One answer
         // drives the rules, the bar and the hit-testing. Japanese swallows a
         // space as a conversion request, and the two can disagree.
         let compose = ime::compose(action, self.composing(), script);
@@ -3862,7 +3874,7 @@ impl Editor {
         match compose {
             ime::Compose::Pass => return Composed::Passed,
             // Backspace is fed to the engine, which drops one unit and
-            // re-predicts, so what is shown follows the engine.
+            // re-predicts: what is shown follows the engine.
             ime::Compose::Feed('\u{8}') => {
                 self.typed.pop();
                 self.feed('\u{8}');
@@ -3914,7 +3926,7 @@ impl Editor {
             }
             // What is composed, as it stands: pinyin for an English word that
             // did not need converting, kana for Japanese that is meant to stay
-            // kana. Nothing is fed to the engine, so it is told to reset.
+            // kana. Nothing is fed to the engine: it is told to reset.
             ime::Compose::CommitRaw => {
                 let text = std::mem::take(&mut self.preedit);
                 self.abandon_composition();
@@ -3973,7 +3985,7 @@ impl Editor {
         let at = from + n;
         match self.engine().and_then(|engine| engine.commit(at)) {
             // The word is not over. The candidate converted the front of the
-            // reading and the engine is composing the rest, so the bar goes on
+            // reading and the engine is composing the rest: the bar goes on
             // carrying it and the next keystroke belongs to it.
             Some(rest) => {
                 self.typed.clone_from(&rest.reading);
@@ -4016,8 +4028,8 @@ impl Editor {
         self.insert_committed(&text);
     }
 
-    /// Put committed text where it is being typed, as one undo step. Every path
-    /// out of the IME ends here, so this is the only place that has to know
+    /// Put committed text where it is being typed, as one undo step. Every
+    /// path out of the IME ends here: this is the only place that has to know
     /// which field is taking text. See [`Sink`].
     fn insert_committed(&mut self, text: &str) {
         if text.is_empty() {
@@ -4028,7 +4040,7 @@ impl Editor {
                 self.doc.insert(text);
                 self.last_edit = Some(std::time::Instant::now());
             }
-            // Whichever of the bar's fields is taking keys, so a writer can say
+            // Whichever of the bar's fields is taking keys: a writer can say
             // what to look for *and* what to put in its place in Chinese.
             Sink::Find => {
                 let text = text.to_string();
@@ -4066,9 +4078,9 @@ impl Editor {
         self.write_document("saved")
     }
 
-    /// Write the document out. `why` names the reason in the log, so an
-    /// autosave and a deliberate save are told apart when reading `karyll.log`
-    /// after something went wrong.
+    /// Write the document out. `why` names the reason in the log: an autosave
+    /// and a deliberate save are told apart when reading `karyll.log` after
+    /// something went wrong.
     fn write_document(&mut self, why: &str) -> Result<()> {
         let Some(path) = &self.path else {
             eprintln!("{why}: no file given, nothing written");
@@ -4085,8 +4097,8 @@ impl Editor {
         Ok(())
     }
 
-    /// Write the document out on its own, so a crash cannot cost prose. CJK
-    /// input runs Amazon's closed predictor plugin inside this process.
+    /// Write the document out on its own: a crash cannot cost prose. CJK input
+    /// runs Amazon's closed predictor plugin inside this process.
     /// [`AUTOSAVE_MAX`] is the backstop for someone who never pauses.
     fn poll_autosave(&mut self) {
         if !self.doc.is_dirty() {
@@ -4167,12 +4179,12 @@ impl Editor {
             };
             return self.show_status(&status);
         }
-        // A panel covered the page, so the next paint starts from scratch —
-        // and that is also exactly when the bar needs drawing again.
+        // A panel covered the page: the next paint starts from scratch — and
+        // that is also exactly when the bar needs drawing again.
         let fresh = self.frame.is_none();
         let (chars, preedit) = self.display();
         let markup = karyll_core::markdown::analyze(&chars);
-        // The page reaches the foot of the panel while the chrome is away, so
+        // The page reaches the foot of the panel while the chrome is away:
         // both the text and the centring measure against that, not against a
         // strip that is not there.
         let bottom = self.page_bottom();
@@ -4189,7 +4201,7 @@ impl Editor {
         .focused_on(self.focus_span(&chars))
         .composing(preedit)
         .hyphenating(self.dictionary());
-        // Kept so page movement measures the same row the page is drawn with.
+        // Kept: page movement measures the same row the page is drawn with.
         // A document with Han in it has taller rows, and paging by Latin rows
         // in one steps past a line every screen.
         self.roles = page.roles.clone();
@@ -4224,8 +4236,7 @@ impl Editor {
             selection,
             overlay: overlay(
                 candidate_page(&self.candidates, &self.pages, self.page),
-                self.announcing,
-                self.language,
+                self.notice,
             ),
             anchor,
         };
@@ -4290,7 +4301,7 @@ impl Editor {
         let cells = self.strip_cells();
         let stretch = self.strip_stretch();
         let fonts = &mut self.fonts;
-        // Measured from the cells drawn, so the box sits over its own field.
+        // Measured from the cells drawn: the box sits over its own field.
         let bounds = ui::cell_bounds(width, &cells, &stretch, |s| {
             ui::measure(fonts, s, ui::TEXT_PX) as u16
         });
@@ -4338,10 +4349,10 @@ impl Editor {
 
 /// Scan for Bluetooth keyboards and pair with one. Needs a terminal — kterm or
 /// ssh — to print a list and read a choice. A paired keyboard's link key is
-/// kept, so this is one step per keyboard and the editor never needs it again.
+/// kept: this is one step per keyboard and the editor never needs it again.
 fn pair() -> Result<()> {
     let mut bluetooth = hid::Hid::beside_executable()?;
-    // The same setting the editor reads, so pairing from a terminal leaves the
+    // The same setting the editor reads: pairing from a terminal leaves the
     // stack the way the writer has asked for it.
     bluetooth.set_keep_alive(read_keep_bluetooth());
     if bluetooth.keep_alive() {
@@ -4447,7 +4458,7 @@ const SCAN_SECONDS: u64 = 14;
 const PAIR_TICKS: usize = 45;
 
 /// How often the loop wakes when nothing has happened. A held finger produces
-/// no events, so the long press needs a tick to be noticed; the same tick looks
+/// no events: the long press needs a tick to be noticed; the same tick looks
 /// for a keyboard that has not arrived yet.
 const TICK_MS: i32 = 200;
 
@@ -4459,15 +4470,15 @@ const AUTOSAVE_IDLE: std::time::Duration = std::time::Duration::from_secs(3);
 /// types. It is the backstop for a writer who never pauses.
 const AUTOSAVE_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Is an autosave due, given how long since the last keystroke and how long the
-/// document has been unsaved? `idle_for` is `None` before anything has been
-/// typed this session. Pure, so the timing is tested off the device.
+/// Is an autosave due, given how long since the last keystroke and how long
+/// the document has been unsaved? `idle_for` is `None` before anything has
+/// been typed this session. Pure: the timing is tested off the device.
 fn autosave_due(idle_for: Option<std::time::Duration>, dirty_for: std::time::Duration) -> bool {
     idle_for.is_none_or(|idle| idle >= AUTOSAVE_IDLE) || dirty_for >= AUTOSAVE_MAX
 }
 
-/// The orientation a Kindle with no sensor was last set to, beside the logs so
-/// it survives an update.
+/// The orientation a Kindle with no sensor was last set to. Beside the logs,
+/// where it survives an update.
 fn orientation_file() -> PathBuf {
     PathBuf::from("/mnt/us/extensions/karyll/var/orientation")
 }
@@ -4524,14 +4535,14 @@ fn candidate_page<'a>(candidates: &'a [String], pages: &[usize], page: usize) ->
     &candidates[from.min(candidates.len())..to.min(candidates.len())]
 }
 
-/// What floats beside the caret. Candidates outrank the language notice.
-/// Takes the three values it reads, leaving the window and the faces free for
-/// the paint around it.
-fn overlay(candidates: &[String], announcing: bool, language: Language) -> ui::Overlay<'_> {
+/// What floats beside the caret. Candidates outrank a notice. Takes the two
+/// values it reads, leaving the window and the faces free for the paint around
+/// it.
+fn overlay<'a>(candidates: &'a [String], notice: Option<&'a str>) -> ui::Overlay<'a> {
     if !candidates.is_empty() {
         ui::Overlay::Candidates(candidates)
-    } else if announcing {
-        ui::Overlay::Notice(language.label())
+    } else if let Some(text) = notice {
+        ui::Overlay::Notice(text)
     } else {
         ui::Overlay::None
     }
@@ -4570,7 +4581,7 @@ struct Readouts {
 }
 
 /// Cut a strip to what the panel can hold. The order things are given up in is
-/// on [`Editor::strip_fitted`]. Free of the editor, so it runs against a stub
+/// on [`Editor::strip_fitted`]. Free of the editor: it runs against a stub
 /// metric on the host.
 fn fit_strip(
     width: u16,
@@ -4662,7 +4673,7 @@ fn find_count(
 }
 
 /// A display index as a document one, given where the preedit sits and how long
-/// it is. Free of the editor so the mapping can be tested on its own.
+/// it is. Free of the editor: the mapping is tested on its own.
 fn document_index(display: usize, cursor: usize, preedit: usize) -> usize {
     if display <= cursor {
         display
@@ -4671,9 +4682,9 @@ fn document_index(display: usize, cursor: usize, preedit: usize) -> usize {
     }
 }
 
-/// Whether the action strip is on screen. Free of the editor so the safety rule
-/// below can be tested: without a keyboard the strip is the only way out, and a
-/// search puts the bar there.
+/// Whether the action strip is on screen. Free of the editor, which leaves the
+/// safety rule below testable: without a keyboard the strip is the only way
+/// out, and a search puts the bar there.
 fn strip_visible(hidden: bool, keyboard_present: bool, finding: bool, writing: bool) -> bool {
     !writing || finding || !hidden || !keyboard_present
 }
@@ -4951,8 +4962,8 @@ fn parse_positions(body: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// Put `path` at the front with its new index, dropping any older entry for it.
-/// Most-recent-first with a cap, so the file cannot grow without bound.
+/// Put `path` at the front with its new index, dropping any older entry for
+/// it. Most-recent-first with a cap: the file cannot grow without bound.
 fn updated_positions(
     mut entries: Vec<(usize, String)>,
     path: &str,
@@ -5055,7 +5066,7 @@ fn help_items() -> Vec<ui::Item> {
         row("Close it again", "The same shortcut, or Esc"),
         row("Leave karyll", "Ctrl/⌘ + Q"),
         heading("Writing in Chinese, Japanese and Korean"),
-        row("Switch input source", "Ctrl + Space"),
+        row("Switch input source", "Ctrl/⌘ + Space"),
         row("Take a candidate", "Space, or 1 … 0"),
         row("Take the letters as typed", "Shift + Enter"),
         row("Drop the half-typed word", "Esc"),
@@ -5065,6 +5076,7 @@ fn help_items() -> Vec<ui::Item> {
         row("Ctrl and ⌘", "The same. Every shortcut takes either"),
         row("Find", "The magnifier key"),
         row("The reading light", "The sun keys"),
+        row("Caps Lock", "AB or ab, beside the cursor"),
         row("Beside the space bar", "Settings says which it sends"),
         row("Both printed on that key", "The keyboard chooses which"),
         row("Changing what it sends", "The keyboard's own shortcut"),
@@ -5132,7 +5144,7 @@ fn sections_of(chars: &[char]) -> Vec<Section> {
 /// level, which is what makes it an outline: the shape of the draft is the
 /// thing being looked at.
 fn outline_items(sections: &[Section], cursor: usize) -> Vec<ui::Item> {
-    // The one the cursor is in: the last heading at or before it. Marked, so
+    // The one the cursor is in: the last heading at or before it. Marked:
     // opening the outline says where the writer is.
     let here = sections.iter().rposition(|s| s.at <= cursor);
     sections
@@ -5189,7 +5201,7 @@ fn next_focusable(takes: &[bool], from: Option<usize>, down: bool) -> Option<usi
 }
 
 /// A strip label as it is drawn. Empty stays empty: a cell with nothing to say
-/// is blank, not a pair of empty brackets. The find bar.s count is blank
+/// is blank, not a pair of empty brackets. The find bar's count is blank
 /// until something has been typed.
 fn bracket(label: &str) -> String {
     if label.is_empty() {
@@ -5343,7 +5355,7 @@ fn describe_listing(words: usize, modified: std::time::SystemTime, open: bool) -
         .unwrap_or_else(|_| "just now".into());
     let words = karyll_core::words::describe(words);
     if open {
-        // Said in words as well as in bold: this is the document the strip.s
+        // Said in words as well as in bold: this is the document the strip's
         // Rename acts on.
         format!("open  ·  {words}  ·  {when}")
     } else {
@@ -5367,8 +5379,8 @@ fn new_document() -> PathBuf {
 }
 
 /// How often to ask the window manager which way the screen is. A subprocess
-/// each time, so not every tick — but often enough that a flip does not leave
-/// the buttons dead for long.
+/// each time: not every tick — but often enough that a flip does not leave the
+/// buttons dead for long.
 const ORIENTATION_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How far a finger may wander and count as having stayed put. At 300 ppi this
@@ -5412,7 +5424,7 @@ enum Bar {
     PageOn,
     /// The find bar's own cells: the field, how many hits there are and which
     /// one is showing, and the two steps between them. Their labels are what
-    /// has been typed, so [`Editor::strip_labels`] fills them in.
+    /// has been typed: [`Editor::strip_labels`] fills them in.
     Query,
     Count,
     Previous,
@@ -5428,8 +5440,8 @@ enum Bar {
     /// Start a document. On the Files strip, where a list of documents is what
     /// you are looking at when you want another.
     New,
-    /// Rename the open document — the one the Files list marks `open`, which is
-    /// why it says so in words as well as in bold.
+    /// Rename the open document — the one the Files list marks `open`, in
+    /// words as well as in bold.
     Rename,
 }
 
@@ -5443,7 +5455,7 @@ impl Bar {
             Bar::Outline => "Outline",
             Bar::Done => "Done",
             Bar::Cancel => "Cancel",
-            // The find bar.s words: the same gesture, stepping through a
+            // The find bar's words: the same gesture, stepping through a
             // sequence with a readout saying where you are.
             Bar::PageBack => "Previous",
             Bar::PageOn => "Next",
@@ -5484,14 +5496,14 @@ impl Bar {
     }
 }
 
-/// What a chip in Config's Keyboard section does. Built alongside the labels so
-/// the two cannot drift: arithmetic over three concatenated lists is how a tap
-/// forgets a keyboard it meant to connect.
+/// What a chip in Config's Keyboard section does. Built alongside the labels,
+/// which holds the two together: arithmetic over three concatenated lists is
+/// how a tap forgets a keyboard it meant to connect.
 #[derive(Debug, Clone)]
 enum KeyAction {
     /// Drop the link, keeping the pairing.
     Disconnect(hid::Device),
-    /// Remove it, and its saved link key, so it can be paired afresh.
+    /// Remove it, and its saved link key: it can be paired afresh.
     Forget(hid::Device),
     /// Pair with something the scan turned up.
     Pair(hid::Device),
@@ -5503,7 +5515,7 @@ enum KeyAction {
 /// chips were drawn from.
 #[derive(Debug, Clone)]
 enum ConfigRow {
-    /// A heading. Not tappable, and here only so the list stays one list.
+    /// A heading. Not tappable. One list holds every row.
     None,
     /// The language chips: which source each option switches on or off.
     Languages(Vec<Language>),
@@ -5572,8 +5584,8 @@ mod tests {
     use std::time::Duration;
 
     /// A line takes the keyboard where taking it does something, a question
-    /// about the panel and not about the row: the outline.s rows carry no chip
-    /// and go somewhere, Help.s carry none and do not.
+    /// about the panel and not about the row: the outline's rows carry no chip
+    /// and go somewhere, Help's carry none and do not.
     #[test]
     fn what_takes_the_keyboard_depends_on_the_panel() {
         let row = ui::Item::Row {
@@ -5656,7 +5668,7 @@ mod tests {
         for want in [
             Style::Emphasis,
             Style::Strong,
-            // The specimen says nesting works, so it has to.
+            // The specimen says nesting works: it has to.
             Style::StrongEmphasis,
             Style::Strikethrough,
             Style::Code,
@@ -5800,8 +5812,8 @@ nine words in this one under the third level
         }
 
         /// The count is the prose under the heading, not the heading's own
-        /// words, and it stops at the next heading of **any** level — so a
-        /// section and its subsections do not count the same prose twice.
+        /// words, and it stops at the next heading of **any** level. A section
+        /// and its subsections do not count the same prose twice.
         #[test]
         fn each_section_counts_only_the_prose_below_it() {
             let counts: Vec<usize> = of(DRAFT).iter().map(|s| s.words).collect();
@@ -5951,8 +5963,8 @@ nine words in this one under the third level
         /// The panels karyll targets, narrowest first.
         const PANELS: [u16; 3] = [1264, 1272, 1860];
 
-        /// The strips, as [`Editor::strip_wanted`] builds them. Written out rather
-        /// than reached through an `Editor`, which needs a window.
+        /// The strips, as [`Editor::strip_wanted`] builds them. Written out
+        /// here; an `Editor` needs a window.
         fn strips() -> Vec<(&'static str, Vec<Bar>)> {
             let paging = [Bar::PageBack, Bar::PageAt, Bar::PageOn];
             let mut out = vec![
@@ -6083,7 +6095,7 @@ nine words in this one under the third level
     mod replacing {
         use super::*;
 
-        /// The bar.s two states, as [`Editor::strip_wanted`] builds them.
+        /// The bar's two states, as [`Editor::strip_wanted`] builds them.
         /// Written out here: an `Editor` needs a window.
         const FINDING: [Bar; 6] = [
             Bar::Query,
@@ -6110,8 +6122,8 @@ nine words in this one under the third level
         fn the_fields_are_the_cells_that_stretch() {
             assert_eq!(stretch_cells(&FINDING), vec![0]);
             assert_eq!(stretch_cells(&REPLACING), vec![0, 1]);
-            // And a bar with no field on it has nothing elastic, so the
-            // remainder falls to the status line.
+            // And a bar with no field on it has nothing elastic: the remainder
+            // falls to the status line.
             assert_eq!(
                 stretch_cells(&[Bar::Exit, Bar::Files, Bar::Config]),
                 Vec::<usize>::new()
@@ -6134,7 +6146,7 @@ nine words in this one under the third level
             assert_eq!(stretch_cells(&reversed), vec![6, 7]);
         }
 
-        /// A cell that is not a field is not one, so nothing else on the strip
+        /// A cell that is not a field is not one: nothing else on the strip
         /// can be typed into by accident.
         #[test]
         fn no_button_is_mistaken_for_a_field() {
@@ -6170,7 +6182,7 @@ nine words in this one under the third level
         assert_eq!(secs(31_536_000), "1 year ago");
     }
 
-    /// The device sets its clock after a sleep, so a file can carry a stamp
+    /// The device sets its clock after a sleep: a file can carry a stamp
     /// slightly in the future. That is not an error worth putting on screen.
     #[test]
     fn a_file_stamped_in_the_future_reads_as_just_now() {
@@ -6376,8 +6388,8 @@ nine words in this one under the third level
         assert!(!strip_visible(true, true, false, true));
         // And it comes straight back when the flag is cleared.
         assert!(strip_visible(false, true, false, true));
-        // A search puts the bar on the strip, and a field you cannot see is
-        // not a field — so it stays whatever the chrome flag says.
+        // A search puts the bar on the strip, and a hidden field is not a
+        // field: the strip stays whatever the chrome flag says.
         assert!(strip_visible(true, true, true, true));
     }
 
@@ -6430,8 +6442,8 @@ nine words in this one under the third level
         use super::*;
 
         /// A language names its keyboard. Pinyin and romaji are both defined
-        /// against the QWERTY letter arrangement, so Chinese and Japanese are
-        /// US however the last prose was typed.
+        /// against the QWERTY letter arrangement: Chinese and Japanese are US
+        /// however the last prose was typed.
         #[test]
         fn each_language_names_its_own_layout() {
             assert_eq!(Language::English.layout(), keymap::Layout::Us);
@@ -6571,8 +6583,8 @@ nine words in this one under the third level
             assert_eq!(opening_cursor_from(None, 0), 0);
         }
 
-        /// The file is plain Markdown on a volume that mounts over USB, so it
-        /// can have been shortened elsewhere between sessions. Clamping beats
+        /// The file is plain Markdown on a volume that mounts over USB: it can
+        /// have been shortened elsewhere between sessions. Clamping beats
         /// refusing to restore.
         #[test]
         fn a_stale_place_past_the_end_is_clamped() {
@@ -6621,7 +6633,7 @@ nine words in this one under the third level
                 entries = updated_positions(entries, &format!("/{i}.md"), i);
             }
             assert_eq!(entries.len(), POSITIONS_KEPT);
-            // Newest first, so the draft just written is the one kept.
+            // Newest first: the draft just written is the one kept.
             assert_eq!(entries[0].1, format!("/{}.md", POSITIONS_KEPT + 19));
         }
     }

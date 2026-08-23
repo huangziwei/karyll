@@ -41,6 +41,9 @@ pub mod code {
     pub const BRIGHTNESSUP: u16 = 225;
     /// `Q` decides whether an input device is a keyboard.
     pub const Q: u16 = 16;
+    /// The first button code. A keyboard's descriptor may carry buttons
+    /// beside its keys, and they arrive on the same node.
+    pub const BTN_MISC: u16 = 0x100;
 }
 
 /// Which modifiers are held.
@@ -197,6 +200,8 @@ pub enum Action {
     ResetSize,
     /// Take the frontlight one step up or down. The two sun keys.
     Brightness(bool),
+    /// Say which case letters come out in. `Caps Lock`.
+    CapsLock(bool),
     /// Take the next margin along. `Ctrl`/`⌘` + `M`.
     CycleMargins,
     /// The document list. `Ctrl`/`⌘` + `O`.
@@ -388,14 +393,18 @@ fn movement(code: u16, mods: Mods) -> Option<Action> {
 /// resolves first, then `chord`, then the named keys, then `character`.
 /// `alt` alone binds nothing.
 pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
+    // `Mods::track` holds the latch; this reads it back.
+    if code == code::CAPSLOCK {
+        return Some(Action::CapsLock(mods.caps));
+    }
     // Ahead of `chord()`, which flattens `ctrl` and `meta` together.
     if let Some(action) = movement(code, mods) {
         return Some(action);
     }
     if mods.chord() {
         if code == code::SPACE {
-            // The one binding `meta` does not take. ⌘Space types no space.
-            return mods.ctrl.then_some(Action::CycleLanguage);
+            // Neither chord types a space.
+            return Some(Action::CycleLanguage);
         }
         // The replace bar's two commands, ahead of `character`.
         if code == code::ENTER || code == code::KPENTER {
@@ -449,7 +458,7 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
             Some('b') => Some(Action::Emphasis("**")),
             Some('i') => Some(Action::Emphasis("*")),
             // Digits are heading levels here. `compose` abandons a composition
-            // on a chord, so candidate selection never reaches this arm.
+            // on a chord, and candidate selection never reaches this arm.
             Some(c @ '1'..='6') => Some(Action::Heading(c as u8 - b'0')),
             _ => None,
         };
@@ -857,14 +866,17 @@ mod tests {
         }
     }
 
-    /// ⌘Space puts no space in the draft.
+    /// Either chord switches, and neither puts a space in the draft.
     #[test]
-    fn command_space_is_not_the_language_switch() {
+    fn space_under_a_chord_is_the_language_switch() {
         assert_eq!(
             action(code::SPACE, ctrl(), Layout::Us),
             Some(Action::CycleLanguage)
         );
-        assert_eq!(action(code::SPACE, meta(), Layout::Us), None);
+        assert_eq!(
+            action(code::SPACE, meta(), Layout::Us),
+            Some(Action::CycleLanguage)
+        );
         assert_eq!(
             action(code::SPACE, plain(), Layout::Us),
             Some(Action::Insert(' '))
@@ -898,6 +910,22 @@ mod tests {
             ..Mods::default()
         };
         assert_eq!(action(30, alt, Layout::Us), Some(Action::Insert('a')));
+    }
+
+    /// Caps Lock names the state it latches into.
+    #[test]
+    fn caps_lock_says_which_way_it_went() {
+        let mut mods = Mods::default();
+        mods.track(code::CAPSLOCK, true);
+        assert_eq!(
+            action(code::CAPSLOCK, mods, Layout::Us),
+            Some(Action::CapsLock(true))
+        );
+        mods.track(code::CAPSLOCK, true);
+        assert_eq!(
+            action(code::CAPSLOCK, mods, Layout::Us),
+            Some(Action::CapsLock(false))
+        );
     }
 
     /// `caps` latches on the press and the release leaves it.

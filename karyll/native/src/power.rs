@@ -40,7 +40,7 @@ pub fn step_frontlight(up: bool) {
         return;
     }
     match Command::new("lipc-set-prop")
-        .args(["-i", "com.lab126.powerd", "flIntensity", &want.to_string()])
+        .args(["com.lab126.powerd", "flIntensity", &want.to_string()])
         .status()
     {
         Ok(_) => eprintln!("power: frontlight {want} of {max}"),
@@ -55,10 +55,11 @@ fn stepped(at: i32, max: i32, up: bool) -> i32 {
     want.clamp(0, max)
 }
 
-/// One of the integer properties on `com.lab126.powerd`.
+/// One of the integer properties on `com.lab126.powerd`. Read the way
+/// `/usr/sbin/loginfo` reads `flIntensity`.
 fn intensity(property: &str) -> Option<i32> {
     let out = Command::new("lipc-get-prop")
-        .args(["-i", "com.lab126.powerd", property])
+        .args(["com.lab126.powerd", property])
         .output()
         .ok()?;
     out.status

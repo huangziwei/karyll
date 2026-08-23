@@ -193,7 +193,7 @@ relink() {
 VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
 [ -n "$VERSION" ] || { echo "error: could not read version from Cargo.toml" >&2; exit 1; }
 
-# Stamp the build so a log on the device names the binary that wrote it. An
+# Stamp the build: a log on the device names the binary that wrote it. An
 # inherited KARYLL_BUILD wins, carrying a release tag; the time of day separates
 # two builds made the same afternoon.
 BUILD_STAMP=${KARYLL_BUILD:-$(date +%H%M%S)}
@@ -226,8 +226,8 @@ build_abi() {
     build_sysroot "$abi"
     SYSROOT="$ROOT/deploy/sysroot-$abi"
 
-    # Driven as a raw linker, so the C runtime objects are named explicitly and
-    # in order. Everything else is reached through the sysroot's own `libc.so`
+    # Driven as a raw linker: the C runtime objects are named explicitly and in
+    # order. Everything else is reached through the sysroot's own `libc.so`
     # script, rewritten above.
     SYSROOT_FLAGS="-C linker-flavor=ld.lld"
     SYSROOT_FLAGS="$SYSROOT_FLAGS -C link-arg=--dynamic-linker=/lib/$(abi_loader "$abi")"
@@ -261,7 +261,7 @@ build_abi() {
     # need. Each name is checked against a device's own `/lib` first. Fatal: a
     # binary naming a library the Kindle lacks never starts.
     NEEDED=$(elf_needed "$BIN" | sort -u)
-    # A dynamically linked binary always names libc, so an empty list means the
+    # A dynamically linked binary always names libc: an empty list means the
     # file was not read, as against needing nothing.
     [ -n "$NEEDED" ] || {
         echo "error: could not read the NEEDED list from $BIN" >&2
@@ -297,8 +297,7 @@ build_abi() {
     }
 
     # The oldest glibc that can run it, decided by the sysroot and not by
-    # anything in this repo's source. Logged so a firmware question is
-    # answerable from a build log.
+    # anything in this repo's source. A build log carries it.
     NEEDS=$(elf_versions "$BIN" | sort -uV | tail -1)
     echo "==> $(abi_binary "$abi"): $got-float, /lib/$(abi_loader "$abi"), ${NEEDS:-an unknown glibc} or newer"
 }
