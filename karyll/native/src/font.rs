@@ -1,34 +1,6 @@
-//! Loading faces, and measuring with them.
-//!
-//! Nothing is compiled into the binary. The firmware's own faces are read from
-//! `/usr/java/lib/fonts`, and the three writing faces karyll ships are read from
-//! `fonts/` beside it in the extension. The policy for *which* face a run wants
-//! lives in `karyll_core::script` and is testable without any of them present;
-//! this module is the part that needs the files.
-//!
-//! **The app and the page are set separately.** [`CHROME_FACES`] draws karyll's
-//! own text and cannot be changed; [`LATIN_FAMILIES`] and the Han lists are what
-//! a document can be set in. One face doing both jobs made the panel look like a
-//! draft and moved the panel's own geometry every time a writer tried a face on.
-//!
-//! **Why these faces.** The renderer thresholds glyph coverage to one bit,
-//! because the partial waveform is two-level and an antialiased grey edge comes
-//! out muddy. That rules the body face more than taste does: 宋体 sets thin
-//! horizontal strokes that thin out further under a one-bit cut, where 黑体
-//! holds an even stroke weight and survives it. So the Han body defaults to
-//! **STHeitiMedium** and Latin to **iA Writer Duo**, pairing a sans with a sans.
-//!
-//! **The defaults are the head of a short list, not the only option.** The
-//! stroke-thinning argument is a prediction rather than a measurement, and it is
-//! also a matter of taste once it stops being a matter of legibility, so
-//! [`families`] offers two or three per writing system and the settings panel
-//! picks between them. It is a curated list and deliberately not a browser over
-//! the faces the device carries: most of them are handwriting styles or scripts
-//! karyll does not typeset, and a list nobody can read through is not a choice.
-//!
-//! **Faces are read on first use, never at startup.** A face costs its file
-//! size in resident bytes, and the Han faces are ~10 MB each against ~514 MB
-//! shared with the framework. An English-only session never pays for them.
+//! Loading faces, and measuring with them. Nothing is compiled in: the
+//! firmware's faces are read from `/usr/java/lib/fonts`, the three writing
+//! faces from `fonts/` beside this extension. A face is read on first use.
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
@@ -39,10 +11,8 @@ use anyhow::{Result, anyhow};
 use karyll_core::script::{Region, Role};
 
 /// The measurements layout needs, separated from the faces that supply them.
-///
-/// Layout arithmetic is worth testing — the goal column, page overlap, where a
-/// caret lands — and none of it can run against real faces on a development
-/// machine, because they live on the device. A stub implements this instead.
+/// The goal column, page overlap and where a caret lands are all arithmetic
+/// over this, and [`Stub`] supplies it off the device.
 pub trait Metrics {
     /// How far the pen moves after drawing `ch` at `px`.
     fn advance(&mut self, role: Role, px: f32, ch: char) -> f32;
@@ -67,23 +37,13 @@ fn probe(role: Role) -> char {
     }
 }
 
-/// A row that only ever holds Latin: chrome, panel titles, anything whose text
-/// karyll wrote itself rather than read out of a document.
+/// A row that only ever holds Latin: chrome, panel titles, any text karyll
+/// wrote itself.
 pub const LATIN_ROW: &[Role] = &[Role::Chrome];
 
-/// A set of roles that are chosen between as one: the Latin four, one
-/// convention's Han pair, or Hangul's.
-///
-/// **The Han faces depend on the region**, because Han unification gives the
-/// three conventions one code point and three correct glyphs. Drawing
-/// Traditional or Japanese from the Simplified faces is not a missing glyph —
-/// it is the wrong glyph, silently. So each convention chooses separately, and
-/// Latin chooses once for every language written in it: English and German are
-/// drawn by the same faces, and offering each of them its own setting would be
-/// two controls over one thing.
-///
-/// **Hangul takes no region.** No code point it holds is drawn two ways, so a
-/// Korean family is a plain choice of face, as a Latin one is.
+/// A set of roles chosen between as one: the Latin four, one convention's Han
+/// pair, or Hangul's. Each Han convention chooses its own faces; Latin chooses
+/// once for every language written in it, and Hangul takes no region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     Latin,
@@ -131,11 +91,8 @@ impl Group {
         }
     }
 
-    /// What the settings panel calls this row, under its Type heading.
-    ///
-    /// Each names itself in its own script, as the language button does. No
-    /// 字体/書体 after it: the section heading says a font row is a font row,
-    /// and the labels are the shorter for it.
+    /// What the settings panel calls this row, under its Type heading. Each
+    /// names itself in its own script, with no 字体/書体 after it.
     pub fn label(self) -> &'static str {
         match self {
             Group::Latin => "Latin",
@@ -162,45 +119,23 @@ impl Group {
 /// draws each of the group's roles.
 pub struct Family {
     /// Shown in the settings panel, and the key it is stored under. Each names
-    /// itself the way its readers would.
+    /// itself in its own script.
     pub name: &'static str,
     /// One path per role in [`Group::roles`] order.
     faces: &'static [&'static str],
 }
 
-/// The faces karyll's own text is drawn in, in [`CHROME_ROLES`] order.
-///
-/// **Amazon Ember, and it is not on offer.** It is the Kindle's interface face,
-/// so a panel set in it reads as part of the device rather than as a document —
-/// which is what chrome is for. It also never changes, so the geometry laid out
-/// against it in [`crate::ui`] holds for the life of the process; see
-/// [`karyll_core::script::chrome_role_for`] for why that matters.
+/// The faces karyll's own text is drawn in, in [`CHROME_ROLES`] order. Amazon
+/// Ember, and no setting reaches it: the geometry [`crate::ui`] lays out
+/// against it holds for the process.
 const CHROME_FACES: [&str; 2] = [
     "/usr/java/lib/fonts/Amazon-Ember-Regular.ttf",
     "/usr/java/lib/fonts/Amazon-Ember-Bold.ttf",
 ];
 
-/// The Latin families a *document* can be set in, default first.
-///
-/// **The three faces karyll ships, and nothing off the firmware.** The device's
-/// own faces draw the device — a page set in one looks like the reader it was
-/// taken from, and the app's chrome is already in Ember. These three were drawn
-/// to be written in, and shipping them is what makes one editor read the same
-/// on every Kindle.
-///
-/// **They are bundled because no Kindle carries a monospace text face.** Every
-/// device this was built against ships the same firmware faces, and the only
-/// one named for the word is a symbol font — so a fenced block or a table has
-/// nothing to line its columns up in. The three are cut from one design at a
-/// shared 0.6 em base and differ in how many widths they allow: Mono holds one,
-/// so it is the only one whose columns align; **Duo** widens six letters by
-/// half and is the writing face iA itself defaults to, which is why it is the
-/// default here; Quattro allows four widths and sets some 9% narrower than Duo,
-/// buying back the line length a fixed pitch costs.
-///
-/// Every entry is a true four-face family, so emphasis and strong are real
-/// italics and bolds rather than synthetic slants — which is what [`available`]
-/// declines an incomplete family to protect.
+/// The Latin families a *document* can be set in, default first. One design at
+/// a shared 0.6 em base in three widths: Mono holds one width, Duo widens six
+/// letters by half, Quattro allows four. Each is a true four-face family.
 const LATIN_FAMILIES: &[Family] = &[
     Family {
         name: "Duo",
@@ -231,12 +166,8 @@ const LATIN_FAMILIES: &[Family] = &[
     },
 ];
 
-/// Simplified Chinese, default first.
-///
-/// A body face and its bold, and nothing between them: emphasis is a 着重号
-/// against each character and leaves the face alone, so a family is one design
-/// at two weights. The device carries no Simplified 楷体 or 圆体, so these two
-/// are all there is.
+/// Simplified Chinese, default first. A body face and its bold: emphasis is a
+/// 着重号 against each character and leaves the face alone.
 const SIMPLIFIED_FAMILIES: &[Family] = &[
     Family {
         name: "黑体",
@@ -254,11 +185,8 @@ const SIMPLIFIED_FAMILIES: &[Family] = &[
     },
 ];
 
-/// Traditional Chinese, default first.
-///
-/// 楷體 and 圓體 live in `/var/local/font`, a font pack rather than the system
-/// directory, so they are the entries most likely to be absent — which is what
-/// the existence check exists for.
+/// Traditional Chinese, default first. 楷體 and 圓體 live in
+/// `/var/local/font`, a font pack, and are the entries most often absent.
 const TRADITIONAL_FAMILIES: &[Family] = &[
     Family {
         name: "黑體",
@@ -309,20 +237,9 @@ const JAPANESE_FAMILIES: &[Family] = &[
     },
 ];
 
-/// Korean, default first.
-///
-/// **All four are in `/usr/java/lib/fonts`**, the base firmware, on every
-/// Kindle karyll runs on: a Korean document draws with nothing installed.
-///
-/// **Their sfnt tag is `OTTO`** — CFF outlines, and the `.otf` extension that
-/// goes with them. `ab_glyph` reads the table. Each holds 13,727 glyphs of
-/// Hangul, Latin and the CJK punctuation, with no Hanja and no kana, which is
-/// what puts them at a tenth of a Han face's size.
-///
-/// **고딕 opens**, on the argument at the head of this file: a one-bit cut
-/// thins a thin horizontal stroke out of existence, and 명조 is a Song-like
-/// face that has them where 고딕 holds an even weight. The bold is a 900
-/// against a 400 body, which is what the firmware carries.
+/// Korean, default first. All four are in `/usr/java/lib/fonts` on every
+/// Kindle karyll runs on. Their sfnt tag is `OTTO`, and each holds 13,727
+/// glyphs of Hangul, Latin and CJK punctuation, with no Hanja and no kana.
 const HANGUL_FAMILIES: &[Family] = &[
     Family {
         name: "고딕",
@@ -351,10 +268,8 @@ pub fn families(group: Group) -> &'static [Family] {
     }
 }
 
-/// Which family each group is set to, as an index into [`families`].
-///
-/// The default is the head of every list, so a writer who never opens the panel
-/// gets exactly the faces this file argues for.
+/// Which family each group is set to, as an index into [`families`]. The
+/// default is the head of every list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Choices {
     picked: [usize; GROUPS.len()],
@@ -369,14 +284,9 @@ impl Choices {
         self.picked[group_at(group)] = family;
     }
 
-    /// Read a stored selection: one `group name` pair per line.
-    ///
-    /// **Stored by name, not by index**, because an index is a position in a
-    /// list that will be edited — inserting a family would silently move every
-    /// writer onto a different face. A group or a name this build does not know
-    /// is skipped and leaves that group on its default, so an older file, a
-    /// hand-typed one, or one written by a build that carried a face this
-    /// device does not, all degrade to the default rather than to nothing.
+    /// Read a stored selection: one `group name` pair per line. A group or a
+    /// name this build does not know is skipped and leaves that group on its
+    /// default.
     pub fn parse(text: &str) -> Choices {
         let mut choices = Choices::default();
         for line in text.lines() {
@@ -417,25 +327,16 @@ fn group_at(group: Group) -> usize {
         .expect("every group is listed")
 }
 
-/// The family a group is set to.
-///
-/// An index past the end falls back to the default rather than to the last
-/// entry, which is the same answer [`Choices::parse`] gives a name it does not
-/// know: when the stored choice cannot be honoured, the head of the list is
-/// what this module argues for, and the tail is nothing in particular.
+/// The family a group is set to. An index past the end falls back to the
+/// default, the same answer [`Choices::parse`] gives a name it does not know.
 fn family(group: Group, chosen: usize) -> &'static Family {
     let list = families(group);
     list.get(chosen).unwrap_or(&list[0])
 }
 
-/// The families of `group` that are actually installed, as indices.
-///
-/// **Every face is checked, not just the body.** A family missing its italic
-/// would not fall back to another italic — a Latin role has one face and then
-/// the pan-Unicode fallback, so emphasis would come out in code2000. Declining
-/// the whole entry is the honest answer, and every family listed here ships
-/// complete — the Han faces on the firmware this was built against, the Latin
-/// three in the extension.
+/// The families of `group` that are installed, as indices. Every face is
+/// checked, the italic and the bold with the body: a Latin role has one face
+/// and then [`FALLBACK`].
 pub fn available(group: Group) -> Vec<usize> {
     available_by(group, |path| Path::new(path).is_file())
 }
@@ -451,10 +352,8 @@ fn available_by(group: Group, exists: impl Fn(&str) -> bool) -> Vec<usize> {
         .collect()
 }
 
-/// Where each role is drawn from, given what each group is set to.
-///
-/// A chrome role answers [`CHROME_FACES`] whatever the choices are: it is not
-/// part of any group, and nothing in the settings panel can re-point it.
+/// Where each role is drawn from, given what each group is set to. A chrome
+/// role answers [`CHROME_FACES`] whatever the choices are.
 fn path_for(role: Role, region: Region, choices: Choices) -> &'static str {
     if let Some(at) = chrome_at(role) {
         return CHROME_FACES[at];
@@ -478,9 +377,8 @@ fn index_in(group: Group, role: Role) -> usize {
 }
 
 /// Tried in order when the role's own face has no glyph for a character.
-///
 /// `code2000` is a pan-Unicode catch-all; `MTChineseSurrogates` carries the
-/// rare Han outside the common blocks. Last resort before drawing nothing.
+/// rare Han outside the common blocks.
 const FALLBACK: &[&str] = &[
     "/usr/java/lib/fonts/code2000.ttf",
     "/usr/java/lib/fonts/MTChineseSurrogates.ttf",
@@ -507,16 +405,9 @@ const CHROME_ROLES: [Role; 2] = [Role::Chrome, Role::ChromeBold];
 
 const REGIONS: [Region; 3] = [Region::Simplified, Region::Traditional, Region::Japanese];
 
-/// Where `(role, region)` sits in `slots`.
-///
-/// Latin first, then the Han roles with all three conventions of each side by
-/// side, then Hangul, then the chrome and [`FALLBACK`]. Every pair has its own
-/// slot and keeps it for the life of the process, which is what lets the
-/// advance cache be keyed on the index rather than on a path.
-///
-/// A slot's *contents* do change, when the writer picks another family — and
-/// that is precisely why [`Fonts::set_family`] evicts the cached advances of
-/// the slots it re-points. A width belongs to the face that measured it.
+/// Where `(role, region)` sits in `slots`. Latin first, then the Han roles
+/// with all three conventions of each side by side, then Hangul, then the
+/// chrome and [`FALLBACK`]. Every pair keeps its slot for the process.
 fn slot_of(role: Role, region: Region) -> usize {
     if let Some(at) = chrome_at(role) {
         return CHROME_AT + at;
@@ -545,23 +436,9 @@ const CHROME_AT: usize = HANGUL_AT + HANGUL_ROLES.len();
 /// Where [`FALLBACK`] starts.
 const FALLBACK_AT: usize = CHROME_AT + CHROME_ROLES.len();
 
-/// The slots that may draw `role` under `region`, best first.
-///
-/// A Latin role has one face. **A Han role has the selected convention first and
-/// the other two behind it**, because the three faces do not cover the same
-/// characters and a document is not written in one convention. The Japanese face
-/// is built to a JIS repertoire and has no 说 or 这; the TC faces have no
-/// Simplified forms. Without the other two in the chain, selecting a language
-/// does not re-cut the Han already on the page — it deletes whatever that face
-/// has never heard of.
-///
-/// **A Hangul role has one face.** The Korean faces carry no Hanja and are
-/// never asked for one: 한자 in Korean prose is
-/// [`karyll_core::script::Script::Han`], and the Han chain draws that run.
-///
-/// The right glyph if the preferred face has it; the character in another
-/// convention's shape if only another does. A wrong shape is a real cost and is
-/// far cheaper than a character that does not appear.
+/// The slots that may draw `role` under `region`, best first. A Latin role has
+/// one face; a Han role has the selected convention first and the other two
+/// behind it; a Hangul role has one face and is never asked for Hanja.
 fn chain_of(role: Role, region: Region) -> Vec<usize> {
     if !role.is_han() {
         return vec![slot_of(role, region)];
@@ -572,12 +449,9 @@ fn chain_of(role: Role, region: Region) -> Vec<usize> {
         .collect()
 }
 
-/// One slot per role, in the order [`slot_of`] files them.
-///
-/// [`FALLBACK`] is not here: it is not a role, and [`Fonts::resolve`] reaches
-/// it from `FALLBACK_AT` whatever role was asked for. The one statement of the
-/// order, so a slot index means the same face to every caller — the advance
-/// cache is keyed on it.
+/// One slot per role, in the order [`slot_of`] files them. [`FALLBACK`] is not
+/// here — [`Fonts::resolve`] reaches it from `FALLBACK_AT` whatever role was
+/// asked for. The one statement of the order the advance cache is keyed on.
 fn role_slots(choices: Choices) -> impl Iterator<Item = Slot> {
     let region = Region::default();
     LATIN_ROLES
@@ -600,8 +474,8 @@ enum State {
     /// On disk, not read yet.
     Pending,
     Loaded(Box<FontVec>),
-    /// Missing, or failed to parse. Skipped from here on, so a bad candidate
-    /// costs one failed attempt per session rather than one per character.
+    /// Missing, or failed to parse. Skipped from here on, at one failed attempt
+    /// per session.
     Absent,
 }
 
@@ -635,13 +509,8 @@ impl Slot {
         }
     }
 
-    /// How tall this face is, **without loading it**.
-    ///
-    /// A row has to be measured against every face that could draw in it, and
-    /// there are three conventions of each Han role at 5–15 MB apiece. Loading
-    /// them all to ask their height would cost more memory than drawing with
-    /// them ever does. `hhea` and `head` are two small tables at a known offset,
-    /// so this is three seeks and twenty bytes.
+    /// How tall this face is, without loading it. `hhea` and `head` are two
+    /// small tables at a known offset: three seeks and twenty bytes.
     fn vertical(&mut self) -> Option<Vertical> {
         if matches!(self.vertical, VerticalState::Unread) {
             self.vertical = match vertical_of(self.path) {
@@ -673,10 +542,8 @@ impl Slot {
     }
 }
 
-/// The [`PxScale`] that draws a face with an em `px` pixels tall.
-///
-/// ab_glyph scales a face by `PxScale / hhea_height`, so `px` alone sets the em
-/// of a 1000/1480 face to 0.68 of a 1000/1000 face's. `hhea_height` cancels it.
+/// The [`PxScale`] that draws a face with an em `px` pixels tall. ab_glyph
+/// scales by `PxScale / hhea_height`, and `hhea_height` cancels it.
 fn em_scale(px: f32, units_per_em: f32, hhea_height: f32) -> PxScale {
     PxScale::from(px * hhea_height / units_per_em)
 }
@@ -688,25 +555,20 @@ fn scale_of(font: &FontVec, px: f32) -> PxScale {
     em_scale(px, font.units_per_em().unwrap_or(height), height)
 }
 
-/// `hhea` and `head` out of a font file, in ems.
-///
-/// Both are small tables at offsets the table directory names, so this reads the
-/// 12-byte offset table, the directory, and twenty bytes — never the outlines,
-/// which are all but a rounding error of the file.
-///
-/// The numbers are fractions of the em, so a face's ascent on screen is
+/// `hhea` and `head` out of a font file, in ems: the 12-byte offset table, the
+/// directory, and twenty bytes. A face's ascent on screen is
 /// `Vertical::ascent * px`.
 fn vertical_of(path: &str) -> Option<Vertical> {
     vertical_in(&mut std::fs::File::open(path).ok()?)
 }
 
-/// The parse itself, over anything seekable, so it is tested against a font
-/// built byte by byte rather than against files this machine does not have.
+/// The parse itself, over anything seekable: the tests build a font byte by
+/// byte.
 fn vertical_in(file: &mut (impl std::io::Read + std::io::Seek)) -> Option<Vertical> {
     let mut header = [0u8; 12];
     file.read_exact(&mut header).ok()?;
-    // A font collection has a different header and would give a nonsense table
-    // count. Nothing on this device is one; declining is better than guessing.
+    // A font collection has a different header and a nonsense table count.
+    // Nothing on this device is one.
     if !matches!(&header[0..4], [0x00, 0x01, 0x00, 0x00] | b"true" | b"OTTO") {
         return None;
     }
@@ -769,18 +631,14 @@ pub struct Fonts {
     centres: HashMap<(u8, char), f32>,
     /// Which convention the Han slots are currently loaded for.
     region: Region,
-    /// Which family each group is set to. Held here rather than beside the
-    /// editor's other settings so that the faces in the slots and the names the
-    /// panel shows cannot disagree.
+    /// Which family each group is set to. Held beside the slots it points at,
+    /// which keeps the faces loaded and the names the panel shows in step.
     choices: Choices,
 }
 
 impl Fonts {
-    /// Prepare the chain. Nothing is read yet.
-    ///
-    /// Fails only when no face is present at all, which means the firmware is
-    /// not what this was built against. A single missing face is not a reason
-    /// to refuse to start: the chain falls through and the text still draws.
+    /// Prepare the chain. Nothing is read yet. Fails only where no face is
+    /// present at all; a single missing face falls through the chain.
     pub fn load(choices: Choices) -> Result<Self> {
         let region = Region::default();
         let slots: Vec<Slot> = role_slots(choices)
@@ -808,18 +666,9 @@ impl Fonts {
         family(group, self.choices.get(group))
     }
 
-    /// Draw a group in another family from here on.
-    ///
-    /// **The old face is dropped and its cached widths go with it.** A slot
-    /// keeps its index for the life of the process and the advance cache is
-    /// keyed on that index, so leaving the entries behind would measure the new
-    /// face with the old one's widths — text laid out to a metric nothing on
-    /// screen has. Assigning a fresh [`Slot`] also releases the `FontVec`, which
-    /// for a Han face is some 10 MB, and leaves the vertical metrics unread so
-    /// the row is re-measured against what will actually draw in it.
-    ///
-    /// Nothing repaints here. The caller has to lay the page out again, because
-    /// two families are not the same height and every row moves.
+    /// Draw a group in another family from here on. A fresh [`Slot`] releases
+    /// the `FontVec`, drops the cached widths keyed on its index, and leaves
+    /// the metrics unread. Nothing repaints; the caller lays the page out.
     pub fn set_family(&mut self, group: Group, chosen: usize) {
         self.choices.set(group, chosen);
         for &role in group.roles() {
@@ -834,21 +683,9 @@ impl Fonts {
         }
     }
 
-    /// Prefer another regional convention for Han from here on.
-    ///
-    /// **This changes which face is tried first, and nothing else.** The other
-    /// conventions stay in the chain behind it, because a document is not
-    /// written in one of them: a draft that mixes 简体, 繁體 and 日本語 needs
-    /// all three repertoires available at once, and the three faces do not
-    /// cover the same characters. The Japanese face is built to a JIS
-    /// repertoire and has no 说 or 这; STHeitiTC has no Simplified forms.
-    /// Swapping the faces on a language switch therefore did not re-cut those
-    /// characters — it dropped them, and they stayed dropped after switching
-    /// back to English, because a Latin language leaves the convention alone.
-    ///
-    /// Each `(role, region)` pair owns its slot for the life of the process, so
-    /// the advance cache stays valid: a cached width belongs to the face that
-    /// measured it rather than to whatever is loaded in that position now.
+    /// Prefer another regional convention for Han from here on. The other
+    /// conventions stay in the chain behind it, and each `(role, region)` pair
+    /// owns its slot for the life of the process.
     pub fn set_region(&mut self, region: Region) {
         self.region = region;
     }
@@ -858,9 +695,8 @@ impl Fonts {
         self.region
     }
 
-    /// Faces this device actually has, in chain order. Worth logging at
-    /// startup: a firmware that moved a face otherwise shows up only as text
-    /// that draws in the wrong style.
+    /// Faces this device actually has, in chain order. Logged at startup: a
+    /// firmware that moved a face shows up as text in the wrong style.
     pub fn present(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.slots
             .iter()
@@ -868,8 +704,8 @@ impl Fonts {
             .filter(|p| Path::new(p).is_file())
     }
 
-    /// The slot that draws `ch` for `role`: the role's own face if it has the
-    /// glyph, otherwise down the fallback chain. `None` when nothing has it.
+    /// The slot that draws `ch` for `role`: the role's own face where it has
+    /// the glyph, then down the fallback chain. `None` when nothing has it.
     fn resolve(&mut self, role: Role, ch: char) -> Option<usize> {
         let n = self.slots.len();
         let mut order = chain_of(role, self.region)
@@ -883,10 +719,8 @@ impl Fonts {
         })
     }
 
-    /// How far the pen moves after drawing `ch` at `px`.
-    ///
-    /// A character no face has measures zero rather than reserving space for a
-    /// box that will not be drawn.
+    /// How far the pen moves after drawing `ch` at `px`. A character no face
+    /// has measures zero.
     fn advance_px(&mut self, role: Role, px: f32, ch: char) -> f32 {
         if karyll_core::script::is_invisible(ch) {
             return 0.0;
@@ -913,37 +747,9 @@ impl Fonts {
         advance
     }
 
-    /// The box a row occupies at `px`, as `(ascent, height)`, from the
-    /// **extremes across every face the row can hold**.
-    ///
-    /// **A row must contain everything drawn in it.** Amazon Ember's ascent is
-    /// shorter than a Han glyph is tall, so a row measured from the Latin face
-    /// alone puts CJK several pixels above its own top edge — outside the
-    /// rectangle that repaints it, inside the one above it, and sitting high
-    /// against the Latin on the same line. Ascent is therefore the largest of
-    /// the faces', descent the lowest, and the height spans both: the two can
-    /// come from different faces, and adding the extremes is what makes the box
-    /// hold either.
-    ///
-    /// Rows stay uniform across the page, which is the point of asking about a
-    /// set of roles rather than one line's. The row's own Latin role is always
-    /// in that set, so a row holding only Han keeps the height it has.
-    ///
-    /// **That anchor is [`Role::Chrome`] for a panel and [`Role::Body`] for a
-    /// page**, and mixing them would put the document's face back into the
-    /// panel's arithmetic — a settings row that grew and shrank as the writer
-    /// tried faces on, which is the coupling the chrome slots exist to cut.
-    ///
-    /// **The whole chain is measured, not the selected convention's face**, and
-    /// the fallbacks with it: `resolve` may reach any of them, and a face that
-    /// can be drawn has to be one the row was sized for. It also makes the row a
-    /// property of the *document* rather than of the language button — measuring
-    /// only the selected convention moved the line spacing every time the button
-    /// was pressed, since STHeiti and TBGothic are not the same height.
-    ///
-    /// Nothing here loads a face. [`Slot::vertical`] reads two tables, so a row
-    /// can be measured against all three conventions for a few dozen bytes
-    /// rather than 30 MB.
+    /// The box a row occupies at `px`, as `(ascent, height)`, taken across
+    /// every face `roles` can reach: the largest ascent, the lowest descent.
+    /// [`Slot::vertical`] reads two tables, not a face.
     fn row_box(&mut self, px: f32, roles: &[Role]) -> (f32, f32) {
         let mut ascent = f32::MIN;
         let mut descent = f32::MAX;
@@ -976,28 +782,15 @@ impl Fonts {
         }
         if ascent == f32::MIN {
             // No face readable at all — the development machine, or a device
-            // missing the file. Enough to lay out with rather than a panic.
+            // missing the file. Enough to lay out with.
             return (px, px * 1.2);
         }
         (ascent, ascent - descent + gap)
     }
 
     /// Rasterise `ch` and hand each covered pixel to `emit` as
-    /// `(dx, dy, coverage)`, **offset from the pen position on the baseline**.
-    ///
-    /// The offsets are signed, and that is the point: `dy` is negative for the
-    /// part of a glyph above the baseline, which is most of it. ab_glyph reports
-    /// coverage relative to the glyph's own bounding box, so the box origin has
-    /// to be added back — without it every glyph is placed by the top of its own
-    /// bitmap rather than by the baseline, and a word comes out with its short
-    /// letters sitting lower than its tall ones.
-    ///
-    /// Coverage is passed through rather than thresholded here — where the cut
-    /// falls is the renderer's decision, and syntax marks dither instead of
-    /// cutting.
-    /// How far a face moves its CJK ink to bring its centre onto
-    /// [`CJK_CENTRE`], in ems. Zero for a Latin role, which sits on the
-    /// baseline.
+    /// `(dx, dy, coverage)`, offset from the pen on the baseline. `dy` is
+    /// negative above it, and coverage is passed through unthresholded.
     fn centring(&mut self, face: usize, role: Role) -> f32 {
         if !(role.is_han() || role.is_hangul()) {
             return 0.0;
@@ -1096,11 +889,8 @@ const CENTRING_PX: f32 = 512.0;
 const CJK_INK: (f32, f32) = (0.842, 0.132);
 
 /// Metrics with no font behind them: every character ten units wide, so a test
-/// can say exactly where it expects a caret or a box edge to land.
-///
-/// Here rather than in one module's tests because both the page and the panels
-/// measure text, and two copies of a stub is two stubs that can disagree about
-/// what a Han row costs — which is the one thing it exists to model.
+/// can say exactly where it expects a caret or a box edge to land. Both the
+/// page and the panels measure text, and both reach this one.
 #[cfg(test)]
 pub struct Stub;
 
@@ -1139,18 +929,9 @@ impl Metrics for Stub {
     }
 }
 
-/// Metrics in the proportions the real faces have: a CJK glyph is one em wide
-/// and a Latin one about half.
-///
-/// [`Stub`]'s flat ten units are easier to check arithmetic against, and they
-/// say nothing at all about how wide CJK draws — a Han character and a comma
-/// cost the same there. Anything asking whether text *fits* has to know the
-/// difference, because the answer is where every fitting bug comes from: ten
-/// four-character candidates want more than a 7″ panel is wide and less than a
-/// 10.2″ one is, and a stub that measures them alike sees neither case.
-///
-/// **Half an em is a stress figure for the panels**, which are set in Amazon
-/// Ember at about 0.37 em. The iA faces set on a 0.6 em base.
+/// Metrics in the proportions the real faces have: a CJK glyph one em wide, a
+/// Latin one about half. Amazon Ember sets at about 0.37 em and the iA faces
+/// on a 0.6 em base, so half an em is a stress figure for the panels.
 #[cfg(test)]
 pub struct Proportional;
 
@@ -1214,8 +995,7 @@ mod tests {
                 let slot = slot_of(role, region);
                 assert!(slot < FALLBACK_AT, "{role:?} is past the fallbacks");
                 // A Latin role is one slot across all three conventions; a Han
-                // role is three. The advance cache is keyed on this index, so a
-                // collision would measure one face with another's widths.
+                // role is three. The advance cache is keyed on this index.
                 if role.is_han() {
                     assert!(taken.insert(slot), "{role:?}/{region:?} shares a slot");
                 }
@@ -1230,9 +1010,8 @@ mod tests {
         assert!(own.iter().all(|i| !taken.contains(i)));
     }
 
-    /// Chrome draws from its own slots, and nothing the writer can set reaches
-    /// them. A chrome role sharing the body's slot would restyle the whole app
-    /// the moment a document face was picked.
+    /// Chrome draws from its own slots, and no setting reaches them. A chrome
+    /// role sharing the body's slot restyles the app on every document face.
     #[test]
     fn chrome_is_pinned_and_no_setting_can_move_it() {
         for (at, role) in CHROME_ROLES.into_iter().enumerate() {
@@ -1293,10 +1072,8 @@ mod tests {
         }
     }
 
-    /// **Changing family or convention does not move the ink.** The CJK faces
-    /// centre 中 and 한 anywhere between 0.348 and 0.413 of an em above the
-    /// baseline; [`Fonts::centring`] brings every one onto [`CJK_CENTRE`].
-    ///
+    /// The CJK faces centre 中 and 한 between 0.348 and 0.413 of an em above
+    /// the baseline; [`Fonts::centring`] brings every one onto [`CJK_CENTRE`].
     /// The centres are read from the faces, one per entry in [`families`].
     #[test]
     fn every_cjk_family_puts_its_ink_at_one_height() {
@@ -1379,8 +1156,8 @@ mod tests {
         );
         assert_eq!(got.gap, 0.05);
 
-        // 2048 units per em is as common as 1000, and reading it from `head`
-        // rather than assuming is the whole reason that table is opened.
+        // 2048 units per em is as common as 1000. `head` carries the number,
+        // which is what opens that table.
         let font = synthetic(2048, 1024, -512, 0);
         let got = vertical_in(&mut std::io::Cursor::new(font)).expect("a parseable font");
         assert_eq!(got.ascent, 0.5);
@@ -1427,9 +1204,8 @@ mod tests {
     }
 
     /// The row is a property of the document, not of the language button.
-    /// Measuring only the selected convention moved the line spacing every time
-    /// the button was pressed, because STHeiti and TBGothic are not the same
-    /// height — so 简体 and 繁體 set wider than 日本語, English and German.
+    /// STHeiti and TBGothic are not the same height, and the row takes the
+    /// tallest whichever convention is selected.
     #[test]
     fn the_row_is_the_same_height_in_every_convention() {
         let Ok(mut fonts) = Fonts::load(Choices::default()) else {
@@ -1476,10 +1252,9 @@ mod tests {
         }
     }
 
-    /// **A CJK family is one design at two weights**, because emphasis is a
-    /// mark against the character rather than a second face — an entry that
-    /// reached outside its own design for the bold would set a bold word in a
-    /// family the writer did not choose.
+    /// A CJK family is one design at two weights. Emphasis is a mark against
+    /// the character, and an entry reaching outside its own design for the bold
+    /// sets a bold word in a family [`Choices`] never named.
     #[test]
     fn a_cjk_family_is_one_design_bodied_and_bolded() {
         for (group, _, family) in all_families() {
@@ -1512,12 +1287,8 @@ mod tests {
     }
 
     /// Traditional Chinese and Japanese must not be drawn from the Simplified
-    /// faces. Han unification gives them the same code points, so the failure
-    /// is not a missing glyph — it is the wrong glyph, silently, which is the
-    /// kind of bug that survives a screenshot.
-    /// Not just the defaults: no convention may reach another's faces through
-    /// *any* entry on its list, or picking 楷體 would be a way to have
-    /// Traditional set in Simplified glyphs.
+    /// faces: Han unification gives them the same code points, and the failure
+    /// is the wrong glyph. No entry on a list may reach another's faces.
     #[test]
     fn each_convention_gets_its_own_han_faces() {
         let faces = |group| -> std::collections::HashSet<&str> {
@@ -1543,7 +1314,7 @@ mod tests {
 
     /// Every group has something to offer, which [`family`] indexes into
     /// without checking, and every entry supplies exactly the roles its group
-    /// covers — a short list would draw one role from another's face.
+    /// covers.
     #[test]
     fn every_group_has_families_and_every_family_is_complete() {
         for group in GROUPS {
@@ -1559,9 +1330,8 @@ mod tests {
         }
     }
 
-    /// Names are the key a choice is stored under, so two entries sharing one
-    /// in a group would make the setting ambiguous. Across groups is fine and
-    /// happens: 黑体 and 黑體 are the same family in two conventions.
+    /// Names are the key a choice is stored under, and one group holds each
+    /// once. Across groups they repeat: 黑体 and 黑體 in two conventions.
     #[test]
     fn family_names_are_unique_within_a_group() {
         for group in GROUPS {
@@ -1609,8 +1379,7 @@ mod tests {
         choices.set(Group::Latin, 1);
         choices.set(Group::Han(Region::Japanese), 2);
         assert_eq!(Choices::parse(&choices.render()), choices);
-        // By name, so inserting a family at the head of a list would not move a
-        // stored choice onto the wrong face.
+        // By name. An index is a position in a list that gets edited.
         assert!(choices.render().contains("latin Mono"));
         assert!(choices.render().contains("ja 筑紫明朝"));
     }
@@ -1641,10 +1410,9 @@ mod tests {
         );
     }
 
-    /// Every face a document can be set in ships with karyll and lives under
-    /// the extension. The chrome does not: the app has to be able to draw
-    /// itself on a device whose storage is away being read over USB, where a
-    /// page falls through to [`FALLBACK`] and the panels stay in Ember.
+    /// Every face a document can be set in ships under the extension. The
+    /// chrome does not: a page falls through to [`FALLBACK`] and the panels
+    /// stay in Ember while the storage is away being read over USB.
     #[test]
     fn the_bundled_families_are_the_ones_karyll_ships() {
         const BUNDLED: &str = "/mnt/us/extensions/karyll/fonts/";
@@ -1657,9 +1425,9 @@ mod tests {
         // Chrome is never bundled: the app has to draw itself on a device whose
         // storage is away being read over USB.
         assert!(CHROME_FACES.iter().all(|p| !p.starts_with(BUNDLED)));
-        // No entry may straddle the two: a family half on the firmware and half
-        // in the extension would survive `available` with /mnt/us unmounted and
-        // then fail to load the half that is gone.
+        // No entry may straddle the two. A family half on the firmware and half
+        // in the extension passes `available` with /mnt/us unmounted, with half
+        // its faces gone.
         for family in LATIN_FAMILIES {
             let bundled = family.faces.iter().filter(|p| p.starts_with(BUNDLED));
             assert!(
@@ -1680,7 +1448,7 @@ mod tests {
         assert_eq!(all, vec![0, 1, 2]);
         assert!(available_by(Group::Latin, |_| false).is_empty());
         // One missing italic is enough: a Latin role has no second face to fall
-        // back to, so emphasis would come out of the pan-Unicode fallback.
+        // back to, and emphasis comes out of the pan-Unicode fallback.
         let no_italic = available_by(Group::Latin, |path| !path.contains("Italic"));
         assert!(!no_italic.contains(&0), "Duo offered without its italic");
     }
@@ -1708,7 +1476,7 @@ mod tests {
 
     /// The advance cache is keyed on the slot index, and a family change is the
     /// one thing that puts a different face in a slot. Left behind, the cached
-    /// widths would lay Mono out to Duo's metrics.
+    /// widths lays Mono out to Duo's metrics.
     #[test]
     fn changing_a_family_drops_the_widths_measured_with_the_old_one() {
         let mut fonts = bare(Choices::default());
@@ -1748,10 +1516,8 @@ mod tests {
         assert!(fonts.slots[chrome].path.contains("Amazon-Ember"));
     }
 
-    /// Every role of the group moves, not only the body: picking 明朝 and
-    /// getting ゴシック back the moment something is emboldened is a half
-    /// applied setting. Emphasis moves *to* the sans, because that is what the
-    /// pairing turns into when the body is the serif.
+    /// Every role of the group moves, not the body alone. Emphasis moves to
+    /// the sans, which is what the pairing turns into under a serif body.
     #[test]
     fn changing_a_family_re_points_every_role_it_covers() {
         let mut fonts = bare(Choices::default());

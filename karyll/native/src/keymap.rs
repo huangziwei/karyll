@@ -7,14 +7,19 @@ pub mod code {
     pub const ESC: u16 = 1;
     pub const BACKSPACE: u16 = 14;
     pub const TAB: u16 = 15;
-    /// `F10`: half-width Latin in every Japanese IME.
+    /// `F10`: half-width Latin in every Japanese IME. `F1`–`F9`, `F11` and
+    /// `F12` are unbound.
     pub const F10: u16 = 68;
     pub const ENTER: u16 = 28;
+    /// The keypad's own Enter, answered wherever [`ENTER`] is.
+    pub const KPENTER: u16 = 96;
     pub const LEFTCTRL: u16 = 29;
     pub const LEFTSHIFT: u16 = 42;
     pub const RIGHTSHIFT: u16 = 54;
     pub const LEFTALT: u16 = 56;
     pub const SPACE: u16 = 57;
+    /// Latched by `Mods::track` on the press, unlatched by the next one.
+    pub const CAPSLOCK: u16 = 58;
     pub const RIGHTCTRL: u16 = 97;
     pub const RIGHTALT: u16 = 100;
     /// The ⌘ / Super keys, accepted by `Mods::chord` alongside Ctrl.
@@ -29,6 +34,11 @@ pub mod code {
     pub const DOWN: u16 = 108;
     pub const PAGEDOWN: u16 = 109;
     pub const DELETE: u16 = 111;
+    /// `KEY_SEARCH`: the magnifier key.
+    pub const SEARCH: u16 = 217;
+    /// The two sun keys.
+    pub const BRIGHTNESSDOWN: u16 = 224;
+    pub const BRIGHTNESSUP: u16 = 225;
     /// `Q` decides whether an input device is a keyboard.
     pub const Q: u16 = 16;
 }
@@ -44,10 +54,13 @@ pub struct Mods {
     pub altgr: bool,
     /// ⌘. `chord` takes it with `ctrl`; `movement` reads the two apart.
     pub meta: bool,
+    /// Caps Lock, latched by `track` and read by `character` for the letters.
+    pub caps: bool,
 }
 
 impl Mods {
-    /// Update on a press or release. `true` when `code` is a modifier.
+    /// Update on a press or release. `true` when `code` is a modifier. `caps`
+    /// latches on the press; the rest follow the key.
     pub fn track(&mut self, code: u16, pressed: bool) -> bool {
         match code {
             code::LEFTSHIFT | code::RIGHTSHIFT => self.shift = pressed,
@@ -55,6 +68,7 @@ impl Mods {
             code::LEFTALT => self.alt = pressed,
             code::RIGHTALT => self.altgr = pressed,
             code::LEFTMETA | code::RIGHTMETA => self.meta = pressed,
+            code::CAPSLOCK => self.caps ^= pressed,
             _ => return false,
         }
         true
@@ -65,6 +79,46 @@ impl Mods {
     /// the two apart and runs ahead of this.
     pub fn chord(self) -> bool {
         self.ctrl || self.meta
+    }
+}
+
+/// Which key beside the space bar carries ⌘. `Mac` sends `KEY_LEFTMETA` from
+/// it and `KEY_LEFTALT` from the key outside; `Pc` sends the two the other
+/// way round.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Convention {
+    #[default]
+    Mac,
+    Pc,
+}
+
+impl Convention {
+    pub fn name(self) -> &'static str {
+        match self {
+            Convention::Mac => "Mac",
+            Convention::Pc => "PC",
+        }
+    }
+
+    /// The `Convention` whose `name` this is. Anything else is `Mac`.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "PC" => Convention::Pc,
+            _ => Convention::Mac,
+        }
+    }
+
+    /// `mods` with ⌘ in `meta` and ⌥ in `alt`, whichever key sent them.
+    /// `altgr` is `KEY_RIGHTALT` under both and holds its place.
+    pub fn resolve(self, mods: Mods) -> Mods {
+        match self {
+            Convention::Mac => mods,
+            Convention::Pc => Mods {
+                alt: mods.meta,
+                meta: mods.alt,
+                ..mods
+            },
+        }
     }
 }
 
@@ -139,6 +193,10 @@ pub enum Action {
     Refresh,
     /// Set the page a size larger or smaller. `Ctrl`/`⌘` + `+` and `-`.
     Resize(bool),
+    /// Set the page back to the size it opens at. `Ctrl`/`⌘` + `0`.
+    ResetSize,
+    /// Take the frontlight one step up or down. The two sun keys.
+    Brightness(bool),
     /// Take the next margin along. `Ctrl`/`⌘` + `M`.
     CycleMargins,
     /// The document list. `Ctrl`/`⌘` + `O`.
@@ -205,7 +263,16 @@ const US: &[Key] = &[
     (43, '\\', '|', None), (44, 'z', 'Z', None),  (45, 'x', 'X', None),
     (46, 'c', 'C', None),  (47, 'v', 'V', None),  (48, 'b', 'B', None),
     (49, 'n', 'N', None),  (50, 'm', 'M', None),  (51, ',', '<', None),
-    (52, '.', '>', None),  (53, '/', '?', None),
+    (52, '.', '>', None),  (53, '/', '?', None),  (86, '\\', '|', None),
+];
+
+/// The numeric keypad, one table for every `Layout`. Read ahead of
+/// [`Layout::table`], carrying the digits NumLock shows.
+#[rustfmt::skip]
+const KEYPAD: &[(u16, char)] = &[
+    (55, '*'), (71, '7'), (72, '8'), (73, '9'), (74, '-'),
+    (75, '4'), (76, '5'), (77, '6'), (78, '+'), (79, '1'),
+    (80, '2'), (81, '3'), (82, '0'), (83, '.'), (98, '/'),
 ];
 
 /// German QWERTZ. Punctuation moves, the umlauts take the `; ' [` positions,
@@ -236,12 +303,18 @@ pub fn character(code: u16, mods: Mods, layout: Layout) -> Option<char> {
     if code == code::SPACE {
         return Some(' ');
     }
+    if let Some((_, key)) = KEYPAD.iter().find(|(c, _)| *c == code) {
+        return Some(*key);
+    }
     let (_, plain, shifted, altgr) = layout.table().iter().find(|(c, ..)| *c == code)?;
     // AltGr outranks shift. Nothing sits at AltGr+shift.
     if mods.altgr {
         return *altgr;
     }
-    Some(if mods.shift { *shifted } else { *plain })
+    // `caps` reaches a key whose upper register is its own capital: `1` stays
+    // `1` and `ß` stays `ß`.
+    let caps = mods.caps && plain.to_uppercase().eq(std::iter::once(*shifted));
+    Some(if mods.shift != caps { *shifted } else { *plain })
 }
 
 /// How far a movement key travels.
@@ -311,10 +384,9 @@ fn movement(code: u16, mods: Mods) -> Option<Action> {
     })
 }
 
-/// What a key press means. `None` for a key with no binding.
-///
-/// `movement` resolves first, then `chord`, then the named keys, then
-/// `character`. `alt` alone binds nothing.
+/// What a key press means. `None` for a key with no binding. `movement`
+/// resolves first, then `chord`, then the named keys, then `character`.
+/// `alt` alone binds nothing.
 pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
     // Ahead of `chord()`, which flattens `ctrl` and `meta` together.
     if let Some(action) = movement(code, mods) {
@@ -326,17 +398,19 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
             return mods.ctrl.then_some(Action::CycleLanguage);
         }
         // The replace bar's two commands, ahead of `character`.
-        if code == code::ENTER {
+        if code == code::ENTER || code == code::KPENTER {
             return Some(if mods.shift {
                 Action::ChangeAll
             } else {
                 Action::Change
             });
         }
+        // Every arm below is written unshifted and unlatched.
         return match character(
             code,
             Mods {
                 shift: false,
+                caps: false,
                 ..mods
             },
             layout,
@@ -354,8 +428,6 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
             Some('d') => Some(Action::ToggleFocus),
             Some('f') if mods.shift => Some(Action::Replace),
             Some('f') => Some(Action::Find),
-            // This arm resolves the code with shift forced off, so every
-            // binding here is unshifted and in one place on both layouts.
             // The shifted arm comes first.
             Some('h') if mods.shift => Some(Action::Emphasis("==")),
             Some('h') => Some(Action::Help),
@@ -365,6 +437,8 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
             // QWERTZ, and the key that enlarges is `=` on one, `+` on the other.
             Some('-') => Some(Action::Resize(false)),
             Some('=' | '+') => Some(Action::Resize(true)),
+            // The digit beside them, and the one the heading levels leave.
+            Some('0') => Some(Action::ResetSize),
             // Three margins, cycled from one key.
             Some('m') => Some(Action::CycleMargins),
             // Open a document, and — shifted — a place inside the open one.
@@ -384,10 +458,13 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
     match code {
         code::ESC => Some(Action::Escape),
         code::F10 => Some(Action::CommitTyped),
+        code::SEARCH => Some(Action::Find),
+        code::BRIGHTNESSDOWN => Some(Action::Brightness(false)),
+        code::BRIGHTNESSUP => Some(Action::Brightness(true)),
         // `Enter` commits the composition as it stands; `Shift`+`Enter` commits
         // the letters struck. Outside a composition, a line break.
-        code::ENTER if mods.shift => Some(Action::CommitTyped),
-        code::ENTER => Some(Action::Newline),
+        code::ENTER | code::KPENTER if mods.shift => Some(Action::CommitTyped),
+        code::ENTER | code::KPENTER => Some(Action::Newline),
         code::PAGEUP => Some(Action::PageUp),
         code::PAGEDOWN => Some(Action::PageDown),
         code::TAB => Some(Action::Indent),
@@ -823,6 +900,185 @@ mod tests {
         assert_eq!(action(30, alt, Layout::Us), Some(Action::Insert('a')));
     }
 
+    /// `caps` latches on the press and the release leaves it.
+    #[test]
+    fn caps_lock_latches_and_the_next_press_lets_it_go() {
+        let mut mods = Mods::default();
+        assert!(mods.track(code::CAPSLOCK, true));
+        assert!(mods.caps);
+        assert!(mods.track(code::CAPSLOCK, false));
+        assert!(mods.caps);
+        assert!(mods.track(code::CAPSLOCK, true));
+        assert!(!mods.caps);
+    }
+
+    #[test]
+    fn caps_lock_reaches_the_letters_and_leaves_the_rest_alone() {
+        let caps = Mods {
+            caps: true,
+            ..Mods::default()
+        };
+        let both = Mods {
+            shift: true,
+            ..caps
+        };
+        for layout in [Layout::Us, Layout::German] {
+            assert_eq!(character(30, caps, layout), Some('A'));
+            // `shift` and `caps` together cancel.
+            assert_eq!(character(30, both, layout), Some('a'));
+            // A digit under Caps Lock is the digit.
+            assert_eq!(character(2, caps, layout), Some('1'));
+        }
+        // `ß` capitalises to two letters, and stays itself.
+        assert_eq!(character(12, caps, Layout::German), Some('ß'));
+        assert_eq!(character(26, caps, Layout::German), Some('Ü'));
+    }
+
+    /// `caps` left on does not shift a chord.
+    #[test]
+    fn a_chord_under_caps_lock_is_the_chord_it_is_under_neither() {
+        let caps = Mods {
+            caps: true,
+            ctrl: true,
+            ..Mods::default()
+        };
+        assert_eq!(action(31, caps, Layout::Us), Some(Action::Save));
+        assert_eq!(action(24, caps, Layout::Us), Some(Action::Files));
+    }
+
+    /// `KEYPAD` answers the same on every `Layout`.
+    #[test]
+    fn the_numeric_keypad_types_its_own_legends() {
+        for layout in [Layout::Us, Layout::German] {
+            for (code, key) in [
+                (55u16, '*'),
+                (71, '7'),
+                (74, '-'),
+                (78, '+'),
+                (82, '0'),
+                (83, '.'),
+                (98, '/'),
+            ] {
+                assert_eq!(
+                    action(code, plain(), layout),
+                    Some(Action::Insert(key)),
+                    "code {code} on {}",
+                    layout.name()
+                );
+            }
+            // `shift` and `caps` leave `KEYPAD` alone.
+            assert_eq!(action(79, shift(), layout), Some(Action::Insert('1')));
+        }
+    }
+
+    #[test]
+    fn the_keypads_enter_is_enter() {
+        assert_eq!(
+            action(code::KPENTER, plain(), Layout::Us),
+            Some(Action::Newline)
+        );
+        assert_eq!(
+            action(code::KPENTER, shift(), Layout::Us),
+            Some(Action::CommitTyped)
+        );
+        assert_eq!(
+            action(code::KPENTER, ctrl(), Layout::Us),
+            Some(Action::Change)
+        );
+    }
+
+    #[test]
+    fn the_magnifier_opens_find() {
+        assert_eq!(
+            action(code::SEARCH, plain(), Layout::Us),
+            Some(Action::Find)
+        );
+    }
+
+    /// The digit `Heading` leaves, beside the two that step the size.
+    #[test]
+    fn the_zero_key_sets_the_type_back() {
+        for layout in [Layout::Us, Layout::German] {
+            for mods in [ctrl(), meta()] {
+                assert_eq!(action(11, mods, layout), Some(Action::ResetSize));
+            }
+            assert_eq!(action(11, plain(), layout), Some(Action::Insert('0')));
+        }
+    }
+
+    /// `Mac` and `Pc` reach the same three bindings from the key against the
+    /// space bar.
+    #[test]
+    fn the_key_beside_the_space_bar_reaches_the_same_bindings_either_way() {
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        for (beside, outside, convention) in [
+            (meta(), alt, Convention::Mac),
+            (alt, meta(), Convention::Pc),
+        ] {
+            let beside = convention.resolve(beside);
+            let outside = convention.resolve(outside);
+            let at = convention.name();
+            // Save, off the key against the space bar.
+            assert_eq!(action(31, beside, Layout::Us), Some(Action::Save), "{at}");
+            // The line grain there, the word grain outside it.
+            assert_eq!(
+                action(code::LEFT, beside, Layout::Us),
+                Some(Action::LineStart),
+                "{at}"
+            );
+            assert_eq!(
+                action(code::LEFT, outside, Layout::Us),
+                Some(Action::WordLeft),
+                "{at}"
+            );
+        }
+    }
+
+    /// `resolve` leaves `altgr` where it arrived under both.
+    #[test]
+    fn the_third_legend_survives_the_swap() {
+        let altgr = Mods {
+            altgr: true,
+            ..Mods::default()
+        };
+        for convention in [Convention::Mac, Convention::Pc] {
+            let mods = convention.resolve(altgr);
+            assert!(mods.altgr, "{}", convention.name());
+            assert!(!mods.alt && !mods.meta, "{}", convention.name());
+            assert_eq!(
+                action(16, mods, Layout::German),
+                Some(Action::Insert('@')),
+                "{}",
+                convention.name()
+            );
+        }
+    }
+
+    /// `resolve` leaves `ctrl` alone under both.
+    #[test]
+    fn control_reaches_config_under_either_convention() {
+        for convention in [Convention::Mac, Convention::Pc] {
+            let mods = convention.resolve(ctrl());
+            assert_eq!(
+                action(51, mods, Layout::Us),
+                Some(Action::Config),
+                "{}",
+                convention.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_convention_survives_the_round_trip_through_its_name() {
+        for convention in [Convention::Mac, Convention::Pc] {
+            assert_eq!(Convention::from_name(convention.name()), convention);
+        }
+        assert_eq!(Convention::from_name(""), Convention::Mac);
+    }
+
     #[test]
     fn every_layout_code_is_listed_once() {
         for layout in [Layout::Us, Layout::German] {
@@ -884,12 +1140,13 @@ mod tests {
         }
 
         /// Code 86, the key beside the left shift, carries `<`, `>` and `|` on
-        /// `German` and nothing on `Us`.
+        /// `German`. An ISO board reading `Us` finds `\` and `|` there.
         #[test]
         fn the_key_us_boards_lack_is_bound() {
             assert_eq!(character(86, plain(), Layout::German), Some('<'));
             assert_eq!(character(86, shift(), Layout::German), Some('>'));
-            assert_eq!(character(86, plain(), Layout::Us), None);
+            assert_eq!(character(86, plain(), Layout::Us), Some('\\'));
+            assert_eq!(character(86, shift(), Layout::Us), Some('|'));
         }
 
         /// Punctuation moves position and arrives as the same character, which

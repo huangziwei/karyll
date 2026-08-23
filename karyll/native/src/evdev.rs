@@ -137,13 +137,23 @@ fn blocks(raw: &str) -> Vec<Block> {
     out
 }
 
-/// Choose the keyboard, returning its `eventN` handler. A device advertising
-/// `code::Q` is a keyboard; `WacomDigitizer`, `stylus-custom` and the power
-/// key carry `EV_KEY` for a handful of buttons and fail it.
+/// How many keys a `B: KEY=` bitmap sets.
+fn key_count(bitmap: &str) -> u32 {
+    bitmap
+        .split_whitespace()
+        .filter_map(|word| u32::from_str_radix(word, 16).ok())
+        .map(u32::count_ones)
+        .sum()
+}
+
+/// Choose the keyboard, returning its `eventN` handler. `code::Q` filters:
+/// `WacomDigitizer`, `stylus-custom` and the power key fail it. Of those left,
+/// the highest [`key_count`] wins, and equal counts take the earliest.
 fn pick_keyboard(raw: &str) -> Option<String> {
     blocks(raw)
         .into_iter()
-        .find(|b| advertises(&b.keys, code::Q))
+        .filter(|b| advertises(&b.keys, code::Q))
+        .min_by_key(|b| std::cmp::Reverse(key_count(&b.keys)))
         .and_then(|b| b.handler)
 }
 
@@ -467,6 +477,37 @@ B: KEY=3ffffff fffffffc
     #[test]
     fn a_device_with_no_accelerometer_reports_none() {
         assert_eq!(pick_accelerometer(COLORSOFT), None);
+    }
+
+    /// A second node from the same keyboard, with `keys` for its `B: KEY=`.
+    fn also_on_event6(keys: &str) -> String {
+        format!(
+            "{CAPTURE}I: Bus=0005 Vendor=1234 Product=5678 Version=0001\n\
+             N: Name=\"test keyboard, second node\"\n\
+             H: Handlers=event6 perfmgr\n\
+             B: PROP=0\n\
+             B: EV=3\n\
+             B: KEY={keys}\n\n"
+        )
+    }
+
+    /// A keyboard registering more than one node: `event5` carries the letters,
+    /// `event6` five keys that reach as far as `code::Q`.
+    #[test]
+    fn the_node_with_the_most_keys_wins() {
+        assert!(advertises("1f0000", code::Q));
+        assert_eq!(key_count("1f0000"), 5);
+        assert_eq!(
+            pick_keyboard(&also_on_event6("1f0000")).as_deref(),
+            Some("event5")
+        );
+    }
+
+    /// `blocks` order decides between equal counts.
+    #[test]
+    fn two_nodes_advertising_as_many_keys_take_the_earlier() {
+        let both = also_on_event6("3ffffff fffffffc");
+        assert_eq!(pick_keyboard(&both).as_deref(), Some("event5"));
     }
 
     #[test]

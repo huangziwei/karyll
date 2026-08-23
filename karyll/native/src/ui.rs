@@ -235,9 +235,8 @@ const CHIP_PAD: u16 = 24;
 const CHIP_GAP: u16 = 20;
 
 /// Where the second column starts on every row — chips, swatches and details
-/// alike. Taken from the widest label, pulled back far enough that the widest
-/// second column finishes inside the right margin, and held between a third
-/// and half the line. Past half, [`elided`] cuts the label.
+/// alike. Taken from the widest label, pulled back until the widest second
+/// column fits, and held between `width / 3` and `width / 2`.
 pub fn chip_column(items: &[Item], width: u16, mut measure_text: impl FnMut(&str) -> u16) -> u16 {
     let widest = items
         .iter()
@@ -376,13 +375,9 @@ pub fn elided(text: &str, room: u16, mut measure_text: impl FnMut(&str) -> u16) 
     kept
 }
 
-/// Where each chip of one choice row sits, in window x.
-///
-/// **The single source for drawing, hit-testing and press feedback**, for the
-/// reason [`cell_bounds`] is: a chip is only as wide as its own text, so
-/// drawing and hit-testing both measure through it. A chip past the right
-/// margin is dropped, the rule [`candidate_pages`] follows. A row too narrow
-/// for [`chip_column`] starts its chips just past its own label.
+/// Where each chip of one choice row sits, in window x. Drawing, hit-testing
+/// and press feedback all measure through this. A chip past the right margin
+/// is dropped; a row too narrow for [`chip_column`] starts past its own label.
 pub fn chip_bounds(
     column: u16,
     width: u16,
@@ -923,11 +918,8 @@ const CELL_PAD_MIN: u16 = 8;
 const CELL_PAD: u16 = 26;
 
 /// Where each cell starts and how wide it is, in window x. Every cell is its
-/// own text's width, packed from the left. `stretch` names the cells that
-/// absorb the remainder, in equal shares; empty leaves it to the status line.
-/// Cells are dropped when the width runs out, so drawing, hit-testing and
-/// press feedback all measure through this. `measure_text` supplies a label's
-/// drawn width, which makes the packing testable against a stub metric.
+/// own text's width, packed from the left. `stretch` names the cells sharing
+/// the remainder; empty leaves it to the status line.
 pub fn cell_bounds(
     width: u16,
     cells: &[String],
@@ -982,8 +974,7 @@ fn fitted(label: &str, pad: u16, measure_text: &mut impl FnMut(&str) -> u16) -> 
 
 /// The blank this strip can afford either side of each cell: [`CELL_PAD`] where
 /// the words fit with it, down to [`CELL_PAD_MIN`] where they do not, one value
-/// across the whole strip. `text` holds the fixed cells' text alone; a stretch
-/// cell counts towards `cells` and claims [`FIELD_MIN`] ahead of the slack.
+/// across the whole strip. A stretch cell claims [`FIELD_MIN`] of the slack.
 fn cell_pad(width: u16, text: u16, cells: usize, elastic: usize) -> u16 {
     let wanted = text.saturating_add(FIELD_MIN * elastic as u16);
     let each = width.saturating_sub(wanted) / (2 * cells.max(1)) as u16;
@@ -1039,9 +1030,8 @@ pub fn cell_at(bounds: &[(u16, u16)], x: u16) -> Option<usize> {
 }
 
 /// Draw cells along the bottom, with the text given. The action strip and the
-/// find bar are both this, differing in what their cells say and which of them
-/// is elastic. The rule runs the full width and no rules sit between cells;
-/// `status` is right-aligned and quiet in the other end of the same band.
+/// find bar are both this. The rule runs the full width, no rules sit between
+/// cells, and `status` is right-aligned and quiet in the same band.
 pub fn paint_cells(
     window: &mut Window,
     fonts: &mut Fonts,
@@ -1274,10 +1264,8 @@ pub fn draw_line(
 }
 
 /// Where the candidate box goes, or `None` with nothing to choose from and no
-/// room for it. `anchor` is whatever is being typed into — the caret on the
-/// page, the find bar's field, the status line a filename goes into — given as
-/// a rectangle and a type size. `bottom` is the last row it may occupy. The
-/// damage rectangle is taken from here ahead of any painting.
+/// room for it. `anchor` is the caret, the find field or the status line, as a
+/// rectangle and a type size; `bottom` is the last row it may occupy.
 pub fn overlay_rect(
     surface_width: u16,
     fonts: &mut impl Metrics,
@@ -1391,10 +1379,8 @@ pub fn overlay_cells(
 }
 
 /// Where each page of candidates starts, given what the panel can hold. A page
-/// is as many as fit, at most `most`; the number row picks ten. The starts are
-/// worked out for the whole list at once, and drawing, tapping and the number
-/// row all read the page from here. Empty for no candidates; a candidate wider
-/// than the panel takes a page to itself.
+/// is as many as fit, at most `most`. Empty for no candidates; a candidate
+/// wider than the panel takes a page to itself.
 pub fn candidate_pages(
     fonts: &mut impl Metrics,
     surface_width: u16,
@@ -2359,12 +2345,9 @@ mod tests {
     const WIDE: u16 = 1860;
     const NARROW: u16 = 1272;
 
-    /// **Every setting has to be on the page**, at every panel width. A chip
-    /// past the right margin is dropped, which for a Bluetooth keyboard's own
-    /// name is the least bad answer and for karyll's own settings is a control
-    /// the writer cannot reach at all. The type sizes are the row that comes
-    /// closest: seven chips, and the widest label on the page pushes them as
-    /// far right as the column is allowed to go.
+    /// **Every setting is on the page**, at every panel width. A chip past the
+    /// right margin is dropped. The type sizes are the closest row: seven
+    /// chips, under the widest label on the page.
     #[test]
     fn no_setting_falls_off_a_narrow_panel() {
         let sizes: Vec<String> = crate::render::SIZES
@@ -2408,10 +2391,9 @@ mod tests {
         vec!["候".repeat(chars); count]
     }
 
-    /// **Ten is what the number row can pick, not what the panel can show.**
-    /// Ten three-character candidates are 1520 px of box — inside a 10.2″
-    /// panel and past a 7″ one — so the smaller panel pages them and the
-    /// larger one does not.
+    /// Ten is what the number row picks, not what the panel shows. Ten
+    /// three-character candidates are 1520 px of box: inside a 10.2″ panel and
+    /// past a 7″ one.
     #[test]
     fn a_bar_too_wide_for_the_panel_is_paged_rather_than_cut_off() {
         let list = candidates(10, 3);
@@ -2437,11 +2419,9 @@ mod tests {
         );
     }
 
-    /// **The invariant the paging exists for**: everything on a page is inside
-    /// the box that page is drawn in. [`overlay_rect`] clamps the box to the
-    /// panel and [`overlay_cells`] lays the candidates out, and the two have to
-    /// agree — a candidate past the box's edge is drawn off the screen while
-    /// the number row goes on picking it.
+    /// Everything on a page is inside the box that page is drawn in.
+    /// [`overlay_rect`] clamps the box to the panel, [`overlay_cells`] lays the
+    /// candidates out, and the two have to agree.
     #[test]
     fn every_candidate_on_a_page_is_inside_its_box() {
         for panel in [WIDE, NARROW] {

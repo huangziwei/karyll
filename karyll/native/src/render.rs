@@ -1,33 +1,6 @@
-//! Laying a document out and drawing it.
-//!
-//! Markdown source is shown styled, never previewed: the markers stay on screen
-//! and are drawn quiet. Prose is thresholded to one bit because the panel's
-//! partial waveform is two-level and an antialiased glyph comes out muddy.
-//!
-//! Syntax marks are drawn in a **flat grey** ([`crate::window::QUIET`]) rather
-//! than black, and never as a dither — see that constant for why a checkerboard
-//! does not read as grey on this panel.
-//!
-//! A selected run inverts — filled black, glyphs drawn white — which is what
-//! one bit has instead of a tint.
-//!
-//! **Han emphasis is a mark rather than a slant or a second face.** A dot sits
-//! against each character of an emphasised Han run — under it in Chinese, over
-//! it in Japanese — and the face stays where it is, so one sentence can set
-//! これ with dots and *difficult* in a real italic. The dot is drawn here
-//! rather than taken from a face: the firmware faces carry no sesame glyph, and
-//! a filled dot is the most legible thing a one-bit panel can put on a page.
-//!
-//! **Every block starts its prose on one vertical line.** A `#`, a `>` or a
-//! `- ` is set right-aligned to end on that edge and reaches back into the
-//! *margin*, never into the text column — so the column keeps its full measure,
-//! nothing reflows when a marker is typed, and a wrapped list item continues
-//! under its own first word. See [`Marker`] and [`Lead`] for the three forms a
-//! marker takes and what decides between them.
-//!
-//! Layout runs per logical line. Each one is wrapped with real advances from
-//! the faces that will actually draw it, so the measuring pass and the drawing
-//! pass can never disagree about where a character sits.
+//! Laying a document out and drawing it. Markdown source is shown styled and
+//! the markers stay on screen, drawn in [`crate::window::QUIET`]. Prose is
+//! thresholded to one bit for the panel's two-level partial waveform.
 
 use anyhow::Result;
 use karyll_core::markdown::{Block, LineMarkup, Style};
@@ -37,39 +10,24 @@ use karyll_core::wrap;
 use crate::font::{Fonts, Metrics};
 use crate::window::{BLACK, Rect, Window};
 
-/// The body sizes on offer, smallest first.
-///
-/// **A ladder rather than a range**, because every step has to be a size the
-/// page still reads well at, and because Config shows every option at once.
-/// 46 px is ~11 pt on this 300 ppi panel and the top of the ladder is ~19 pt.
-/// Nothing under 10 pt is offered: a 10.2″ page is not a place to set footnote
-/// type, and every one of these panels is read closer than the laptop iA
-/// Writer is used on.
+/// The body sizes on offer, smallest first. A ladder, and Config shows every
+/// step at once: 46 px is ~11 pt on this 300 ppi panel and the top is ~19 pt.
+/// Nothing under 10 pt is offered.
 pub const SIZES: [f32; 7] = [42.0, 46.0, 52.0, 58.0, 64.0, 72.0, 80.0];
 
 /// The size a page opens at.
 pub const DEFAULT_SIZE: f32 = 46.0;
 
-/// The margins on offer, as a percentage of the surface's width, and what
-/// each one is called on the page that offers it.
-///
-/// **A share of the surface rather than a count of pixels**, so one setting is
-/// one page across three panels that each turn on their side: 300 px is a
-/// sixth of a portrait Scribe and a quarter of a Colorsoft, where a fifth of
-/// either is a fifth of it.
-///
-/// **Three levels, which are the whole range and not steps through it.** On a
-/// portrait Scribe at the default size they set 72, 60 and 48 characters to
-/// the line — the comfortable span end to end. On a 7″ panel the same three
-/// give 49, 41 and 33, because a small page holds a long line or a wide margin
-/// and not both.
+/// The margins on offer, as a percentage of the surface's width, with what
+/// each is called. On a portrait Scribe they set 72, 60 and 48 characters to
+/// the line; on a 7″ panel 49, 41 and 33.
 pub const MARGINS: [(u16, &str); 3] = [(8, "Narrow"), (15, "Medium"), (22, "Wide")];
 
 /// The margin a page opens at.
 pub const DEFAULT_MARGIN: u16 = 15;
 
-/// The ladder entry nearest `px`, so a remembered size from another build lands
-/// on something that exists rather than being refused.
+/// The ladder entry nearest `px`, which lands a remembered size from another
+/// build on one that exists.
 pub fn nearest_size(px: f32) -> f32 {
     SIZES
         .into_iter()
@@ -96,11 +54,8 @@ pub fn step_size(px: f32, larger: bool) -> f32 {
     SIZES.get(next).copied().unwrap_or(SIZES[at])
 }
 
-/// The next margin along, wrapping at the end.
-///
-/// A cycle rather than the two-ended step [`step_size`] is, because three
-/// levels put every one of them within two presses of any other — where seven
-/// sizes wrapped would send a writer at the top of the ladder to the bottom.
+/// The next margin along, wrapping at the end. Three levels put every one
+/// within two presses of any other, where [`step_size`] stops at both ends.
 pub fn step_margin(percent: u16) -> u16 {
     let at = MARGINS
         .iter()
@@ -113,22 +68,16 @@ pub fn step_margin(percent: u16) -> u16 {
 pub struct Theme {
     pub body_px: f32,
     /// White space either side of the text column, as a percentage of the
-    /// surface's width.
-    ///
-    /// The column is what is left in the middle, centred rather than
-    /// full-bleed: long lines are harder to read and there is no reason to use
-    /// the full 1860 px. [`column()`] resolves this against the surface being
-    /// drawn on.
+    /// surface's width. The column is the centred remainder, which [`column()`]
+    /// resolves against the surface being drawn on.
     pub margin: u16,
     pub margin_y: u16,
     /// Multiplier on the face's own line height.
     pub leading: f32,
     /// Extra space above a heading, as a multiple of the body line height.
     pub heading_space: f32,
-    /// How the line may be broken, over the script rules that always apply.
-    ///
-    /// A page setting like the margin rather than a document one: it changes
-    /// where the same prose breaks and nothing about what the prose is.
+    /// How the line may be broken, over the script rules that always apply. A
+    /// page setting like the margin: it moves where the same prose breaks.
     pub rules: wrap::Rules,
 }
 
@@ -140,16 +89,8 @@ impl Default for Theme {
 
 impl Theme {
     /// The page set at `body_px`, with `margin` per cent of white either side.
-    ///
-    /// **Two settings that answer different questions, and neither answers the
-    /// other's** — how large the type is, and how much of the page is given to
-    /// white space. The size cannot take the margin back: type grows into the
-    /// same column and fewer characters go on the line, and how many that is
-    /// belongs to the panel rather than to either setting.
-    ///
-    /// The vertical margin and the leading follow the type. Large type on a
-    /// tight margin reads as a page that is too full, and it wants
-    /// proportionally *less* leading than small type does.
+    /// Type grows into the same column and fewer characters go on the line.
+    /// The vertical margin and the leading follow `body_px`.
     pub fn at(body_px: f32, margin: u16) -> Self {
         Self {
             body_px,
@@ -161,29 +102,17 @@ impl Theme {
         }
     }
 
-    /// The same page with `rules` over its line breaking.
-    ///
-    /// Separate from [`Theme::at`] because the two are set independently and
-    /// remembered separately: a size or a margin changed from the panel must
-    /// not quietly take the breaking back to its default.
+    /// The same page with `rules` over its line breaking. Separate from
+    /// [`Theme::at`]: the two are set and remembered separately.
     pub fn breaking(mut self, rules: wrap::Rules) -> Self {
         self.rules = rules;
         self
     }
 }
 
-/// Where an emphasis mark sits on a line, and how big it is.
-///
-/// **In the air the leading leaves.** A CJK glyph fills its em, so the only
-/// room for a mark is between one row's glyph box and the next — the same air
-/// on every row, which is what keeps a marked line the height of an unmarked
-/// one and a page of them evenly spaced. Nothing about the mark reaches the
-/// wrap: it takes no width, so a marked run breaks exactly where the same run
-/// unmarked would.
-///
-/// **Both sides are measured.** Chinese sets 着重号 under the character and
-/// Korean sets 드러냄표 over it, so a sentence mixing 简体 with 한글 draws a
-/// mark on each side of one line.
+/// Where an emphasis mark sits on a line, and how big it is: in the air the
+/// leading leaves, taking no width. Both sides are measured — 着重号 under the
+/// character, 드러냄표 over it.
 struct Mark {
     /// Baseline to the centre of the mark on each side, positive downwards.
     above: f32,
@@ -192,10 +121,10 @@ struct Mark {
 }
 
 impl Mark {
-    /// Measured once per line, from the metrics the row is already built from.
+    /// Measured once per line, from the metrics the row is built from.
     fn on(fonts: &mut impl Metrics, roles: &[Role], px: f32) -> Self {
         // A sixteenth of the type size: 3 px against a 46 px body, which is
-        // half the width of the caret and reads as a dot rather than a bullet.
+        // half the width of the caret: a dot, not a bullet.
         let radius = (px / 16.0).round().max(2.0);
         let ascent = fonts.ascent(px, roles);
         let box_height = fonts.line_height(px, roles);
@@ -212,12 +141,9 @@ impl Mark {
     }
 }
 
-/// The dot against one emphasised character, centred on its advance.
-///
-/// **Clamped inside the row.** A mark that reached past it would land against
-/// the line above or below, where it would read as belonging to that one — and
-/// the air it hangs in is the leading, which the writer can set tighter than
-/// the mark needs.
+/// The dot against one emphasised character, centred on its advance. Clamped
+/// inside the row: the air it hangs in is the leading, which the writer can set
+/// tighter than the mark needs.
 fn emphasis_mark(
     window: &mut Window,
     line: &VisualLine,
@@ -238,11 +164,8 @@ fn emphasis_mark(
 }
 
 /// The value a glyph is drawn in: three cases, and the awkward one is the pair.
-///
-/// Inside an inverted run everything is white, quiet marks included. There is no
-/// room for a third value on top of an inversion — a recessive mark on a black
-/// band reads as damage rather than as a mark — so the selection wins and the
-/// syntax mark gives up its greyness for as long as it is selected.
+/// Inside an inverted run everything is white, quiet marks included — one bit
+/// leaves no third value on a black band.
 fn ink(inverted: bool, quiet: bool) -> u8 {
     use crate::window::{QUIET, WHITE};
     match (inverted, quiet) {
@@ -253,12 +176,8 @@ fn ink(inverted: bool, quiet: bool) -> u8 {
 }
 
 /// Type size for a block. Headings step down towards the body size, so a
-/// document of mostly `##` does not waste the page on chrome.
-///
-/// The steps are tight against a 46 px body: 1.6 / 1.35 / 1.15 would put an `#`
-/// at 74 px, a poster on a 1280 px measure. Source shown styled needs the
-/// hierarchy legible, not loud — the heading is marked by its `#` as well, so
-/// size is not carrying the distinction alone.
+/// document of mostly `##` keeps the page. The steps are tight against a 46 px
+/// body; 1.6 / 1.35 / 1.15 sets an `#` at 74 px on a 1280 px measure.
 pub fn block_px(theme: &Theme, block: Block) -> f32 {
     match block {
         Block::Heading(1) => theme.body_px * 1.45,
@@ -269,48 +188,29 @@ pub fn block_px(theme: &Theme, block: Block) -> f32 {
     }
 }
 
-/// How wide the caret is drawn, at a given type size.
-///
-/// Scaled rather than fixed, so it stays the same weight against the text
-/// whatever `body_px` becomes. At 46 px that is 6 px — about 0.5 mm on a 300 ppi
-/// panel. 2 px is 0.17 mm and reads as a hairline. The floor keeps it visible
-/// if the type is ever set very small.
-///
-/// A bar rather than a block: this editor is always inserting and the caret sits
-/// *between* two characters, so a block would sit on top of the one after it.
-///
-/// **One width, whatever the panel can show.** The bar is drawn on the 300 ppi
-/// ink layer and stays crisp; a colour panel resolves its hue at about half
-/// that, which is thin enough to be worth knowing about and not thin enough to
-/// widen the caret for.
+/// How wide the caret is drawn, at a given type size. Scaled, holding its
+/// weight against the text at every `body_px`: 6 px at 46 px, with a floor for
+/// very small type. A bar, sitting between two characters.
 fn caret_width(px: f32) -> u16 {
     (px / 8.0).round().max(3.0) as u16
 }
 
 /// The text column on a surface `width` wide: where it starts, and how wide.
-///
-/// **The margin is the setting and the column is the remainder**, so there is
-/// nothing here that can fail to fit: a page is [`Theme::margin`] per cent
-/// white down each side at every type size, on every panel, either way up.
-///
-/// One statement of the geometry, because two things need it: the page draws
-/// inside the column, and [`edge_at`] reads the margins either side of it.
+/// The margin is the setting and the column is the remainder, at every type
+/// size on every panel. [`edge_at`] reads the margins either side of it.
 pub fn column(theme: &Theme, width: u16) -> (u16, u16) {
     let side = (width as u32 * theme.margin as u32 / 100) as u16;
     (side, width.saturating_sub(side * 2))
 }
 
-/// Which edge of the page a tap fell on.
-///
-/// **The margins are the page's own controls**, which is what makes a document
-/// readable with nothing paired: a tap places the cursor, a drag selects, and
-/// neither moves the page — so without these there is one way through a long
-/// draft and it is the keyboard.
+/// Which edge of the page a tap fell on. The margins are the page's own
+/// controls: on the page itself a tap places the cursor and a drag selects,
+/// and neither moves the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
     /// The left margin: back a screen.
     Back,
-    /// The right margin: on a screen. The way round a Kindle already reads.
+    /// The right margin: on a screen, the way round a Kindle reads.
     On,
     /// The band along the top: the start of the document.
     Start,
@@ -318,22 +218,13 @@ pub enum Edge {
     End,
 }
 
-/// How much of an edge answers a tap.
-///
-/// The strip's own height, which is the target size this app already settled on
-/// for a finger: 120 px is 10 mm on a 300 ppi panel.
+/// How much of an edge answers a tap. The strip's own height: 120 px is 10 mm
+/// on a 300 ppi panel.
 const EDGE: u16 = 120;
 
-/// Which edge a tap at `(x, y)` fell on, or `None` for the page itself.
-///
-/// **The sides run the full height and the bands sit between them**, so a
-/// corner turns a page rather than jumping to an end — the corner is where a
-/// thumb strays, and a page turn is the cheaper mistake.
-///
-/// The sides are the real margins, widened to [`EDGE`] when a narrow setting
-/// on a small panel leaves less. The cost of that widening is a character or two at
-/// each end of a line that a tap can no longer put the cursor in; the cost of
-/// not widening it is a control too narrow to hit.
+/// Which edge a tap at `(x, y)` fell on, or `None` for the page itself. The
+/// sides run the full height and the bands sit between them. The sides are the
+/// real margins, widened to [`EDGE`] where a narrow setting leaves less.
 pub fn edge_at(theme: &Theme, width: u16, bottom: u16, x: u16, y: u16) -> Option<Edge> {
     let (left, _) = column(theme, width);
     let side = left.max(EDGE);
@@ -352,23 +243,16 @@ pub fn edge_at(theme: &Theme, width: u16, bottom: u16, x: u16, y: u16) -> Option
     None
 }
 
-/// 四分アキ at a type size: a quarter of the em, to the pixel.
-///
-/// Whole pixels because [`wrap::wrap_with`] measures the line in them while the
-/// pen draws in `f32`. A fractional quarter would put the two a fraction apart
-/// at every script boundary, and a line of mixed prose has many.
+/// 四分アキ at a type size: a quarter of the em, to the pixel. Whole pixels,
+/// since [`wrap::wrap_with`] measures the line in them and the pen draws in
+/// `f32`.
 fn aki_px(px: f32) -> f32 {
     (px / 4.0).round()
 }
 
-/// How a row's block marker is set.
-///
-/// **The pen snaps to the prose edge where the marker ends**, whichever of
-/// these the row is — which is what makes the flush edge exact rather than
-/// nearly exact. Walking the marker forward and hoping to land on the edge
-/// leaves a fraction of a pixel behind at every size, and a fraction either
-/// side of a pixel boundary is a heading a pixel out from the paragraph under
-/// it.
+/// How a row's block marker is set. The pen snaps to the prose edge where the
+/// marker ends, whichever of these the row is, which is what makes the flush
+/// edge exact to the pixel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Marker {
     /// The row has none: a paragraph, a blank, or a continuation row.
@@ -376,19 +260,9 @@ pub enum Marker {
     /// Its own characters, `chars` of them, drawn from `from` and ending on
     /// the prose edge.
     Set { chars: usize, from: f32 },
-    /// `#N` in place of hashes the margin will not take.
-    ///
-    /// **The one place on the page where a character is not a glyph.** The
-    /// row's first `chars` characters are `###### `; two glyphs and a space
-    /// stand for them, and the characters themselves take no width — so a
-    /// caret anywhere inside the marker draws on the prose edge, and the
-    /// marker holds still while hashes are typed or deleted.
-    ///
-    /// Compact rather than truncated because truncation lies: `######` with its
-    /// left clipped away reads as a shallower heading, which is a *wrong*
-    /// reading rather than a degraded one. `#6` clipped loses a corner of the
-    /// `#` and keeps the digit, which is the marker's rightmost glyph, so the
-    /// level survives.
+    /// `#N` in place of hashes the margin will not take. The row's first
+    /// `chars` characters are `###### `; two glyphs and a space stand for them,
+    /// and the characters themselves take no width.
     Compact { chars: usize, level: u8 },
 }
 
@@ -424,12 +298,8 @@ fn compact_width(fonts: &mut impl Metrics, role: Role, px: f32, level: u8) -> f3
 }
 
 /// Where a logical line's prose starts, and how its marker gets out of the way.
-///
-/// **The gutter comes out of the margin, never out of the text column.** Prose
-/// is flush at the column's left edge on every block; the marker is
-/// right-aligned to end there and reaches back into the margin. So `left` never
-/// moves, nothing reflows when a `#` is typed, and every block on the page —
-/// paragraph, heading, quote, list — shares one vertical line.
+/// The gutter comes out of the margin: prose is flush at the column's left edge
+/// on every block, and the marker is right-aligned to end there.
 struct Lead {
     /// Left edge of the prose, on every row of the line.
     prose: f32,
@@ -439,14 +309,9 @@ struct Lead {
     marker: Marker,
 }
 
-/// How `entry`'s marker is set against the margin this page actually has.
-///
-/// Three answers, in order of preference: hung in the margin; set as `#N` where
-/// the hashes will not fit; and set inside the column where neither is possible
-/// — which is a marker whose own characters would be clipped into a different
-/// marker, `1. ` losing its digit at the largest sizes on the smallest panel.
-/// That row alone gives up the flush edge, and its continuations still hang
-/// under its prose.
+/// How `entry`'s marker is set against the margin this page has. Three answers
+/// in order: hung in the margin; set as `#N` where the hashes will not fit; set
+/// inside the column, the one row without a flush edge.
 fn lead_of(
     page: &Page,
     fonts: &mut impl Metrics,
@@ -469,8 +334,7 @@ fn lead_of(
         let role = roles.get(at).copied().unwrap_or(Role::Body);
         fonts.advance(role, px, text[at])
     };
-    // A nested item keeps its own indent inside the column, so nesting still
-    // shows; only the marker itself hangs.
+    // A nested item keeps its own indent inside the column; the marker hangs.
     let indent: f32 = (0..chars)
         .take_while(|&at| text[at] == ' ')
         .map(&mut advance)
@@ -489,7 +353,7 @@ fn lead_of(
         };
     }
     // Hashes the margin will not take. h1 is never compacted: `#` is one glyph
-    // where `#1` is two, so it would swap a narrower marker for a wider one.
+    // and `#1` is two.
     if let Block::Heading(level) = entry.block
         && level >= 2
     {
@@ -506,42 +370,34 @@ fn lead_of(
     }
 }
 
-/// Everything a layout or paint needs about the document and the page, so the
-/// functions below take one bundle instead of the same five arguments each.
+/// Everything a layout or paint needs about the document and the page. The
+/// functions below take one bundle.
 pub struct Page<'a> {
     pub chars: &'a [char],
     pub markup: &'a [LineMarkup],
     pub theme: &'a Theme,
     /// The text column actually used: the theme's measure, capped to what the
-    /// surface can hold. **Wrapping asks here, not the theme**, or the largest
-    /// type sizes would wrap to a column wider than the page they are drawn on.
+    /// surface can hold. Wrapping asks here, not the theme: the largest type
+    /// sizes wrap to a column the page can draw.
     pub measure: u16,
     /// Left edge of the text column, centring the measure on the surface.
     pub left: u16,
     /// Where the page ends. The action strip lives below this, and text drawn
-    /// under it would be both invisible and untappable.
+    /// under it is invisible and untappable.
     pub bottom: u16,
-    /// Every face this document draws from.
-    ///
-    /// Rows are one height across the page — a paragraph whose lines were
-    /// different heights because one of them happened to contain a kanji would
-    /// be worse than a slightly taller row — so the box is sized once, from
-    /// everything in the document rather than from what is on any one line.
-    /// Scanning for it is pure and costs one pass; the alternative is asking the
-    /// faces, and that is what would load 10 MB of Han for an English draft.
+    /// Every face this document draws from. Rows are one height across the
+    /// page, and the box is sized from everything in the document. One pure
+    /// pass over the markup, loading no face.
     pub roles: Vec<Role>,
     /// The one sentence drawn solid while the rest of the page is set back.
     ///
     /// `None` is focus mode switched off, and leaves every character solid.
     pub focus: Option<std::ops::Range<usize>>,
-    /// Text being composed by the IME, drawn underlined because it is not yet
-    /// part of the document.
+    /// Text the IME is composing, drawn underlined and outside the document.
     pub underline: Option<std::ops::Range<usize>>,
-    /// Where words may be divided, or `None` where they may not be.
-    ///
-    /// `None` is the setting switched off, a language that does not hyphenate,
-    /// and a device without the firmware's dictionaries — three states that
-    /// draw identically and have no reason to be told apart here.
+    /// Where words may be divided, or `None` where they may not be. `None` is
+    /// the setting switched off, a language that does not hyphenate, and a
+    /// device without the firmware's dictionaries.
     pub hyphen: Option<&'a karyll_core::Hyphenator>,
 }
 
@@ -580,7 +436,7 @@ impl<'a> Page<'a> {
         self
     }
 
-    /// Mark `span` as text the IME is still composing.
+    /// Mark `span` as text the IME is composing.
     pub fn composing(mut self, span: Option<std::ops::Range<usize>>) -> Self {
         self.underline = span;
         self
@@ -602,13 +458,8 @@ fn hidden(line: &VisualLine, at: usize) -> bool {
 }
 
 /// Where the row's pen sits before character `at` is drawn, given where it sat
-/// after the one before.
-///
-/// **The snap is the whole of the flush edge.** At the end of the marker the
-/// pen takes the prose edge outright rather than whatever the marker's advances
-/// added up to, so a heading, a bullet and a paragraph begin on one line to the
-/// pixel — and a marker may be any width at all, including two glyphs standing
-/// for seven characters.
+/// after the one before. At the end of the marker the pen takes the prose edge
+/// outright, whatever the marker's own advances came to.
 fn advanced(line: &VisualLine, at: usize, pen: f32) -> f32 {
     if at == line.range.start + line.marker.chars() {
         line.prose
@@ -617,11 +468,9 @@ fn advanced(line: &VisualLine, at: usize, pen: f32) -> f32 {
     }
 }
 
-/// The space set before character `at` on `line`.
-///
-/// Zero at the row's own start: 四分アキ sits between two characters, and a gap
-/// where a row begins would indent it a quarter em past the flush edge — on the
-/// one line a reader is most likely to see it on.
+/// The space set before character `at` on `line`. Zero at the row's own start:
+/// 四分アキ sits between two characters, and a gap where a row begins indents
+/// it a quarter em past the flush edge.
 fn gap_before(page: &Page, line: &VisualLine, at: usize) -> f32 {
     if at <= line.range.start {
         return 0.0;
@@ -636,20 +485,15 @@ fn gap_before(page: &Page, line: &VisualLine, at: usize) -> f32 {
 pub struct VisualLine {
     /// Character range into the document.
     pub range: std::ops::Range<usize>,
-    /// Left edge of the row's prose, in window coordinates.
-    ///
-    /// **Per row rather than per block**, which is what lets a marker hang into
-    /// the margin while its own continuations line up under its prose. See
-    /// [`Lead`].
+    /// Left edge of the row's prose, in window coordinates. Per row, which lets
+    /// a marker hang into the margin while its continuations line up under its
+    /// prose. See [`Lead`].
     pub prose: f32,
     /// How this row sets its block marker, if it has one.
     pub marker: Marker,
     /// True when the line ended inside a word, so a [`wrap::HYPHEN`] is drawn
-    /// after its last character.
-    ///
-    /// **The mark is not in `range` and is not in the document.** It is ink
-    /// past the end of the line, which is what lets every index below — the
-    /// caret, a selection, a hit test — stay in the buffer's own index space.
+    /// after its last character. The mark is not in `range` and not in the
+    /// document: every index below stays in the buffer's own index space.
     pub hyphenated: bool,
     /// Index of the logical line this came from, so drawing can reach its
     /// styles without searching for the entry that contains it.
@@ -662,46 +506,26 @@ pub struct VisualLine {
     /// than deriving it from `px`, so the rectangle that repaints a row is the
     /// same box the row was laid out in.
     pub height: i32,
-    /// The leading, split — half above the glyph box and half below.
-    ///
-    /// Leading is extra space around a line, and putting all of it under the
-    /// text pushes every glyph to the top of its row. Latin hides that, because
-    /// a Latin face's ascent has air above the cap height and the letters end up
-    /// near the middle anyway; Han fills its em box to the top and goes exactly
-    /// where the arithmetic puts it. Splitting it is what centres the text in
-    /// its row, and what makes the caret sit around the glyphs rather than
-    /// hanging below them.
+    /// The leading, split — half above the glyph box and half below. A Latin
+    /// face has air above its cap height and Han fills its em box to the top;
+    /// the split centres both, and the caret around them.
     pub inset: i32,
     /// Offset from [`VisualLine::y`] to the baseline, [`VisualLine::inset`]
     /// included. Layout works this out and drawing uses it, so the two cannot
     /// disagree about where the text sits.
     pub baseline: i32,
-    /// How much of this row is in focus, **relative to its own start**.
-    ///
-    /// Relative rather than absolute so that inserting a character earlier in
-    /// the document does not make every row below it look changed. Focus mode
-    /// off is the whole row, so nothing is set back and the comparison below
-    /// stays stable.
-    ///
-    /// This is on the line, rather than read from the page while drawing,
-    /// because [`Frame::unchanged`] has to see it. A cursor moving to the next
-    /// sentence changes no text, no size and no position — so a row whose ink
-    /// is about to change would otherwise count as unchanged and never be
-    /// repainted, leaving the dimming a sentence behind the cursor.
+    /// How much of this row is in focus, relative to its own start. Focus mode
+    /// off is the whole row. Held on the line for [`Frame::unchanged`], which
+    /// repaints on it.
     pub focus: std::ops::Range<usize>,
-    /// How much of this row the IME is still composing, relative to its start.
-    ///
-    /// Here for the same reason as `focus`, and with a sharper case: committing
-    /// a Japanese preedit can leave the characters **identical** — `あ` composed
-    /// and `あ` committed — so a frame that compared only text would call the
-    /// row unchanged and leave the underline drawn under settled prose.
+    /// How much of this row the IME is composing, relative to its start.
+    /// Held for the same reason as `focus`: committing a Japanese preedit can
+    /// leave the characters identical — `あ` composed and `あ` committed.
     pub underline: std::ops::Range<usize>,
 }
 
 /// Every distinct role the document draws from, in one pass over its markup.
-///
-/// Used to size the row box, so it holds the tallest face on the page rather
-/// than only the Latin one.
+/// Sizes the row box, which holds the tallest face on the page.
 fn roles_in(chars: &[char], markup: &[LineMarkup]) -> Vec<Role> {
     let mut seen = Vec::new();
     for line in markup {
@@ -761,10 +585,9 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
         let base = line.range.start;
         let lead = lead_of(page, fonts, line, &roles, px);
 
-        // **The marker is not wrapped with the prose.** It has already been
-        // given its own room by `lead_of`, and offering it to the wrapper as
-        // text would let a line break inside it and charge the column for
-        // width the margin is carrying.
+        // The marker is not wrapped with the prose. `lead_of` has given it its
+        // own room, and text offered to the wrapper can break inside it and
+        // charge the column for width the margin carries.
         let marker = lead.marker.chars();
         let prose = &page.chars[base + marker..line.range.end];
         // The quarter em is this block's own, so a heading sets a wider one
@@ -782,7 +605,7 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
                 fonts.advance(role, px, c).ceil() as u32
             },
             // Asked once per wrapped row, for the one word the overflow landed
-            // inside, rather than once per word of the document.
+            // inside.
             |word| match page.hyphen {
                 Some(dictionary) => dictionary.breaks_in(&prose[word]),
                 None => Vec::new(),
@@ -790,8 +613,8 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
         );
 
         for (n, vl) in broken.into_iter().enumerate() {
-            // The marker belongs to the first row, which therefore starts where
-            // the logical line does rather than where its prose does.
+            // The marker belongs to the first row, which starts where the
+            // logical line does.
             let first = n == 0;
             let from = if first { 0 } else { marker + vl.range.start };
             let range = base + from..base + marker + vl.range.end;
@@ -819,11 +642,8 @@ pub fn layout(page: &Page, fonts: &mut impl Metrics, top: i32) -> Vec<VisualLine
 }
 
 /// The part of `row` that falls inside the focused span, as an offset into the
-/// row itself.
-///
-/// No focus at all means the whole row, because "everything is solid" and
-/// "focus mode is off" have to draw identically and there is no reason for them
-/// to be two states.
+/// row itself. No focus at all is the whole row: a solid row and focus mode off
+/// draw identically.
 fn focus_within(
     focus: &Option<std::ops::Range<usize>>,
     row: &std::ops::Range<usize>,
@@ -834,12 +654,9 @@ fn focus_within(
     clip_to_row(span, row)
 }
 
-/// Rule a line under composing text, from `from` to `to`.
-///
-/// Below the baseline rather than on it, by a fraction of the type size so it
-/// holds its distance as the size changes, and clamped inside the row so it
-/// cannot land in the leading of the line beneath — which the row's own damage
-/// rectangle would not repaint.
+/// Rule a line under composing text, from `from` to `to`. Below the baseline by
+/// a fraction of the type size, holding its distance as the size changes, and
+/// clamped inside the row's own damage rectangle.
 fn underline(window: &mut Window, line: &VisualLine, from: f32, to: f32) {
     let drop = (line.px / 9.0).round().max(2.0) as i32;
     let thickness = (line.px / 20.0).round().max(1.0) as i32;
@@ -847,16 +664,9 @@ fn underline(window: &mut Window, line: &VisualLine, from: f32, to: f32) {
     rule(window, top, thickness, from, to);
 }
 
-/// Rule a line through struck-out text, from `from` to `to`.
-///
-/// **Through the lowercase, not through the middle of the row.** A row is as
-/// tall as its leading and its tallest face, so its centre sits below the
-/// x-height of Latin prose. A third of the type size above the baseline lands
-/// on the middle of the lowercase.
-///
-/// Clamped inside the row at the top, the way [`underline`] is at the bottom:
-/// the row's own damage rectangle is what repaints this, and ink outside it is
-/// left behind by the next update.
+/// Rule a line through struck-out text, from `from` to `to`. A third of the
+/// type size above the baseline lands on the middle of the lowercase. Clamped
+/// inside the row, the way [`underline`] is.
 fn strikethrough(window: &mut Window, line: &VisualLine, from: f32, to: f32) {
     let rise = (line.px / 3.5).round().max(2.0) as i32;
     let thickness = (line.px / 20.0).round().max(1.0) as i32;
@@ -864,12 +674,9 @@ fn strikethrough(window: &mut Window, line: &VisualLine, from: f32, to: f32) {
     rule(window, top, thickness, from, to);
 }
 
-/// Rule the bottom edge of a highlight field.
-///
-/// Inside the field rather than under it, so it cannot land in the leading of
-/// the row beneath — which this row's damage rectangle would not repaint. It is
-/// what gives the run an edge on a panel where the field itself is only a few
-/// levels away from paper.
+/// Rule the bottom edge of a highlight field. Inside the field, clear of the
+/// leading of the row beneath, which this row's damage rectangle does not
+/// repaint. It gives the run an edge on a panel where the field is pale.
 fn field_rule(window: &mut Window, rect: Rect, ink: u8) {
     let thickness = (rect.height / 16).max(2).min(rect.height);
     let top = rect.y + rect.height - thickness;
@@ -910,12 +717,9 @@ fn clip_to_row(
     start..end
 }
 
-/// The visual line holding `cursor`.
-///
-/// After a soft wrap the cursor sits at the end of one line and the start of
-/// the next; it belongs to the later one, which is where the next character
-/// will appear. The trailing search catches a cursor at the very end of the
-/// document, which no half-open range contains.
+/// The visual line holding `cursor`. After a soft wrap the cursor sits at the
+/// end of one line and the start of the next, and belongs to the later one. The
+/// trailing search catches a cursor at the very end of the document.
 fn line_of(lines: &[VisualLine], cursor: usize) -> Option<usize> {
     lines
         .iter()
@@ -948,11 +752,9 @@ fn pen_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, cursor: usiz
     Some(advanced(line, cursor, x))
 }
 
-/// The character index on `line` nearest horizontal position `x`.
-///
-/// Nearest, not the one containing `x`: clicking or arrowing into the right
-/// half of a glyph should land after it, which is what a caret between
-/// characters means.
+/// The character index on `line` nearest horizontal position `x`. Nearest, not
+/// the one containing `x`: the right half of a glyph lands after it, which is
+/// what a caret between characters means.
 fn index_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, x: f32) -> usize {
     let Some(entry) = page.markup.get(line.markup) else {
         return line.range.start;
@@ -984,12 +786,9 @@ fn index_at(page: &Page, fonts: &mut impl Metrics, line: &VisualLine, x: f32) ->
     line.range.end
 }
 
-/// The character index nearest a point on the page.
-///
-/// In window coordinates, against the frame the reader is actually looking at.
-/// A point below the last line lands at the end of it and one above the first
-/// lands at its start: a finger aimed past the text still meant somewhere, and
-/// refusing to answer would make a tap in the margin do nothing at all.
+/// The character index nearest a point on the page, in window coordinates,
+/// against the frame on screen. A point below the last line lands at the end of
+/// it and one above the first lands at its start.
 pub fn index_at_point(
     page: &Page,
     fonts: &mut impl Metrics,
@@ -1006,12 +805,9 @@ pub fn index_at_point(
     Some(index_at(page, fonts, line, x))
 }
 
-/// Move `cursor` by `delta` visual lines, holding `goal` as its column.
-///
-/// `goal` is the horizontal position the cursor is trying to keep. Editors
-/// carry it across a run of vertical moves so that passing through a short line
-/// does not drag the cursor permanently left; the caller keeps it and clears it
-/// on any other kind of movement.
+/// Move `cursor` by `delta` visual lines, holding `goal` as its column. `goal`
+/// is the horizontal position the cursor keeps across a run of vertical moves;
+/// the caller holds it and clears it on any other movement.
 pub fn move_vertical(
     page: &Page,
     fonts: &mut impl Metrics,
@@ -1028,8 +824,8 @@ pub fn move_vertical(
     };
     let to = (from as i32 + delta).clamp(0, lines.len().saturating_sub(1) as i32) as usize;
     if to == from {
-        // Already at the top or bottom: hold the column so a further move in
-        // the other direction still returns to it.
+        // At the top or bottom: hold the column, and a move the other way
+        // returns to it.
         return Some((cursor, goal));
     }
     Some((index_at(page, fonts, &lines[to], goal), goal))
@@ -1045,70 +841,27 @@ pub fn lines_per_page(fonts: &mut impl Metrics, theme: &Theme, roles: &[Role], h
     ((height as f32 / line) as i32 - 1).max(1)
 }
 
-/// How the page follows the cursor.
-///
-/// **Two different modes, and the second alone is not enough.** Unconditional
-/// typewriter scrolling, clamped at the top, makes ordinary writing behave as
-/// half a focus mode: text fills down from the first line, stops at the pin,
-/// and thereafter scrolls under a fixed writing line. iA Writer only does that
-/// in focus mode; its normal mode lets
-/// the cursor run to the foot of the page like any other editor.
+/// How the page follows the cursor. Two modes: [`Follow`] lets the cursor run
+/// to the foot of the page, and [`Centre`] holds the focused sentence on the
+/// middle of the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scroll {
-    /// Move only when the cursor would otherwise leave the page, and keep
-    /// whatever offset the page already had. This is what makes the cursor run
-    /// down to the bottom instead of sticking to a line partway up.
+    /// Move as far as it takes to keep the cursor on the page, holding the
+    /// offset the page has. The cursor runs down to the bottom.
     Follow { top: i32, bottom: i32 },
-    /// Hold the focused sentence's own middle on the middle of the page,
-    /// wherever in the document it is — including the first sentence, which
-    /// puts blank paper above it rather than refusing to scroll.
-    ///
-    /// **The sentence, not the caret's row.** Measured off an iA Writer
-    /// capture: with a sentence wrapped across two rows the caret sat half a
-    /// line *below* the middle, and the midpoint of the two rows sat on it.
-    ///
-    /// `top` and `bottom` are the edges of the **page**, not of the text
-    /// column — see [`scroll_mode`].
+    /// Hold the focused sentence's own middle on the middle of the page, blank
+    /// paper above the first sentence included. The sentence, not the caret's
+    /// row. `top` and `bottom` are the page's edges — see [`scroll_mode`].
     Centre { top: i32, bottom: i32 },
     /// Put the cursor's own row at the top of the text column, with the
-    /// document below it.
-    ///
-    /// **For arriving at a section rather than at a word.** A search hit is a
-    /// word wanted in context and is centred; a heading is a place to start
-    /// reading, and everything above it is what the writer chose to leave.
-    ///
+    /// document below it. For arriving at a section.
     /// `top` is the text column's top margin, as `Follow`'s is.
     Top { top: i32 },
 }
 
-/// Which way the page follows the cursor.
-///
-/// **The two modes measure different boxes, and that is the whole reason this
-/// is a function.**
-///
-/// Following is about the text column as it currently is: it starts at the top
-/// margin, because the caret should not be dragged above where text begins, and
-/// ends at `page_bottom`, because the caret must stay off the chrome.
-///
-/// Centring is about the **panel**, top to bottom, and neither the margin nor
-/// the chrome moves it:
-///
-/// - The margin is where text starts, not where the page does. Using it as the
-///   top put the focused sentence half a margin low.
-/// - The strip comes and goes while writing. Measuring to it moved the focused
-///   sentence by half the strip's height every time the chrome appeared, so the
-///   page shifted under the reader for a reason that had nothing to do with
-///   what they were writing.
-///
-/// **A jump centres too**, for a reason that is not focus mode's. Following
-/// only moves the page as far as it must, so a cursor that arrived from off
-/// screen lands flush against whichever edge it came in by — and a search hit
-/// pinned to the last line of the page shows the writer everything before their
-/// match and nothing after it. Every editor centres what it found; this is that,
-/// and it reuses the machinery focus mode already needed.
-/// **Landing on a section is the third case, and it outranks focus mode**: it is
-/// the one paint where the writer has said where they want to be. The sentence
-/// they land on is centred again by the next keystroke.
+/// Which way the page follows the cursor. [`Follow`] measures the text column,
+/// top margin to `page_bottom`; [`Centre`] measures the panel, top to bottom,
+/// clear of the margin and of a strip that comes and goes.
 pub fn scroll_mode(
     focus: bool,
     jumped: bool,
@@ -1132,15 +885,9 @@ pub fn scroll_mode(
     }
 }
 
-/// Where the page should sit, given where it sat before.
-///
-/// Pure, and separate from moving the lines, because the interesting part is
-/// the decision. `was` is the offset currently applied; the answer is the new
-/// one.
-///
-/// **`Centre` is deliberately unclamped.** A negative offset pushes the text
-/// down so the first sentence of a document can still sit in the middle of the
-/// page, which is what focus mode does and what a clamp at zero prevents.
+/// Where the page should sit, given where it sat before. `was` is the offset
+/// currently applied. `Centre` is unclamped, and a negative offset puts the
+/// first sentence of a document in the middle of the page.
 pub fn scroll_for(lines: &[VisualLine], cursor: usize, was: i32, how: Scroll) -> i32 {
     let Some(index) = line_of(lines, cursor) else {
         return was;
@@ -1172,10 +919,8 @@ pub fn scroll_for(lines: &[VisualLine], cursor: usize, was: i32, how: Scroll) ->
     }
 }
 
-/// Top and bottom of the rows the focused sentence covers.
-///
-/// `None` when nothing is focused, which is a cursor on a blank line — the
-/// sentence there is empty and has no rows of its own.
+/// Top and bottom of the rows the focused sentence covers. `None` when nothing
+/// is focused, which is a cursor on a blank line.
 fn focused_extent(lines: &[VisualLine]) -> Option<(i32, i32)> {
     let mut rows = lines.iter().filter(|l| !l.focus.is_empty());
     let first = rows.next()?;
@@ -1193,11 +938,9 @@ pub fn shift(lines: &mut [VisualLine], offset: i32) {
     }
 }
 
-/// Where the caret sits: the visual line holding `cursor`, and how far along it.
-///
-/// The cursor can land at the end of one visual line and the start of the next
-/// after a soft wrap. It is shown at the *start of the later line*, which is
-/// where the next character will appear.
+/// Where the caret sits: the visual line holding `cursor`, and how far along
+/// it. After a soft wrap the cursor is shown at the start of the later line,
+/// where the next character appears.
 fn caret(
     page: &Page,
     fonts: &mut impl Metrics,
@@ -1207,11 +950,9 @@ fn caret(
     let index = line_of(lines, cursor)?;
     let line = &lines[index];
     let x = pen_at(page, fonts, line, cursor)?;
-    // The glyph box, not the leaded row: a caret marks where the text is, and
-    // one spanning the leading stands taller than everything beside it. Taken
-    // from the layout rather than measured again, so it cannot disagree with the
-    // row it sits in — or with the rectangle that repaints it, which is the row
-    // and so contains this.
+    // The glyph box, not the leaded row: a caret marks where the text is. Taken
+    // from the layout, which is the same source as the row it sits in and the
+    // rectangle that repaints it.
     let top = (line.y + line.inset).max(0);
     let height = line.height - 2 * line.inset;
     Some(Rect {
@@ -1222,16 +963,9 @@ fn caret(
     })
 }
 
-/// The rectangles covering a selection, one per visual line it touches.
-///
-/// Per *visual* line, so a selection across a soft wrap is drawn as the runs it
-/// visually is rather than as one impossible box.
-///
-/// A line whose selection carries on to the next gets a short nub past its last
-/// glyph: the newline is inside the selection, and without it a multi-line
-/// selection reads as several unrelated runs. A nub rather than a fill out to
-/// the margin, because on this panel a full-width black band is a lot of ink to
-/// lay down and then lift again.
+/// The rectangles covering a selection, one per visual line it touches. A line
+/// whose selection carries on gets a short nub past its last glyph, standing
+/// for the newline the selection swallowed.
 fn selection_rects(
     page: &Page,
     fonts: &mut impl Metrics,
@@ -1248,12 +982,8 @@ fn selection_rects(
 }
 
 /// The box `run` covers on one visual line, or `None` if it misses the line
-/// entirely.
-///
-/// `nub` adds a space's width when the run carries on past this line, which is
-/// what draws the newline a selection swallowed. A `==highlight==` passes
-/// `false`: it never crosses a newline, so a run that continues does so at a
-/// soft wrap, where there is no character between the two halves to stand for.
+/// entirely. `nub` adds a space's width where the run carries on, drawing the
+/// newline a selection swallowed. A `==highlight==` passes `false`.
 fn run_rect(
     page: &Page,
     fonts: &mut impl Metrics,
@@ -1275,14 +1005,13 @@ fn run_rect(
         && start == line.range.start
     {
         let role = page.roles_at(line, start).unwrap_or(Role::Body);
-        // Clamped to the page, because the marker may itself be clipped there:
-        // an inversion that started off the left edge would carry the width it
-        // lost round to the right one and fill past the run.
+        // Clamped to the page: the marker may itself be clipped there, and an
+        // inversion starting off the left edge carries the width it lost round
+        // to the right one.
         left = (left - compact_width(fonts, role, line.px, level)).max(0.0);
     }
-    // A division mark is drawn past the last character, so a run that reaches
-    // the end of a divided row has to reach over it as well — otherwise the
-    // mark is the one glyph left unlit in the middle of a selection.
+    // A division mark is drawn past the last character, and a run reaching the
+    // end of a divided row reaches over it: the mark is inside the selection.
     if line.hyphenated && end == line.range.end {
         let role = page
             .roles_at(line, end.saturating_sub(1))
@@ -1292,8 +1021,7 @@ fn run_rect(
     if nub && run.end > line.range.end {
         right += fonts.advance(Role::Body, line.px, ' ');
     }
-    // A line scrolled half off the top keeps the half that is still on the
-    // page rather than being dropped or drawn above it.
+    // A line scrolled half off the top keeps the half on the page.
     let top = line.y.max(0);
     let height = line.height - (top - line.y);
     if height <= 0 {
@@ -1308,11 +1036,8 @@ fn run_rect(
 }
 
 /// The fields behind every `==highlight==` on the page, each with whether focus
-/// mode has set its row back.
-///
-/// **A field that is partly in the focused sentence is drawn lit**, whole. One
-/// phrase is one box: a field split at the focus boundary would read as two
-/// phrases, one of them set back.
+/// mode has set its row back. A field partly inside the focused sentence is
+/// drawn lit and whole: one phrase is one box.
 fn highlight_fields(
     page: &Page,
     fonts: &mut impl Metrics,
@@ -1336,32 +1061,27 @@ fn highlight_fields(
     fields
 }
 
-/// The vertical extent of a set of selection rectangles.
-///
-/// Only the vertical matters: the damage rectangle is always full width, so a
-/// y-span is exactly as much as it can express.
+/// The vertical extent of a set of selection rectangles. Only the vertical
+/// matters: the damage rectangle is always full width.
 fn selection_span(rects: &[Rect]) -> Option<(i32, i32)> {
     let top = rects.iter().map(|r| r.y as i32).min()?;
     let bottom = rects.iter().map(|r| r.y as i32 + r.height as i32).max()?;
     Some((top, bottom))
 }
 
-/// What was last drawn, so the next paint can work out what actually changed.
-///
-/// Holds its own copy of the document because the comparison is exact — line
-/// contents are compared character by character rather than hashed, so no
-/// collision can silently skip a repaint.
+/// What was last drawn, so the next paint can work out what changed. Holds its
+/// own copy of the document: line contents are compared character by character,
+/// and no hash collision can skip a repaint.
 pub struct Frame {
     chars: Vec<char>,
     lines: Vec<VisualLine>,
     caret: Option<Rect>,
-    /// The vertical extent of the selection that was drawn, so that clearing
-    /// one repaints where it was. Without this a dropped selection leaves a
-    /// black band on the page.
+    /// The vertical extent of the selection that was drawn. Clearing one
+    /// repaints where it was, and a dropped selection leaves no black band.
     selection: Option<(i32, i32)>,
     /// Where the candidate box was, for the same reason as the selection: it
-    /// covers prose, and committing a word makes it vanish without any line
-    /// changing. Unremembered, it would leave a bordered white hole in the page.
+    /// covers prose, and committing a word makes it vanish with no line
+    /// changing. Unremembered, it leaves a bordered white hole in the page.
     candidates: Option<Rect>,
 }
 
@@ -1374,9 +1094,8 @@ impl Frame {
 
 impl Frame {
     /// Whether visual line `i` is identical to the one drawn last time.
-    ///
-    /// Geometry as well as text: a line whose characters are unchanged but
-    /// which has moved down the page still has to be redrawn.
+    /// Geometry as well as text: an unchanged line that moved down the page is
+    /// redrawn.
     fn unchanged(&self, i: usize, chars: &[char], line: &VisualLine) -> bool {
         let Some(old) = self.lines.get(i) else {
             return false;
@@ -1395,16 +1114,9 @@ impl Frame {
     }
 }
 
-/// The smallest rectangle covering everything that differs between two frames.
-///
-/// `None` when nothing changed. Typing inside a line dirties that line, which is
-/// the case worth keeping cheap.
-///
-/// **A vertical shift dirties the whole page, upwards as well as down.** A
-/// newline or a rewrap moves content down and leaves ink below; scrolling
-/// towards the start of the document moves content down the screen and leaves
-/// ink *above* the new lines. `top` is measured from where the lines are now, so
-/// it cannot see the second case on its own.
+/// The smallest rectangle covering everything that differs between two frames,
+/// `None` when nothing changed. A vertical shift dirties the whole page,
+/// upwards as well as down, since `top` is measured from where the lines are.
 fn damage(
     previous: Option<&Frame>,
     chars: &[char],
@@ -1432,7 +1144,7 @@ fn damage(
             shifted = true;
         }
     }
-    // Lines that existed last time and no longer do leave ink behind.
+    // Lines dropped since the last paint leave ink behind.
     if previous.lines.len() != lines.len() {
         shifted = true;
         if let Some(old) = previous.lines.get(lines.len().min(previous.lines.len())) {
@@ -1455,9 +1167,8 @@ fn damage(
     }
 
     // And so does the candidate box, which covers prose and vanishes on commit
-    // without any line changing. Both the previous box and the next: the first
-    // to clear where it was, the second because the rows under it are about to
-    // be hidden.
+    // with no line changing. Both boxes: the previous to clear where it was,
+    // the next for the rows about to be hidden.
     for rect in [previous.candidates, candidates].into_iter().flatten() {
         top = top.min(rect.y as i32);
         bottom = bottom.max(rect.y as i32 + rect.height as i32);
@@ -1481,31 +1192,22 @@ fn damage(
     })
 }
 
-/// Draw the document, presenting only what changed since `previous`.
-///
-/// Pass `None` for the first paint. The returned frame is what the next call
-/// compares against.
-/// What the editor is doing right now, as against what the document says.
-///
-/// Bundled because all three are the same kind of thing — transient state that
-/// the page is drawn *with* rather than part of the page — and because passing
-/// them separately took `paint` past the number of arguments anyone can read.
-///
-/// Indices here are **display** indices, matching [`Page::chars`]: with a
-/// preedit spliced in, document positions and screen positions are not the
-/// same number.
+/// What the editor is doing, as against what the document says. Indices here
+/// are display indices, matching [`Page::chars`]: a spliced preedit puts
+/// document and screen positions on different numbers.
 pub struct Editing<'a> {
     pub cursor: usize,
     pub selection: Option<std::ops::Range<usize>>,
     /// What floats over the page beside the caret, if anything.
     pub overlay: crate::ui::Overlay<'a>,
-    /// What the overlay hangs off when the caret is the wrong thing to hang it
-    /// off: the find bar's field, which is on the strip while the caret is
-    /// wherever the last match was. `None` means the caret, which is the
-    /// ordinary case of composing into the prose.
+    /// What the overlay hangs off where the caret is the wrong thing: the find
+    /// bar's field, while the caret is at the last match. `None` is the caret.
     pub anchor: Option<Rect>,
 }
 
+/// Draw the document, presenting only what changed since `previous`. Pass
+/// `None` for the first paint; the returned frame is what the next call
+/// compares against.
 pub fn paint(
     window: &mut Window,
     fonts: &mut Fonts,
@@ -1532,16 +1234,14 @@ pub fn paint(
     let region = fonts.region();
 
     // Damage is clipped to the page. A rewrap extends it to the foot of the
-    // surface, and without this that clears the action strip — which is drawn
-    // once and not repainted per keystroke, so the buttons simply vanish while
-    // typing.
+    // surface, which clears the action strip — drawn once, and not repainted
+    // per keystroke.
     let surface = Rect {
         height: page.bottom.min(surface.height),
         ..surface
     };
-    // Where the box will go, worked out before the damage so that the
-    // rectangle covers it — and before drawing, so the box is not measured
-    // against a page that has already been cleared.
+    // Where the box will go, worked out before the damage rectangle covers it
+    // and before the clear that takes the page out from under it.
     let width = window.width();
     let box_now = anchor.or(caret).and_then(|at| {
         crate::ui::overlay_rect(width, fonts, at, page.theme.body_px, page.bottom, &labels)
@@ -1557,19 +1257,15 @@ pub fn paint(
     };
 
     // Clearing first means every line that touches the damage has to be drawn
-    // again, including ones that did not themselves change — a line half inside
-    // the rectangle would otherwise lose its other half.
+    // again, unchanged ones included: a line half inside the rectangle keeps
+    // its other half.
     window.fill(dirty, crate::window::WHITE);
     let top = dirty.y as i32;
     let bottom = top + dirty.height as i32;
 
-    // Highlight fields first of all: they are the only thing on the page that
-    // is genuinely *behind* the text, and a selection drawn over one has to
-    // win, which it cannot do from underneath.
-    //
-    // Skipped outside the damage on the same test the line loop uses below —
-    // a field filled where its line is not being redrawn would leave a band
-    // with nothing written on it.
+    // Highlight fields first of all: they are the one thing behind the text,
+    // and a selection drawn over one wins. Skipped outside the damage on the
+    // same test the line loop uses below.
     for (rect, quiet) in &fields {
         let rect_bottom = rect.y as i32 + rect.height as i32;
         if rect_bottom <= top || rect.y as i32 >= bottom {
@@ -1580,12 +1276,9 @@ pub fn paint(
         field_rule(window, *rect, window.field_rule_ink(*quiet));
     }
 
-    // The inverted runs go down before the glyphs, which are drawn in white
-    // where they land on one.
-    //
-    // Skipped entirely outside the damage, on the same test the line loop uses
-    // below: a rectangle filled where its line is not being redrawn would leave
-    // a black band with nothing written on it.
+    // The inverted runs go down before the glyphs, which are drawn white where
+    // they land on one. Skipped outside the damage on the same test the line
+    // loop uses below.
     for rect in &selected {
         let rect_bottom = rect.y as i32 + rect.height as i32;
         if rect_bottom <= top || rect.y as i32 >= bottom {
@@ -1596,8 +1289,8 @@ pub fn paint(
 
     for line in &lines {
         let line_bottom = line.y + line.height;
-        // Clipped to the page as well as to the damage: a line that would
-        // reach under the action strip is not drawn at all.
+        // Clipped to the page as well as to the damage: a line reaching under
+        // the action strip is not drawn at all.
         if line_bottom <= top || line.y >= bottom || line.y >= page.bottom as i32 {
             continue;
         }
@@ -1611,10 +1304,8 @@ pub fn paint(
         let mut pen = line.marker.pen(line.prose);
         let baseline = (line.y + line.baseline) as f32;
         // The compact marker first, right-aligned to end on the prose edge and
-        // reaching back into the margin. It may overrun the page's left edge at
-        // the largest sizes on the narrowest setting, and is left to clip
-        // there: `put_pixel` drops what falls off, and what it drops is the
-        // left of the `#` rather than the digit that carries the level.
+        // reaching back into the margin. `put_pixel` clips what overruns the
+        // page's left edge: the left of the `#`, never the digit.
         if let Marker::Compact { level, .. } = line.marker {
             let role = roles.first().copied().unwrap_or(Role::Body);
             let inverted = selection
@@ -1639,17 +1330,16 @@ pub fn paint(
                 x += fonts.advance(role, line.px, ch);
             }
         }
-        // Collected as the pen passes, rather than measured again afterwards:
-        // the rule has to start and stop under the glyphs actually drawn.
+        // Collected as the pen passes: the rule starts and stops under the
+        // glyphs drawn.
         let mut rule: Option<(f32, f32)> = None;
         // The same, for struck-out text — but a *run* at a time: a line can
         // hold two struck phrases with prose between them, and one span from
-        // the first to the last would rule through the prose.
+        // the first to the last rules through the prose.
         let mut struck: Option<(f32, f32)> = None;
         // The face and the ink of the last character drawn, so a division mark
-        // is set in the same ones. Collected as the pen passes rather than
-        // worked out again afterwards, for the reason the rules above are: it
-        // has to match the glyph it follows, whatever decided that glyph.
+        // is set in the same ones. Collected as the pen passes, which is what
+        // matches it to the glyph it follows.
         let mut tail: Option<(Role, u8)> = None;
 
         for i in line.range.clone() {
@@ -1672,8 +1362,7 @@ pub fn paint(
             pen += gap_before(page, line, i);
             let origin_x = pen;
             let advance = fonts.advance(role, line.px, ch);
-            // Before the glyph rather than after it, so a mark can never be
-            // drawn over the character it belongs to.
+            // Before the glyph: a mark is never drawn over its own character.
             if matches!(style, Style::Emphasis | Style::StrongEmphasis) && takes_mark(ch) {
                 let above = mark_above(script_of(ch), region);
                 emphasis_mark(
@@ -1687,8 +1376,8 @@ pub fn paint(
                 );
             }
             fonts.draw(role, line.px, ch, |gx, gy, coverage| {
-                // The rasterizer reports coverage; the panel takes ink. One bit,
-                // because a two-level waveform turns grey into mud.
+                // The rasterizer reports coverage; the panel takes ink. One bit
+                // for a two-level waveform, which turns grey into mud.
                 if coverage <= 0.5 {
                     return;
                 }
@@ -1712,10 +1401,9 @@ pub fn paint(
                 strikethrough(window, line, from, to);
             }
         }
-        // **Past the end of the line, and past the measure with it.** The
-        // margin is at least 8 per cent of the surface, wider than any glyph
-        // on the size ladder, so there is room; `put_pixel` clips at the
-        // surface edge whatever happens.
+        // Past the end of the line, and past the measure with it. The margin is
+        // at least 8 per cent of the surface, wider than any glyph on the size
+        // ladder; `put_pixel` clips at the surface edge.
         if line.hyphenated
             && let Some((role, ink)) = tail
         {
@@ -1745,8 +1433,7 @@ pub fn paint(
         window.fill(rect, ink);
     }
 
-    // Last, over everything: the box floats above the page, and drawing it
-    // before the glyphs would put the prose on top of it.
+    // Last, over everything: the box floats above the page.
     if let Some(rect) = box_now {
         crate::ui::draw_overlay(window, fonts, rect, page.theme.body_px, &labels);
     }
@@ -1932,7 +1619,7 @@ mod tests {
 
     #[test]
     fn a_field_the_focus_only_partly_covers_stays_lit() {
-        // Splitting the box at the boundary would draw one phrase as two.
+        // Splitting the box at the boundary draws one phrase as two.
         let fields = fielded("==one two==", Some(0..5));
         assert_eq!(fields.len(), 1);
         assert!(!fields[0].1);
@@ -1941,11 +1628,8 @@ mod tests {
     #[test]
     fn a_highlight_that_wraps_is_a_field_per_visual_line() {
         // Long enough to wrap the 1272 px surface at the default size, so the
-        // run crosses a soft wrap and has to be drawn as the runs it visually
-        // is — the same rule a selection follows.
-        //
-        // Trimmed, because a closing marker has to follow a non-space the way
-        // an emphasis one does, and a trailing space would leave the run open.
+        // run crosses a soft wrap. Trimmed: a closing marker follows a
+        // non-space, and a trailing space leaves the run open.
         let long = format!("=={}==", "word ".repeat(60).trim_end());
         let fields = fielded(&long, None);
         assert!(
@@ -1959,8 +1643,7 @@ mod tests {
     fn the_ladder_steps_and_stops_at_both_ends() {
         assert_eq!(step_size(46.0, true), 52.0);
         assert_eq!(step_size(46.0, false), 42.0);
-        // No wrapping: the smallest is not one press from the largest, which
-        // would be a surprise rather than a convenience.
+        // No wrapping: the smallest is not one press from the largest.
         assert_eq!(step_size(SIZES[0], false), SIZES[0]);
         assert_eq!(
             step_size(SIZES[SIZES.len() - 1], true),
@@ -1968,8 +1651,8 @@ mod tests {
         );
     }
 
-    /// A size remembered by another build is snapped rather than refused, the
-    /// way a stored cursor past the end is clamped.
+    /// A size remembered by another build snaps to the ladder, the way a stored
+    /// cursor past the end is clamped.
     #[test]
     fn a_size_that_is_no_longer_offered_lands_on_the_nearest() {
         assert_eq!(nearest_size(47.0), 46.0);
@@ -1991,8 +1674,8 @@ mod tests {
         for (percent, _) in MARGINS {
             let theme = Theme::at(px, percent);
             let page = Page::new(&chars, &markup, &theme, (1264, 1680), 1560);
-            // Against a nominal half-em character rather than a face's own, so
-            // this is about the geometry and not about which faces shipped.
+            // Against a nominal half-em character: this is about the geometry,
+            // not about which faces shipped.
             let per_line = page.measure as f32 / (px * 0.5);
             assert!(
                 per_line >= 15.0,
@@ -2025,7 +1708,7 @@ mod tests {
         }
 
         /// The page itself is the largest part of the page, and a tap there
-        /// still places the cursor.
+        /// places the cursor.
         #[test]
         fn the_column_between_them_is_not_an_edge() {
             let theme = Theme::default();
@@ -2039,8 +1722,8 @@ mod tests {
             );
         }
 
-        /// A corner turns a page rather than jumping to an end: it is where a
-        /// thumb strays, and a page turn is the cheaper mistake.
+        /// A corner turns a page. It is where a thumb strays, and a page turn
+        /// is the cheaper mistake.
         #[test]
         fn the_corners_belong_to_the_sides() {
             let theme = Theme::default();
@@ -2090,7 +1773,7 @@ mod tests {
         let h3 = block_px(&theme, Block::Heading(3));
         let body = block_px(&theme, Block::Paragraph);
         assert!(h1 > h2 && h2 > h3 && h3 > body);
-        // Deep headings stop shrinking rather than going below body text.
+        // Deep headings stop shrinking at the body size.
         assert_eq!(block_px(&theme, Block::Heading(6)), body);
     }
 
@@ -2101,7 +1784,7 @@ mod tests {
         assert_eq!(ink(false, true), QUIET);
         // Three distinct values, which is the whole claim: one extra ink level,
         // not a ramp. If QUIET ever collapses onto BLACK the marks stop being
-        // recessive and nothing else in the app would say so.
+        // recessive, and nothing else in the app says so.
         assert_ne!(ink(false, true), ink(false, false));
         // A selection inverts everything it covers, quiet marks included.
         assert_eq!(ink(true, true), WHITE);
@@ -2137,10 +1820,9 @@ mod tests {
 
     #[test]
     fn moving_the_cursor_to_the_next_sentence_makes_the_rows_it_touches_dirty() {
-        // The trap this whole field exists for. A cursor moving between
-        // sentences changes no text, no size and no position — so without
-        // focus in the comparison both rows count as unchanged, never repaint,
-        // and the dimming lags a sentence behind the cursor.
+        // The trap this field exists for. A cursor moving between sentences
+        // changes no text, no size and no position, and both rows count as
+        // unchanged without `focus` in the comparison.
         let text = "One here. Two there.";
         let chars: Vec<char> = text.chars().collect();
         let mut before = line(0..20, 0);
@@ -2151,8 +1833,8 @@ mod tests {
         after.focus = 10..20;
         assert!(!previous.unchanged(0, &chars, &after));
 
-        // And a row whose focus did not move is still left alone, or every
-        // keystroke would repaint the page.
+        // And a row whose focus did not move is left alone: a keystroke
+        // repaints one row.
         let mut same = line(0..20, 0);
         same.focus = 0..9;
         assert!(previous.unchanged(0, &chars, &same));
@@ -2162,13 +1844,11 @@ mod tests {
     fn the_body_size_is_readable_on_a_ten_inch_page() {
         let theme = Theme::default();
         // ~300 ppi, so 1 pt is about 4.17 px. Below 10 pt is footnote type on a
-        // page nearly as large as A4, which is why the ladder starts where it
-        // does.
+        // page nearly as large as A4, and the ladder starts above it.
         let pt = theme.body_px / 4.17;
         assert!((10.0..=12.0).contains(&pt), "body is {pt} pt");
-        // Against a nominal half-em character rather than the face's own, so
-        // this checks the page a writer opens and not the arithmetic that set
-        // it.
+        // Against a nominal half-em character: this checks the page a writer
+        // opens, not the arithmetic that set it.
         let latin_advance = theme.body_px * 0.5;
         let (_, measure) = column(&theme, 1860);
         let chars_per_line = measure as f32 / latin_advance;
@@ -2360,9 +2040,8 @@ mod tests {
         assert!(line.baseline <= line.inset + glyph_box);
     }
 
-    /// A stand-in dictionary that divides one word, so that the wiring from
-    /// `wrap` through `layout` to the mark on the row can be tested without
-    /// the firmware's files.
+    /// A stand-in dictionary that divides one word. It carries the wiring from
+    /// `wrap` through `layout` to the mark on the row, off the firmware files.
     fn dividing() -> karyll_core::Hyphenator {
         karyll_core::Hyphenator::from_patterns("UTF-8\nLEFTHYPHENMIN 2\nRIGHTHYPHENMIN 2\nn1a\n")
             .expect("a dictionary of one pattern")
@@ -2397,8 +2076,8 @@ mod tests {
         );
         assert!(!lines[1].hyphenated, "the last row took a mark");
 
-        // The same page with no dictionary divides nothing, and the rows still
-        // tile the text either way.
+        // The same page with no dictionary divides nothing, and the rows tile
+        // the text either way.
         let plain = Page::new(&chars, &markup, &narrow, (200, 2480), 2360);
         let plain_lines = layout(&plain, &mut Stub, 0);
         assert!(plain_lines.iter().all(|l| !l.hyphenated));
@@ -2442,8 +2121,8 @@ mod tests {
         let line = &lines[0];
         assert_eq!(bar.y as i32, line.y + line.inset);
         assert_eq!(bar.height as i32, line.height - 2 * line.inset);
-        // And still inside the rectangle that repaints the row, or clearing it
-        // would leave a stripe behind.
+        // And inside the rectangle that repaints the row, which clears it
+        // whole.
         assert!(bar.y as i32 >= line.y);
         assert!(bar.y as i32 + bar.height as i32 <= line.y + line.height);
     }
@@ -2645,7 +2324,7 @@ mod tests {
     #[test]
     fn writing_normally_lets_the_cursor_run_to_the_foot_of_the_page() {
         // A page that slides as soon as the cursor passes 40% down is half a
-        // focus mode. Nothing may move while the row is still on the page.
+        // focus mode. Nothing may move while the row is on the page.
         let lines = vec![
             para(0..6, 0, 100),
             para(7..13, 1, 500),
@@ -2663,8 +2342,7 @@ mod tests {
 
     #[test]
     fn a_page_already_scrolled_stays_where_it_is_while_the_cursor_is_visible() {
-        // Standing still is what makes this an editor rather than a focus
-        // mode: only leaving the page moves it.
+        // Only leaving the page moves it, which is what makes this an editor.
         let lines = vec![para(0..6, 0, 500), para(7..13, 1, 900)];
         assert_eq!(scroll_for(&lines, 9, 300, FOLLOW), 300);
     }
@@ -2710,7 +2388,7 @@ mod tests {
     fn focus_mode_centres_the_sentence_rather_than_the_caret_row() {
         // Measured off an iA Writer capture: a sentence wrapped across two
         // rows put the caret half a line below the middle and the midpoint of
-        // the two rows on it. Centring the caret row would answer 4467 here.
+        // the two rows on it. Centring the caret row answers 4467 here.
         let lines = vec![
             unfocused(0..6, 0, 100),
             focused(7..13, 1, 4900),
@@ -2729,8 +2407,8 @@ mod tests {
 
     #[test]
     fn a_sentence_taller_than_the_page_keeps_the_caret_on_it_instead() {
-        // Centring a sentence longer than the page would scroll the caret off
-        // the bottom, which is worse than not centring.
+        // Centring a sentence longer than the page scrolls the caret off the
+        // bottom.
         let mut lines: Vec<VisualLine> = (0..40)
             .map(|i| focused(i * 2..i * 2 + 2, i, 100 + i as i32 * 34))
             .collect();
@@ -2738,9 +2416,8 @@ mod tests {
         // The sentence spans 100..1460, far taller than the 900 of page. The
         // caret is on the last of its rows, 1426..1460, whose middle is 1443.
         assert_eq!(scroll_for(&lines, 78, 0, CENTRE), 1443 - 550);
-        // Which is the point of the guard: centring the sentence would answer
-        // 230, and the caret row would then be drawn below the foot of the
-        // page rather than on it.
+        // Which is the point of the guard: centring the sentence answers 230,
+        // and the caret row draws below the foot of the page.
         let centred = (100 + 1460) / 2 - 550;
         assert!(1426 - centred > 1000, "the caret would be off the page");
     }
@@ -2769,17 +2446,15 @@ mod tests {
                 bottom: 1860
             }
         );
-        // A jump centres by the same measure and for its own reason: following
-        // would pin a search hit to whichever edge it arrived by, so the writer
-        // sees everything before their match and nothing after it.
+        // A jump centres by the same measure. Following pins a search hit to
+        // whichever edge it arrived by.
         assert_eq!(
             scroll_mode(false, true, false, 160, strip_top, panel),
             scroll_mode(true, false, false, 160, strip_top, panel)
         );
     }
 
-    /// Landing outranks both, because it is the one paint where the writer has
-    /// said where they want to be.
+    /// Landing outranks both: it is the one paint the writer aimed.
     #[test]
     fn landing_on_a_section_beats_focus_and_beats_a_search_hit() {
         let panel = 1860;
@@ -2795,8 +2470,8 @@ mod tests {
     /// asked for above the fold.
     #[test]
     fn a_section_chosen_from_the_outline_arrives_at_the_top() {
-        // A page of rows, and a jump to one far down it from a page still at
-        // the top of the document.
+        // A page of rows, and a jump to one far down it from the top of the
+        // document.
         let rows = || -> Vec<VisualLine> {
             (0..40)
                 .map(|i| para(i * 10..i * 10 + 6, i, 160 + i as i32 * 60))
@@ -2811,8 +2486,8 @@ mod tests {
         let mut shifted = rows();
         shift(&mut shifted, landed);
         assert_eq!(shifted[30].y, 160);
-        // Following would have put it at the foot of the page instead, with
-        // every word of the section below the fold.
+        // Following puts it at the foot of the page, with every word of the
+        // section below the fold.
         let followed = scroll_for(
             &lines,
             heading,
@@ -2834,7 +2509,7 @@ mod tests {
     fn landing_on_the_first_heading_does_not_push_blank_paper_above_it() {
         let lines = vec![para(0..6, 0, 160), para(7..13, 1, 220)];
         assert_eq!(scroll_for(&lines, 0, 0, Scroll::Top { top: 160 }), 0);
-        // And from further down the document, it still comes back to zero.
+        // And from further down the document, it comes back to zero.
         assert_eq!(scroll_for(&lines, 0, 900, Scroll::Top { top: 160 }), 0);
     }
 
@@ -3041,9 +2716,8 @@ mod tests {
             );
         }
 
-        /// A finger in the margin still meant somewhere, so this answers rather
-        /// than declining — otherwise a tap below the last line does nothing at
-        /// all, which reads as the app having missed it.
+        /// A finger in the margin meant somewhere. This answers: a tap below
+        /// the last line lands at the end of it.
         #[test]
         fn a_point_past_the_text_lands_at_the_near_end_of_it() {
             let (chars, markup) = navigable("one two");
@@ -3163,12 +2837,8 @@ Plain prose here, long enough that it wraps on every panel this app runs on, at 
         }
 
         /// And on every panel, at every margin and every size — first rows and
-        /// continuations alike.
-        ///
-        /// The one exception is a marker the margin cannot take in any form,
-        /// which stays in the column: that logical line's prose is a marker's
-        /// width in from the flush edge, and its first row starts on the edge.
-        /// Every row of it still shares one prose edge, which is 1a.
+        /// continuations alike. The one exception is a marker the margin cannot
+        /// take in any form, which stays in the column.
         #[test]
         fn the_flush_edge_holds_across_every_panel_margin_and_size() {
             for panel in PANELS {
@@ -3208,8 +2878,7 @@ Plain prose here, long enough that it wraps on every panel this app runs on, at 
         }
 
         /// **1a: a wrapped item hangs under its own prose**, not under its
-        /// bullet. This is what makes a list of two-line items still read as a
-        /// list.
+        /// bullet, which is what makes a list of two-line items read as a list.
         #[test]
         fn a_wrapped_item_continues_under_its_prose() {
             // A narrow column, so the item wraps.
@@ -3235,10 +2904,8 @@ Plain prose here, long enough that it wraps on every panel this app runs on, at 
             );
         }
 
-        /// **A nested item keeps its indent, and only its marker hangs.**
-        /// Hanging the indent along with the marker would put every level of a
-        /// list on the same edge, which is a list that has stopped saying what
-        /// is under what.
+        /// A nested item keeps its indent, and only its marker hangs. Hanging
+        /// the indent puts every level of a list on one edge.
         #[test]
         fn nesting_still_shows_and_the_marker_still_hangs() {
             let theme = Theme::default();
@@ -3282,7 +2949,7 @@ Plain prose here, long enough that it wraps on every panel this app runs on, at 
 
         /// Deep hashes set in full where the margin takes them and as `#N`
         /// where it does not — and never on h1, whose `#` is one glyph where
-        /// `#1` would be two.
+        /// `#1` is two.
         #[test]
         fn deep_headings_compact_only_where_the_margin_is_too_narrow() {
             let wide = Theme::at(42.0, MARGINS[2].0);
@@ -3306,15 +2973,14 @@ Plain prose here, long enough that it wraps on every panel this app runs on, at 
             });
         }
 
-        /// **The sequence a writer sees deleting hashes back to `###`.** The
-        /// caret does not move and the prose does not move; only the digit
-        /// changes, and the marker expands into the margin the moment there is
-        /// room for it.
+        /// The sequence a writer sees deleting hashes back to `###`. The caret
+        /// holds and the prose holds; the digit changes, and the marker expands
+        /// into the margin as soon as there is room.
         #[test]
         fn deleting_a_hash_changes_the_marker_and_moves_nothing() {
             // The largest type on the smallest panel, at a margin that can
-            // still take a shallow heading's hashes — so the run passes through
-            // both forms.
+            // take a shallow heading's hashes: the run passes through both
+            // forms.
             let theme = Theme::at(80.0, MARGINS[1].0);
             let mut seen = Vec::new();
             for level in (1..=6).rev() {
@@ -3322,8 +2988,8 @@ Plain prose here, long enough that it wraps on every panel this app runs on, at 
                 on_page(&text, &theme, (1264, 1680), |page, lines, fonts| {
                     let row = &lines[0];
                     // Two glyphs stand for the whole marker, so every position
-                    // inside it draws in one place and the caret holds still
-                    // while the hashes come off.
+                    // inside it draws in one place, and the caret holds while
+                    // the hashes come off.
                     if matches!(row.marker, Marker::Compact { .. }) {
                         for at in 0..=level {
                             assert_eq!(
