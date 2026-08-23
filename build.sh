@@ -238,9 +238,8 @@ build_abi() {
     # with it, `Scrt1.o` being the shared-style start file.
     SYSROOT_FLAGS="$SYSROOT_FLAGS -C relocation-model=static -C link-arg=-no-pie"
 
-    # Lazy binding, which the device's own loader takes. `LD_DEBUG=reloc` on
-    # glibc 2.20 shows every library relocating `(lazy)` and karyll, relocated
-    # eagerly, segfaulting inside the loader.
+    # Lazy binding, which the device's own loader takes. Eager relocation
+    # segfaults inside it.
     SYSROOT_FLAGS="$SYSROOT_FLAGS -C relro-level=partial"
     for o in crt1.o crti.o crtn.o; do
         SYSROOT_FLAGS="$SYSROOT_FLAGS -C link-arg=$SYSROOT/usr-lib/$o"
@@ -284,9 +283,8 @@ build_abi() {
         esac
     done
 
-    # **The float ABI, read back out of what was actually produced.** It is the
-    # one property that decides whether the file can start at all, and getting
-    # the flags reports what was asked for.
+    # **The float ABI, read back out of the file produced.** It decides
+    # whether the file can start at all.
     got=$(elf_float_abi "$BIN")
     want=$(abi_float "$abi")
     [ "$got" = "$want" ] || {
@@ -366,23 +364,22 @@ echo "==> Bundling the Bluetooth stack $HID_VERSION"
 # ./koreader-plugin holds a KOReader Lua plugin.
 tar xzf "$TARBALL" -C "$EXT/hid" \
     --exclude="./koreader-plugin" --exclude="./config.ini"
-# The release ships no LICENSE; GPLv3 asks that one travel with the binaries.
+# The release ships no LICENSE; this copies one beside the binaries.
 if [ -f "$ROOT/LICENSE" ]; then
     cp "$ROOT/LICENSE" "$EXT/hid/LICENSE"
 fi
 printf 'kindle-hid-passthrough %s\nsource: https://github.com/zampierilucas/kindle-hid-passthrough\ntarball sha256: %s\nkoreader-plugin/ omitted; LICENSE added (upstream ships none, and it is GPLv3).\n' \
     "$HID_VERSION" "$HID_SHA256" > "$EXT/hid/PROVENANCE"
 
-# The writing faces. No Kindle carries a monospace text face: the devices probed
-# ship the same 87 faces and the only file named for the word is a symbol font.
-# Fetched, pinned to a commit, and checksummed per file.
+# The writing faces. No Kindle carries a monospace text face. Fetched, pinned
+# to a commit, and checksummed per file.
 FONTS_COMMIT=f32c04c3058a75d7ce28919ce70fe8800817491b
 FONTS_CACHE="$ROOT/deploy/fonts"
 FONTS_RAW="https://raw.githubusercontent.com/iaolo/iA-Fonts/$FONTS_COMMIT"
 
-# sha256, the directory under the repository root, and the file. Only the static
-# cuts: the variable files carry no bold at all, and nothing here sets a
-# variation axis, and draw one weight under four names.
+# sha256, the directory under the repository root, and the file. Only the
+# static cuts: the variable files carry no bold, nothing here sets a variation
+# axis, and they draw one weight under four names.
 FONTS_MANIFEST="
 454a20d2b4569ba66810f0f710bb022065cbaac11c82fdcef677545ab27329f2 iA%20Writer%20Duo/Static iAWriterDuoS-Regular.ttf
 8e15abab476026abd362d079fd519e9c1220e0ab32b3ce3e4c13695af53e7153 iA%20Writer%20Duo/Static iAWriterDuoS-Italic.ttf

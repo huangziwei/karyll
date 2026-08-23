@@ -41,8 +41,7 @@ pub mod code {
     pub const BRIGHTNESSUP: u16 = 225;
     /// `Q` decides whether an input device is a keyboard.
     pub const Q: u16 = 16;
-    /// The first button code. A keyboard's descriptor may carry buttons
-    /// beside its keys, and they arrive on the same node.
+    /// The first button code. Codes at and above it are buttons, not keys.
     pub const BTN_MISC: u16 = 0x100;
 }
 
@@ -52,8 +51,8 @@ pub struct Mods {
     pub shift: bool,
     pub ctrl: bool,
     pub alt: bool,
-    /// `KEY_RIGHTALT`. On `German` this is AltGr and the one way to
-    /// `@ € [ ] { } \ | ~`; on `Us` it is the same key as `alt`.
+    /// `KEY_RIGHTALT`. On `German` this is AltGr and the one way to the third
+    /// legends; on `Us` it is the same key as `alt`.
     pub altgr: bool,
     /// ⌘. `chord` takes it with `ctrl`; `movement` reads the two apart.
     pub meta: bool,
@@ -280,27 +279,27 @@ const KEYPAD: &[(u16, char)] = &[
     (80, '2'), (81, '3'), (82, '0'), (83, '.'), (98, '/'),
 ];
 
-/// German QWERTZ. Punctuation moves, the umlauts take the `; ' [` positions,
-/// `@ € [ ] { } \ | ~` sit on AltGr, and code 86 is the key beside the left
-/// shift. `´`, `` ` `` and `^` produce themselves: `´` then `a` gives `´a`.
+/// German QWERTZ. The umlauts take the `; ' [` positions, code 86 is the key
+/// beside the left shift, and AltGr carries a third legend on every key that
+/// has one. `´`, `` ` `` and `^` produce themselves: `´` then `a` gives `´a`.
 #[rustfmt::skip]
 const GERMAN: &[Key] = &[
-    (2, '1', '!', None),        (3, '2', '"', Some('²')),  (4, '3', '§', Some('³')),
-    (5, '4', '$', None),        (6, '5', '%', None),       (7, '6', '&', None),
+    (2, '1', '!', Some('¹')),   (3, '2', '"', Some('²')),  (4, '3', '§', Some('³')),
+    (5, '4', '$', Some('¼')),   (6, '5', '%', Some('½')),  (7, '6', '&', Some('¬')),
     (8, '7', '/', Some('{')),   (9, '8', '(', Some('[')),  (10, '9', ')', Some(']')),
     (11, '0', '=', Some('}')),  (12, 'ß', '?', Some('\\')), (13, '´', '`', None),
     (16, 'q', 'Q', Some('@')),  (17, 'w', 'W', None),      (18, 'e', 'E', Some('€')),
-    (19, 'r', 'R', None),       (20, 't', 'T', None),      (21, 'z', 'Z', None),
+    (19, 'r', 'R', None),       (20, 't', 'T', None),      (21, 'z', 'Z', Some('←')),
     (22, 'u', 'U', None),       (23, 'i', 'I', None),      (24, 'o', 'O', None),
     (25, 'p', 'P', None),       (26, 'ü', 'Ü', None),      (27, '+', '*', Some('~')),
-    (30, 'a', 'A', None),       (31, 's', 'S', None),      (32, 'd', 'D', None),
+    (30, 'a', 'A', None),       (31, 's', 'S', Some('ſ')), (32, 'd', 'D', None),
     (33, 'f', 'F', None),       (34, 'g', 'G', None),      (35, 'h', 'H', None),
-    (36, 'j', 'J', None),       (37, 'k', 'K', None),      (38, 'l', 'L', None),
-    (39, 'ö', 'Ö', None),       (40, 'ä', 'Ä', None),      (41, '^', '°', None),
-    (43, '#', '\'', None),      (44, 'y', 'Y', None),      (45, 'x', 'X', None),
+    (36, 'j', 'J', None),       (37, 'k', 'K', None),      (38, 'l', 'L', Some('ł')),
+    (39, 'ö', 'Ö', None),       (40, 'ä', 'Ä', None),      (41, '^', '°', Some('′')),
+    (43, '#', '\'', Some('’')),  (44, 'y', 'Y', Some('»')), (45, 'x', 'X', Some('«')),
     (46, 'c', 'C', None),       (47, 'v', 'V', None),      (48, 'b', 'B', None),
-    (49, 'n', 'N', None),       (50, 'm', 'M', Some('µ')), (51, ',', ';', None),
-    (52, '.', ':', None),       (53, '-', '_', None),      (86, '<', '>', Some('|')),
+    (49, 'n', 'N', None),       (50, 'm', 'M', Some('µ')), (51, ',', ';', Some('·')),
+    (52, '.', ':', Some('…')),  (53, '-', '_', Some('–')), (86, '<', '>', Some('|')),
 ];
 
 /// The character a printable key produces, if it is one.
@@ -512,7 +511,7 @@ mod tests {
 
     #[test]
     fn hello_decodes_from_the_codes_the_device_reported() {
-        // The key codes captured on the Scribe when "hello" was typed.
+        // The key codes for "hello".
         let typed: String = [35u16, 18, 38, 38, 24]
             .iter()
             .filter_map(|c| character(*c, plain(), Layout::Us))
@@ -1152,6 +1151,20 @@ mod tests {
                 (11, '}'),
                 (16, '@'),
                 (18, '€'),
+                (86, '|'),
+                (12, '\\'),
+                (52, '…'),
+                (53, '–'),
+                (44, '»'),
+                (45, '«'),
+                (51, '·'),
+                (43, '’'),
+                (7, '¬'),
+                (6, '½'),
+                (5, '¼'),
+                (2, '¹'),
+                (21, '←'),
+                (38, 'ł'),
             ] {
                 assert_eq!(character(code, altgr, Layout::German), Some(want));
             }

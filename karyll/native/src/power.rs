@@ -1,6 +1,5 @@
-//! `preventScreenSaver` and `flIntensity` on `com.lab126.powerd`. One latch
-//! covers the screensaver, the suspend behind it and WiFi; the other sets the
-//! frontlight.
+//! `preventScreenSaver` covers the screensaver, the suspend behind it and
+//! WiFi; `flIntensity` sets the frontlight. Both sit on `com.lab126.powerd`.
 
 use std::process::Command;
 
@@ -28,7 +27,7 @@ pub fn prevent_screensaver(on: bool) {
 const FRONTLIGHT_STEPS: i32 = 8;
 
 /// Take the frontlight one step brighter or dimmer. `flMaxIntensity` is the
-/// ceiling; a device answering neither property has none to set.
+/// ceiling; either property missing leaves nothing to set.
 pub fn step_frontlight(up: bool) {
     let (Some(at), Some(max)) = (intensity("flIntensity"), intensity("flMaxIntensity")) else {
         eprintln!("power: no frontlight to set");
@@ -55,8 +54,7 @@ fn stepped(at: i32, max: i32, up: bool) -> i32 {
     want.clamp(0, max)
 }
 
-/// One of the integer properties on `com.lab126.powerd`. Read the way
-/// `/usr/sbin/loginfo` reads `flIntensity`.
+/// One of the integer properties on `com.lab126.powerd`.
 fn intensity(property: &str) -> Option<i32> {
     let out = Command::new("lipc-get-prop")
         .args(["com.lab126.powerd", property])
