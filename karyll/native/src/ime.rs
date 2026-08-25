@@ -1,46 +1,23 @@
-//! CJK input: two languages through Amazon's own predictor plugins, and one
-//! karyll composes itself.
+//! CJK input: two languages through the device's own predictor plugins, and
+//! one karyll composes itself.
 //!
-//! [`Korean`] is the one karyll composes. It needs no dictionary, no candidate
-//! list and no segmenter — a Hangul syllable is arithmetic on a code point and
-//! the words are spaced — so it is three tables and a state machine, and all of
-//! it runs under `cargo test`. Everything below it is the two that are a
-//! binding.
+//! [`Korean`] is the composed one — a Hangul syllable is arithmetic on a code
+//! point, so it is three tables and a state machine, all under `cargo test`.
+//! The rest of this file is a binding.
 //!
-//! The device ships a complete IME for each of twenty languages under
-//! `/usr/share/keyboard/<locale>/libpredictor.so.1` — engine, dictionaries and
-//! keyboard databases. karyll drives those plugins directly rather than
-//! reimplementing pinyin or romaji, which is why the whole of this file is a
-//! binding and almost none of it is linguistics.
+//! The device ships an IME per locale under
+//! `/usr/share/keyboard/<locale>/libpredictor.so.1` — engine, dictionaries
+//! and keyboard databases. Two are driven: **Chinese** is `zh_CN`, XT9 over
+//! `libxt9a`; **Japanese** is `ja`, Omron iWnn over `libwlf` with ICU doing
+//! romaji to kana from `hiragana_rules.txt`. The plugins share one ABI —
+//! `libkb`'s — so [`Plugin`] is written once.
 //!
-//! Two are used. **Chinese** is `zh_CN`, XT9 over `libxt9a`, and **Japanese** is
-//! `ja`, Omron iWnn over `libwlf` with ICU doing the romaji-to-kana
-//! transliteration from Amazon's own `hiragana_rules.txt`. They are different
-//! engines with different dictionaries, and they share one ABI — the table
-//! below is `libkb`'s, not any one language's — so [`Plugin`] is written once
-//! and the languages differ only in the facts around it.
-//!
-//! `load(host)` returns a 48-byte block of function pointers and, importantly,
-//! **performs the entire engine initialisation itself**. For Chinese that is
-//! `ET9CPSysInit`, `ET9CPLdbInit`, `ET9CPSetInputMode`, `ET9CPSetFullSentence`,
-//! `ET9CPUdbActivate`, `ET9KDB_Init`, `ET9KDB_SetPageNum`,
-//! `ET9KDB_SetDiscreteMode` and the `mmap` of the two databases; for Japanese
-//! it is `wlf_init`, `wlf_set_state`, `wlf_load_lang` on
-//! `/usr/share/keyboard/ja/JA.conf` and `wlf_set_active_lang`. Nothing in the
-//! table brings the engine up. By the time `load()` returns, it is up, and the
-//! table is a *session* API.
-//!
-//! Three things about the calling convention, each of which was got wrong at
-//! least once and cost a device round trip:
-//!
-//! * **There is no `self`/context argument.** Every slot resolves its own
-//!   context PC-relative from the plugin's `.bss`. The pointer `load()` stores
-//!   at `+0x2c` is its own bookkeeping, not something to pass back.
-//! * **`userData` is the last argument**, not the first, and the plugin only
-//!   ever logs it. `0` is what we send.
-//! * **`+0x00` and `+0x08` are the teardown pair**, not the setup pair. Calling
-//!   them first unloads and closes the engine `load()` just built, and
-//!   everything after that runs on freed memory.
+//! `load(host)` performs the entire engine initialisation — for Chinese
+//! `ET9CPSysInit`, `ET9CPLdbInit`, `ET9CPSetInputMode`,
+//! `ET9CPSetFullSentence`, `ET9CPUdbActivate`, the `ET9KDB_*` setup and the
+//! `mmap` of both databases; for Japanese `wlf_init`, `wlf_set_state`,
+//! `wlf_load_lang` on `JA.conf` and `wlf_set_active_lang` — and returns a
+//! 48-byte block of function pointers, a *session* API:
 //!
 //! | slot | signature |
 //! |---|---|
@@ -53,46 +30,41 @@
 //! | `+0x18` | commit: `(index: u32, userData) -> int` |
 //! | `+0x1c` | `prv_get_candidate_list(out: *mut *mut c_char, count: *mut u32, userData)` |
 //!
-//! **The order is the ABI. The addresses are not**, and neither is anything
-//! else about a particular build: the same function sits somewhere different in
-//! every firmware, two builds of one language can agree on all their code and
-//! still differ in `.bss`, and an offset copied out of one disassembly points
-//! at arbitrary memory in the next. So no address is written down here. The
-//! plugin is found in `/proc/self/maps` from a pointer it produced itself (see
-//! [`Mapping`]), and the engine state karyll reads directly is found by asking
-//! the running engine — the phonetic context by the magic it stamps on itself,
-//! the pending keys by typing at it and watching which words move.
+//! The calling convention:
 //!
-//! Both unnamed slots are unnamed because they carry no entry trace, not
-//! because they are obscure: every other slot logs its own `__func__` and these
-//! two never log at all. `+0x18` is `prv_candidate_selected` in Chinese and has
-//! no name in Japanese.
+//! * **No `self`/context argument.** Every slot resolves its own context
+//!   PC-relative from the plugin's `.bss`; the pointer `load()` stores at
+//!   `+0x2c` is its own bookkeeping.
+//! * **`userData` is the last argument**, and the plugin only logs it.
+//!   [`USER_DATA`] is what karyll sends.
+//! * **`+0x00` and `+0x08` are the teardown pair.** Called first, they close
+//!   and unload the engine `load()` built, and every call after them runs on
+//!   freed memory.
 //!
-//! All return `int`, 0 = ok — **except `+0x1c`, which returns nothing**. It is
-//! the one slot that never sets `r0` on its exit path, so a caller reads
-//! leftover register content — arbitrary non-zero values on calls that produced
-//! perfect candidates. Treating it as a status means never showing a candidate.
-//! The out-count is the answer.
+//! **The order is the ABI. The addresses are not**: the same function sits
+//! somewhere different in every firmware, and two builds of one language can
+//! agree on all their code and still differ in `.bss`. No address is written
+//! down here — the plugin is found in `/proc/self/maps` from a pointer it
+//! produced itself (see [`Mapping`]), and engine state is found by asking
+//! the running engine: the phonetic context by the magic it stamps on
+//! itself, the pending keys by typing at it and watching which words move.
 //!
-//! `+0x1c` fills a caller-supplied `char *` array with pointers **borrowed**
-//! from the plugin's own fixed-stride candidate table, valid only until the
-//! next call, and overwrites `*count` with how many it produced. Commit takes
-//! the index of that same table, so the caller always already holds the text it
-//! committed: the host callback that reports it is confirmation, not delivery.
+//! All slots return `int`, 0 = ok — **except `+0x1c`, which returns
+//! nothing**: its exit path never sets `r0`, and the out-count is the
+//! answer. It fills the caller's array with pointers **borrowed** from the
+//! plugin's own fixed-stride candidate table, valid until the next call, and
+//! overwrites `*count` with how many it produced. Commit takes an index into
+//! that same table, so the caller holds the text it committed; the host
+//! callback reporting it is confirmation, not delivery.
 //!
-//! **A commit does not have to consume the whole reading**, and the two engines
-//! part company over what becomes of the rest. Chinese's commit slot handles it
-//! itself: `ET9CPGetSelection` reports how many symbols the chosen phrase
-//! covered, and the slot re-feeds every key past that one back through
-//! `prv_key_handler`, so it returns already composing the remainder. Japanese's
-//! ends by zeroing its composition buffer, so what the candidate did not cover
-//! is gone. Either way the caller has to ask what is left rather than assume a
-//! commit ended the word — assuming it strands the remainder inside the engine,
-//! where it joins the front of the next word typed.
+//! **A commit need not consume the whole reading.** Chinese's commit slot
+//! re-feeds every key past the chosen phrase through `prv_key_handler` and
+//! returns composing the remainder; Japanese's ends by zeroing its
+//! composition buffer. Either way the caller asks what is left — a remainder
+//! left inside the engine joins the front of the next word typed.
 //!
 //! The key is a **Unicode codepoint** — ASCII for pinyin and romaji, not a
-//! keycode and not an index. Each engine handles a couple of keys itself, which
-//! is why they are forwarded rather than special-cased here.
+//! keycode and not an index. Each engine handles a couple of keys itself.
 
 use std::ffi::{c_char, c_void};
 use std::ops::Range;
@@ -121,40 +93,23 @@ pub trait Ime {
     fn key(&mut self, key: char) -> Vec<String>;
 
     /// Accept candidate `index`, and hand back whatever reading it left
-    /// unconverted.
-    ///
-    /// It returns no committed text, because the caller already has that — it
-    /// is the candidate it just selected. The plugin does hand the committed
-    /// string back through a host callback, but that is confirmation, not
-    /// delivery.
-    ///
-    /// What it does return is the other half of the answer. A candidate can
-    /// cover the front of the reading and leave the rest, and then the word is
-    /// not over: it carries on with a shorter reading and a new list of
-    /// candidates. `None` is a word that is finished.
+    /// unconverted: a candidate can cover the front of the reading, and the
+    /// word then carries on with the rest. `None` is a finished word. The
+    /// committed text is the candidate the caller selected, and is not
+    /// returned.
     fn commit(&mut self, index: usize) -> Option<Rest>;
 
     /// Abandon whatever is being composed.
     fn clear(&mut self);
 
-    /// Hand back Traditional characters rather than Simplified.
-    ///
-    /// The device ships exactly one Chinese *keyboard* database — `zh_CN.ldb`,
-    /// which is Simplified pinyin — so Traditional is not a second engine but
-    /// the same candidates converted. Amazon's own Traditional locales are
-    /// Cangjie and Zhuyin, neither of which is pinyin, so there was never a
-    /// stock Traditional-from-pinyin to borrow. The Traditional word list under
-    /// `/usr/lib/mmseg/tcn` is no help here: it says where words end, not which
-    /// characters a sound could be.
+    /// Hand back Traditional characters. The device's one Chinese keyboard
+    /// database, `zh_CN.ldb`, is Simplified pinyin; Traditional is the same
+    /// candidates converted.
     fn set_traditional(&mut self, traditional: bool);
 
-    /// The engine's own reading of what has been typed, when it keeps one.
-    ///
-    /// Japanese needs this and Chinese does not, which is the whole reason it
-    /// exists. Pinyin *is* the letters typed, so karyll can show them itself;
-    /// romaji is not what the writer means to see — typing `nihon` should show
-    /// にほん, and only the engine knows that, because it holds the ICU
-    /// transliteration. `None` means "show what was typed".
+    /// The engine's own reading of what has been typed, when it keeps one:
+    /// romaji has become kana — `nihon` shows にほん — and only the engine
+    /// holds the transliteration. `None` means "show what was typed".
     fn preedit(&self) -> Option<String> {
         None
     }
@@ -174,36 +129,20 @@ pub struct Rest {
 /// and matches the number row, which is how they are chosen.
 pub const WANTED: usize = 10;
 
-/// How many to keep behind them, for the writer to page through.
-///
-/// A word whose candidate is not in the first ten is exactly the word that
-/// needs the rest of the list, and without this there is no way to reach it.
-/// Five pages rather than everything the engine has: **Chinese clamps its
-/// answer to the count it is asked for**, and each candidate past that count
-/// costs an `ET9CPGetPhrase` on every keystroke, while the pages past the fifth
-/// are ones no writer pages to.
+/// How many to keep behind them, for paging. **Chinese clamps its answer to
+/// the count it is asked for**, and each candidate past that count costs an
+/// `ET9CPGetPhrase` on every keystroke.
 pub const KEPT: usize = 5 * WANTED;
 
 /// CJK punctuation for the ASCII key that produces it.
 ///
-/// Amazon's own keymaps are no help: they are on-screen keyboards with a *page*
-/// of symbols to tap, so they never had to map a physical punctuation key onto
-/// its CJK form. Neither does either engine — `hiragana_rules.txt` maps letters
-/// and nothing else, so a `.` typed in Japanese mode reaches the preedit as a
-/// full stop and stays one. This is the half of "typing CJK" that has nothing
-/// to do with prediction, and every bit of it has to be supplied here.
+/// Neither engine supplies any: `hiragana_rules.txt` maps letters and
+/// nothing else, so a `.` typed in Japanese mode reaches the preedit as a
+/// full stop and stays one. Every CJK mark comes from here.
 ///
-/// **macOS is the reference**, by user instruction: it is what these hands
-/// already know, so where a mapping is arguable karyll copies it rather than
-/// picking. That is why Chinese puts both bracket pairs on the bracket keys and
-/// Japanese puts 「」 on the unshifted ones, matching a JIS keyboard.
-///
-/// Deliberately not exhaustive, and the same reasoning in both languages: `-`,
-/// `/`, `=`, `+`, `%`, `#`, `&` and `*` stay as they are, because their CJK
-/// forms are rare in prose and a writer who wanted one would be more surprised
-/// than served. `$` is left alone for the same reason — mapping it to ￥ is
-/// conventional, but this is a bilingual writer's editor and a dollar sign in
-/// CJK text is likelier than a yuan sign.
+/// **macOS's CJK inputs are the reference** where a mapping is arguable.
+/// Not exhaustive: `-`, `/`, `=`, `+`, `%`, `#`, `&`, `*` and `$` stay
+/// ASCII — their CJK forms are rare in prose.
 fn punctuation(script: Script, key: char) -> Option<Punct> {
     let fixed = |s| Some(Punct::Fixed(s));
     // Shared by both: sentence marks differing only in the comma, and the
@@ -259,9 +198,7 @@ fn punctuation(script: Script, key: char) -> Option<Punct> {
             '<' => fixed("〈"),
             '>' => fixed("〉"),
             '~' => fixed("〜"),
-            // Japanese doubles neither: 〜 already spans, and the ellipsis is
-            // written as a pair only in typeset prose, which is a decision for
-            // the writer rather than the keyboard.
+            // Japanese doubles neither the dash nor the ellipsis.
             _ => common(),
         },
     }
@@ -273,13 +210,8 @@ enum Punct {
     Paired(&'static str, &'static str),
 }
 
-/// The quote-pairing state, which is the only thing about punctuation that has
-/// to be remembered between keystrokes.
-///
-/// Chinese quotation marks are directional and the keyboard has one key for
-/// each pair, so the same key has to alternate. Kept per document rather than
-/// per paragraph: a quotation that opens on one line and closes three lines
-/// later is ordinary prose.
+/// The quote-pairing state, per document. Chinese quotation marks are
+/// directional with one key per pair, so the key alternates.
 #[derive(Default)]
 pub struct Punctuation {
     double_open: bool,
@@ -329,16 +261,14 @@ pub enum Compose {
     PreviousPage,
     /// Insert the Chinese form of this ASCII punctuation key.
     Punctuate(char),
-    /// Insert the pinyin exactly as typed and stop composing. Enter does this,
-    /// so an English word typed without switching modes is not lost.
+    /// Insert the pinyin exactly as typed and stop composing; Enter's case.
     CommitRaw,
     /// Finish the word under way and add this Latin character to the document
     /// directly, without the engine seeing it.
     Latin(char),
-    /// Insert the letters as they were struck, rather than what they were
-    /// converted into. Japanese needs this and Chinese does not: pinyin's
-    /// preedit *is* the letters, so `CommitRaw` already gives them back, while
-    /// romaji has become kana by then and the letters are only in `typed`.
+    /// Insert the letters as they were struck. Pinyin's preedit *is* the
+    /// letters; romaji has become kana, and the letters survive only in
+    /// `typed`.
     CommitTyped,
     /// Abandon the composition. The keystroke is consumed.
     Cancel,
@@ -347,32 +277,24 @@ pub enum Compose {
 }
 
 /// The prolonged sound mark, which lengthens the preceding kana — ラーメン.
-///
-/// It reaches the engine as itself rather than as the `-` that was typed:
-/// `prv_key_handler` compares the key against this code point explicitly, so it
-/// is a key the engine expects, and the romaji rules have no mapping that would
-/// produce it from a hyphen.
+/// Fed to the engine as this code point: `prv_key_handler` tests for it, and
+/// the romaji rules map no hyphen onto it.
 const CHOONPU: char = 'ー';
 
 /// Decide what a keystroke means while CJK input is on.
 ///
 /// `composing` is whether anything has been typed towards a word yet, and it
 /// changes almost every rule: a digit is a candidate number mid-word and a
-/// digit otherwise, space converts mid-word and is a space otherwise. Without
-/// that distinction the mode would make it impossible to type a number.
+/// digit otherwise, space converts mid-word and is a space otherwise.
 ///
-/// Pure, so all of this is tested without an engine, a window or a keyboard.
+/// Pure: tested without an engine, a window or a keyboard.
 pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) -> Compose {
     use crate::keymap::Action;
 
-    // **A Korean keyboard types Korean.** Every letter is a jamo while
-    // [`Script::Korean`] is selected, capitals included — those are the tense
-    // consonants — and Latin is reached by switching source, which is what the
-    // 한/영 key does and what `Ctrl + Space` does here.
-    //
-    // Every other key finishes the syllable and goes on to mean what it means:
-    // space is a space, a digit is a digit, `.` is a full stop, Enter breaks
-    // the line. No candidate list to number, and no page to turn.
+    // **A Korean keyboard types Korean.** Every letter is a jamo, capitals
+    // included — the tense consonants — and Latin is reached by switching
+    // source (`Ctrl + Space`). Every other key finishes the syllable and
+    // goes on to mean what it means; no candidate list, no pages.
     if script == Script::Korean {
         return match action {
             Action::Insert(c) if jamo_for(*c).is_some() => Compose::Jamo(*c),
@@ -383,16 +305,9 @@ pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) 
     }
 
     match action {
-        // **A capital is never CJK input.** Pinyin and romaji are both written
-        // in lower case, so an upper-case letter can only be Latin the writer
-        // wants on the page — an acronym, a name, the start of an English
-        // sentence inside a Chinese one. Folded to lower case and fed to the
-        // engine, capitals are unreachable in all three CJK modes: `NASA` comes
-        // out as a pinyin guess.
-        //
-        // Before the letter rule below, and deliberately not conditional on
-        // `composing`: with the mode on and nothing typed yet, a capital would
-        // otherwise open a composition rather than land on the page.
+        // **A capital is never CJK input** — pinyin and romaji are written
+        // in lower case, and a capital is Latin for the page. Before the
+        // letter rule, and unconditional on `composing`.
         Action::Insert(c) if c.is_ascii_uppercase() => Compose::Latin(*c),
 
         // Letters always start or continue a syllable, in both languages: the
@@ -409,62 +324,44 @@ pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) 
         // of ordinary romaji input rather than punctuation.
         Action::Insert('-') if composing && script == Script::Japanese => Compose::Feed(CHOONPU),
 
-        // Punctuation is CJK whenever the mode is on, composing or not. This is
-        // the half of "typing CJK" that has nothing to do with prediction, and
-        // leaving it out gives CJK words in English-punctuated sentences.
+        // Punctuation is CJK whenever the mode is on, composing or not.
         Action::Insert(c) if punctuation(script, *c).is_some() => Compose::Punctuate(*c),
 
         _ if !composing => Compose::Pass,
 
-        // The number row picks a candidate, as it does in every CJK IME, and 0
-        // is the tenth rather than the zeroth.
+        // The number row picks a candidate; 0 is the tenth.
         Action::Insert(c @ '1'..='9') => Compose::Select(*c as usize - '1' as usize),
         Action::Insert('0') => Compose::Select(9),
 
-        // **Space is the one rule the two languages disagree on**, and it is a
-        // difference in the languages rather than in the plugins. Pinyin
-        // predicts as you type, so by the time a word is spelled the best
-        // candidate is already offered and space accepts it. Japanese does not:
-        // kana is unambiguous and the *conversion* to kanji is the step that
-        // needs asking for, which is what space means to a Japanese writer and
-        // what `prv_key_handler` implements — 0x20 starts and then advances the
-        // selection. So Chinese takes the candidate and Japanese asks for one.
+        // **Space is the one rule the two languages disagree on.** Pinyin
+        // predicts as it goes and space accepts the best candidate; Japanese
+        // converts on space — `prv_key_handler` routes 0x20 to start and
+        // advance the selection.
         Action::Insert(' ') => match script {
             Script::Chinese => Compose::Select(0),
             Script::Japanese => Compose::Feed(' '),
             Script::Korean => Compose::Finish,
         },
 
-        // Backspace goes to the engine rather than the document. Chinese routes
-        // 0x08 to `ET9ClearOneSymb`; Japanese truncates its own preedit buffer
-        // one UTF-8 character back. Either way the engine drops one unit and
-        // re-predicts from what is left, which is not something the editor
-        // could do on its behalf.
+        // Backspace goes to the engine: Chinese routes 0x08 to
+        // `ET9ClearOneSymb`, Japanese truncates its preedit one character
+        // back, and either re-predicts from what is left.
         Action::Backspace => Compose::Feed('\u{8}'),
 
         // **The arrows page the candidates rather than the document.** The
-        // word wanted is often not in the first ten — that is the whole reason
-        // there are more than ten — and while a bar is on screen the arrows are
-        // the only keys a writer reaches for to see the rest of it. Both axes
-        // do it: the bar is one row, so up and down have nothing else to mean,
-        // and neither does a page key while a word is being composed.
+        // bar is one row, so both axes page, and so do the page keys.
         Action::Right | Action::Down | Action::PageDown => Compose::NextPage,
         Action::Left | Action::Up | Action::PageUp => Compose::PreviousPage,
 
         Action::Newline => Compose::CommitRaw,
         Action::Escape => Compose::Cancel,
 
-        // **The way out of kana for a Latin word.** `F10` converts the reading
-        // to half-width Latin in every Japanese IME, and it is the answer to a
-        // real gap: romaji becomes kana as it is typed, so with the mode on
-        // there was no way to write a lower-case Latin word at all. Chinese
-        // gets it too, where it does the same thing Enter already does.
+        // **The way out of kana for a Latin word**: `F10` converts the
+        // reading to half-width Latin, in both languages.
         Action::CommitTyped => Compose::CommitTyped,
 
         // Anything else — a Ctrl chord, the ends of a line, a jump — abandons
-        // the composition and is consumed. Moving the cursor out from under a
-        // half-typed word and leaving it pending would be worse than costing
-        // one keystroke.
+        // the composition and is consumed.
         _ => Compose::Cancel,
     }
 }
@@ -777,33 +674,25 @@ fn split(pairs: &[(char, char, char)], jamo: char) -> Option<(char, char)> {
 const PLUGIN_ZH: &str = "/usr/share/keyboard/zh_CN/libpredictor.so.1";
 
 /// The Japanese plugin: Omron iWnn over `libwlf`, with ICU doing romaji to
-/// kana. A heavier neighbour than the Chinese one — it names nineteen shared
-/// libraries against Chinese's four, GTK and ICU among them — but every one of
-/// them is already on the device, because the stock keyboard needs them too.
+/// kana. It names nineteen shared libraries against Chinese's four, every
+/// one of them on the device.
 const PLUGIN_JA: &str = "/usr/share/keyboard/ja/libpredictor.so.1";
 
 /// How many candidate pointers the plugin is given room to write.
 ///
-/// **Sized to the plugin's own table, not to [`WANTED`], because Japanese
-/// ignores what is asked for and writes as many as it produced.** Both tables
-/// are bounded by the `.bss` they live in — the Japanese one starts `0x51b0`
-/// into a section ending `0x8284`, at a 50-byte stride, so 250 entries is all
-/// it can physically hold, and Chinese preallocates 500 buffers of 41 bytes.
-/// This is the larger of the two with the reasoning attached, so that shrinking
-/// it later is understood to be a memory-safety change and not a tidy-up.
+/// **Sized to the plugins' own tables, not to [`WANTED`]: Japanese ignores
+/// the count asked for and writes as many as it produced.** The Japanese
+/// table holds 250 entries at a 50-byte stride; Chinese preallocates 500
+/// buffers of 41 bytes. Shrinking this is a memory-safety change.
 const MAX_CANDIDATES: usize = 500;
 
 /// Opaque host cookie, passed last to every slot and only ever logged.
 const USER_DATA: u32 = 0;
 
-/// The word the ET9 engine stamps into its Chinese-phonetic context, and where
-/// in the context it puts it.
-///
-/// The plugin never hands the context out — it resolves it PC-relative from its
-/// own `.bss` on every call — but it does mark it:
-/// `ET9CPSimplifiedToTraditional` refuses any context whose word at `+0x88` is
-/// not this. That makes the mark something to *search for* rather than
-/// something to check a guess against, which is how the context is found.
+/// The word the ET9 engine stamps into its Chinese-phonetic context, and
+/// where in the context it puts it: `ET9CPSimplifiedToTraditional` refuses a
+/// context whose word at `+0x88` is not this, and the mark is what
+/// [`Chinese::find_converter`] scans for.
 const CP_MAGIC_OFFSET: usize = 0x88;
 const CP_MAGIC: u32 = 0x1428_1428;
 
@@ -813,11 +702,9 @@ const CP_MAGIC: u32 = 0x1428_1428;
 const SIMPLIFIED: u16 = 0x56fd;
 const TRADITIONAL: u16 = 0x570b;
 
-/// Two letters to type at a plugin while watching what it writes.
-///
-/// Any two would do. These are ordinary pinyin and ordinary romaji, so both
-/// engines take them as input rather than as a command, and they are distinct
-/// so that the second says something the first did not.
+/// Two letters to type at a plugin while watching what it writes: ordinary
+/// pinyin and ordinary romaji, distinct so the second says something the
+/// first did not.
 const PROBE_KEYS: [char; 2] = ['a', 'b'];
 
 /// The key handler stops recording at 512, so a longer count is a record that
@@ -869,16 +756,13 @@ const MAPS: &str = "/proc/self/maps";
 
 /// Where the dynamic linker put a plugin, and what of it karyll may read.
 ///
-/// **The kernel is the only authority on where a plugin is.** Every address
-/// inside one moves between builds, so karyll asks rather than assumes, and
-/// then checks every pointer it derives against the answer before reading it.
-/// That is what turns a wrong guess from a corruption of the engine's state
-/// into a message saying Chinese is unavailable.
+/// Every address inside a plugin moves between builds, so every pointer
+/// derived from one is checked against the kernel's map before it is read; a
+/// pointer that fails the check is a message, not a read.
 ///
-/// The object is found from a pointer the plugin itself produced rather than
-/// from the path it was opened under, which is not fussiness:
-/// `libpredictor.so.1` is a symlink to `libpredictor.so.1.0` and
-/// `/proc/self/maps` names the file it resolves to, so the path handed to
+/// The object is found from a pointer the plugin itself produced:
+/// `libpredictor.so.1` is a symlink to `libpredictor.so.1.0`,
+/// `/proc/self/maps` names the file it resolves to, and the path handed to
 /// `dlopen` never appears there at all.
 struct Mapping {
     /// What the kernel calls the object. Reported, never matched against.
@@ -939,9 +823,8 @@ impl Mapping {
 
     /// Every writable word of the object, in address order.
     ///
-    /// Volatile because the plugin writes this memory from the other side of an
-    /// FFI call: two of these taken either side of a keystroke are meant to
-    /// differ, and the point of the whole exercise is where.
+    /// Volatile: the plugin writes this memory from the other side of an FFI
+    /// call, and two reads taken either side of a keystroke differ.
     ///
     /// # Safety
     /// The ranges must be this process's own, which they are for any `Mapping`
@@ -979,9 +862,9 @@ struct Row {
     range: Range<usize>,
     exec: bool,
     write: bool,
-    /// Empty for anonymous memory. It is the last column and may hold spaces;
-    /// runs of them collapse here, which costs nothing, because a path is only
-    /// ever compared against another row of the same file and printed.
+    /// Empty for anonymous memory. It is the last column and may hold
+    /// spaces; runs of them collapse here — a path is only compared against
+    /// another row of the same file, and printed.
     path: String,
 }
 
@@ -998,9 +881,7 @@ fn row(line: &str) -> Option<Row> {
 }
 
 /// Describe the object holding `addr`, given the text of `/proc/self/maps`.
-///
-/// Pure and separate from every read, so that the parsing is tested against
-/// real map text instead of only ever being exercised on a device.
+/// Pure: the parsing is tested against captured map text.
 fn locate(maps: &str, addr: usize) -> Option<Mapping> {
     let rows: Vec<Row> = maps.lines().filter_map(row).collect();
     let path = rows
@@ -1043,12 +924,11 @@ fn locate(maps: &str, addr: usize) -> Option<Mapping> {
     })
 }
 
-/// One of Amazon's predictor plugins, loaded and ready.
+/// One of the device's predictor plugins, loaded and ready.
 ///
-/// The ABI is `libkb`'s rather than any one language's, so this is written once
-/// and both languages use it. What differs between them lives in [`Chinese`]
-/// and [`Japanese`]: which file to open, whether the session has to be opened
-/// explicitly, and what to do with the candidates on the way out.
+/// The ABI is `libkb`'s, one for every language. What differs lives in
+/// [`Chinese`] and [`Japanese`]: which file to open, whether the session has
+/// to be opened explicitly, and what to do with the candidates.
 struct Plugin {
     table: *const usize,
     handle: *mut c_void,
@@ -1060,18 +940,15 @@ struct Plugin {
 impl Plugin {
     /// `dlopen` the plugin and call `load()`, which brings its engine up.
     ///
-    /// Nothing is preloaded alongside it. Each plugin's own `DT_NEEDED` names
-    /// the engine it was built against — `libxt9a.so.1` for Chinese — and
-    /// neither `kb` nor `libkb.so` links any `libxt9*`, so that is where its
-    /// calls bind under Amazon's own run too. The three XT9 engines are one
-    /// build with different embedded data, every entry point at an identical
-    /// address, so preloading the wrong one would interpose silently.
+    /// Nothing is preloaded alongside it: each plugin's own `DT_NEEDED`
+    /// names the engine it was built against, and neither `kb` nor
+    /// `libkb.so` links any `libxt9*`. The three XT9 engines are one build
+    /// with different embedded data, every entry point at an identical
+    /// address — a preloaded wrong one interposes silently.
     fn open(path: &str) -> Result<Plugin, String> {
-        // The host block is what the plugin calls back into. It must hold
-        // callable pointers, not zeroes: committing a candidate calls into it,
-        // and a zeroed block would be a call through null. karyll does not need
-        // anything the callbacks carry — it already holds the text it committed
-        // — so they are no-ops that return 0.
+        // The host block is what the plugin calls back into — committing a
+        // candidate calls it — and a zeroed slot is a call through null, so
+        // every slot points at a no-op returning 0.
         let host = unsafe { calloc(1, HOST_BLOCK) };
         if host.is_null() {
             return Err("cannot allocate the host block".into());
@@ -1094,14 +971,11 @@ impl Plugin {
         }
         let table = table as *const usize;
 
-        // `load()`'s own return value is the one thing here that cannot be
-        // checked before it is read. Everything derived from it is checked
-        // against the mapping the first slot leads to — including the rest of
-        // the table, because the eight slots being these eight functions in
-        // this order is `libkb`'s ABI rather than a fact about a build, and a
-        // firmware that changed it would otherwise be a call through whatever
-        // took their place. The Thumb bit comes off first: in a Thumb-2 build
-        // every one of these addresses is odd.
+        // `load()`'s return value cannot be checked before it is read.
+        // Everything derived from it is checked against the mapping the
+        // first slot leads to — the whole table: the slot order is `libkb`'s
+        // ABI, and a table failing the check is an error, not a call. The
+        // Thumb bit comes off first: every address in a Thumb-2 build is odd.
         let slots: Vec<usize> = (0..SLOTS).map(|i| unsafe { *table.add(i) } & !1).collect();
         let maps = std::fs::read_to_string(MAPS)
             .map_err(|e| format!("{path}: cannot read {MAPS}: {e}"))?;
@@ -1136,8 +1010,8 @@ impl Plugin {
         unsafe { *self.table.add(byte_offset / 4) }
     }
 
-    /// A discovered address as the offset a disassembly of the plugin would
-    /// show it at, which is the only form worth printing.
+    /// A discovered address as the offset a disassembly of the plugin shows
+    /// it at.
     fn offset_of(&self, addr: usize) -> usize {
         addr.saturating_sub(self.mapping.base)
     }
@@ -1164,19 +1038,12 @@ impl Plugin {
     ///
     /// **The count out is a report, not an answer to the count in.** Chinese
     /// clamps to what was asked for; Japanese overwrites it with however many
-    /// it produced and fills that many array slots regardless — its inner loop
-    /// bounds itself on the engine's own total and never looks at the request.
-    /// So the array is sized to the plugin's whole preallocation rather than to
-    /// what is asked for, and the result is cut to [`KEPT`] here instead.
+    /// it produced and fills that many array slots — so the array is sized to
+    /// the plugins' whole preallocation, and the result is cut to [`KEPT`]
+    /// here.
     ///
-    /// Getting that wrong is what put a black smear across the bottom of the
-    /// screen the first time Japanese ran: iWnn answers a two-letter reading
-    /// with dozens of conversions and width variants, every one of them drawn
-    /// as an equal share of the strip. What bounds the drawing now is the page,
-    /// not the list, so the list is free to be longer than the bar.
-    ///
-    /// The strings are borrowed from the plugin's own fixed-stride table and
-    /// are only valid until the next call, so they are copied here.
+    /// The strings are borrowed from the plugin's own fixed-stride table,
+    /// valid until the next call, and are copied here.
     fn call_candidates(&self) -> Vec<String> {
         let mut slots: Vec<*mut c_char> = vec![std::ptr::null_mut(); MAX_CANDIDATES];
         let mut count: u32 = KEPT as u32;
@@ -1200,10 +1067,7 @@ impl Plugin {
     }
 
     /// `+0x10` — copy out the composition as the engine understands it.
-    ///
-    /// Empty is `None` rather than `Some("")`, because "nothing is being
-    /// composed" and "the composition is the empty string" want the same
-    /// treatment from the caller and only one of them is a real state.
+    /// Empty is `None`.
     fn call_preedit(&self) -> Option<String> {
         let mut buf = [0u8; PREEDIT_CAPACITY];
         let f: unsafe extern "C" fn(*mut c_char, usize) =
@@ -1215,14 +1079,10 @@ impl Plugin {
 }
 
 impl Drop for Plugin {
-    /// Close and unload, in that order, as the plugin's own lifecycle wants.
-    /// Closing writes the user dictionary back to disk — Amazon's `xt9-zh.*`
-    /// for Chinese, the iWnn learning data for Japanese — so a session's
-    /// learned phrases survive.
-    ///
-    /// `panic = "abort"` skips `Drop`, so a panic loses the dictionary update.
-    /// That is a fair trade: the alternative is running teardown from a broken
-    /// state, and the document is protected by autosave rather than by this.
+    /// Close and unload, in that order — the plugin's own lifecycle. Closing
+    /// writes the user dictionary back to disk (Amazon's `xt9-zh.*` for
+    /// Chinese, the iWnn learning data for Japanese), so a session's learned
+    /// phrases survive. `panic = "abort"` skips `Drop` and loses that write.
     fn drop(&mut self) {
         let close: unsafe extern "C" fn(u32) -> i32 =
             unsafe { std::mem::transmute(self.slot(SLOT_CLOSE)) };
@@ -1250,12 +1110,9 @@ pub struct Chinese {
     pending: Option<Pending>,
 }
 
-/// The two places the Chinese plugin keeps what it has not converted yet: how
-/// many keys it is holding, and the keys themselves.
-///
-/// **Two pointers rather than one and a `+4`.** They sit side by side in some
-/// builds and 57 KB apart in others, so their being neighbours is a fact about
-/// one build rather than about the record.
+/// The two places the Chinese plugin keeps what it has not converted yet:
+/// how many keys it is holding, and the keys themselves. Two pointers: the
+/// pair sits side by side in some builds and 57 KB apart in others.
 struct Pending {
     count: *const u32,
     keys: *const u32,
@@ -1273,10 +1130,8 @@ impl Chinese {
             want_traditional: false,
             pending: None,
         };
-        // Begin a session. Skipping this produced identical candidates on
-        // device, so nothing Chinese depends on it, but it is the documented
-        // lifecycle, it costs one call at startup, and both searches below want
-        // an engine that has been given no keys yet.
+        // Begin a session — the documented lifecycle, and both searches
+        // below want an engine holding no keys.
         let st = zh.plugin.call_open();
         if st != 0 {
             eprintln!("ime: zh prv_open returned {st}, continuing");
@@ -1287,22 +1142,16 @@ impl Chinese {
     }
 
     /// Find where the plugin keeps the keys it has not converted yet, by
-    /// watching it keep some.
+    /// watching it keep some: an open session holds no keys, a key makes it
+    /// hold that key, a second makes it two, reopening empties it. The
+    /// writable memory is copied at each of those four moments; the count is
+    /// the word that read 0, 1, 2, 0, and the keys are the pair that became
+    /// `a`, then `a` and `b`.
     ///
-    /// **Both halves are found by what they do, not by where they once were.**
-    /// An open session holds no keys; a key makes it hold that key; a second
-    /// makes it hold two; reopening empties it again. So the plugin's writable
-    /// memory is copied at each of those four moments, and the words that told
-    /// that story are the record: the count is the word that read 0, 1, 2, 0,
-    /// and the keys are the pair that became `a`, then `a` and `b`.
-    ///
-    /// They are searched for independently because they are not always
-    /// neighbours. Where a counter does sit immediately in front of the array
-    /// it is preferred over one further off, since that is the count *of that
-    /// array* rather than some other tally that also went up.
-    ///
-    /// The search costs four copies of a few hundred kilobytes and three calls,
-    /// and leaves the session exactly as it found it.
+    /// The halves are searched for independently — they are not always
+    /// neighbours — and a counter immediately in front of the array is
+    /// preferred: that one is the count *of that array*. The search costs
+    /// four copies and three calls, and leaves the session as it found it.
     fn find_pending(&mut self) {
         let quiet = unsafe { self.plugin.mapping.read() };
         self.plugin.call_key(PROBE_KEYS[0]);
@@ -1372,11 +1221,8 @@ impl Chinese {
             .collect()
     }
 
-    /// What the engine offers, in the script asked for.
-    ///
-    /// Converted here rather than on commit, so the bar shows what will
-    /// actually be inserted. Offering Simplified and inserting Traditional
-    /// would be worse than not offering Traditional at all.
+    /// What the engine offers, in the script asked for — converted here, so
+    /// the bar shows what will be inserted.
     fn candidates(&self) -> Vec<String> {
         let candidates = self.plugin.call_candidates();
         if self.want_traditional {
@@ -1387,19 +1233,11 @@ impl Chinese {
     }
 
     /// Find the engine's own Simplified-to-Traditional converter, and the
-    /// context it needs.
-    ///
-    /// The device has one Chinese dictionary and it is Simplified, so this is
-    /// the only route to Traditional that keeps pinyin as the input method.
-    ///
-    /// **The context is searched for rather than known.** It is a static inside
-    /// the plugin that moves with every build, and it announces itself: the
-    /// engine stamps [`CP_MAGIC`] into it, which is the check
-    /// `ET9CPSimplifiedToTraditional` itself performs. So the magic is what is
-    /// looked for in the plugin's writable memory, and a character that changes
-    /// between the scripts is what confirms a hit — a word that merely happens
-    /// to read the magic would not merely fail, it would let a stranger's
-    /// pointer into the engine's state.
+    /// context it needs. The context is a static that moves with every build
+    /// and announces itself: the engine stamps [`CP_MAGIC`] into it — the
+    /// check `ET9CPSimplifiedToTraditional` itself performs — so the magic
+    /// is scanned for in the plugin's writable memory, and [`converts`]
+    /// confirms a hit.
     fn find_converter(&mut self) {
         let convert = self.plugin.symbol("ET9CPSimplifiedToTraditional");
         if convert.is_null() {
@@ -1432,10 +1270,10 @@ impl Chinese {
 
     /// Convert one candidate to Traditional, in the engine's own terms.
     ///
-    /// The engine works in 16-bit symbols and converts in place, so the string
-    /// makes a round trip through UTF-16. Anything outside the basic plane is
-    /// left alone rather than mangled: `encode_utf16` would split it into a
-    /// surrogate pair the converter would treat as two characters.
+    /// The engine works in 16-bit symbols and converts in place, so the
+    /// string makes a round trip through UTF-16. Anything outside the basic
+    /// plane is left alone: `encode_utf16` splits it into a surrogate pair,
+    /// two characters to the converter.
     fn to_traditional(&self, text: &str) -> String {
         let Some((convert, ctx)) = self.converter else {
             return text.to_string();
@@ -1477,13 +1315,11 @@ impl Ime for Chinese {
     }
 
     /// The commit slot re-feeds the keys the phrase did not cover, so the
-    /// engine comes back from a commit already composing the rest of the
-    /// reading and there is nothing here to restart — only to notice.
-    ///
-    /// Without the pending record a finished word and a half-converted one look
-    /// the same, and then the engine is cleared: it costs the context the commit
-    /// just set for the next prediction, and it is the only way to be sure a
-    /// stranded reading does not arrive on the front of the next word typed.
+    /// engine returns from a commit composing the remainder; this notices,
+    /// and restarts nothing. Without the pending record a finished word and
+    /// a half-converted one look the same, and the engine is cleared — at
+    /// the cost of the context the commit set — so no stranded reading lands
+    /// on the front of the next word typed.
     fn commit(&mut self, index: usize) -> Option<Rest> {
         self.plugin.call_commit(index);
         match self.pending() {
@@ -1500,9 +1336,8 @@ impl Ime for Chinese {
     }
 
     fn clear(&mut self) {
-        // Space is the engine's own "clear everything": prv_key_handler routes
-        // 0x20 to ET9CPClearContext + ET9ClearAllSymbs. Reopening the session
-        // does the same thing and says so more plainly.
+        // Reopening the session clears the context and the symbols
+        // (`prv_key_handler` routes 0x20 to the same pair).
         self.plugin.call_open();
     }
 }
@@ -1516,28 +1351,19 @@ impl Japanese {
     pub fn open() -> Result<Japanese, String> {
         let plugin = Plugin::open(PLUGIN_JA).map_err(|e| format!("{e} — no Japanese input"))?;
 
-        // **Unlike Chinese, opening the session is mandatory**, and this is the
-        // one place the two lifecycles genuinely differ. `prv_open` sets the
-        // plugin's input mode, and until it runs the mode is whatever `.bss`
-        // was zeroed to — a value on which the key handler takes a different
-        // branch and the composition getter returns nothing at all. Chinese
-        // tolerates skipping it; Japanese silently does nothing.
+        // `prv_open` sets the plugin's input mode; before it runs the mode
+        // is zeroed `.bss`, on which the key handler takes a different
+        // branch and the composition getter returns nothing.
         let st = plugin.call_open();
         if st != 0 {
             eprintln!("ime: ja prv_open returned {st}, continuing");
         }
 
-        // **`load()` returns a complete-looking table whether or not the engine
-        // came up.** Its error paths log and fall through to the same return,
-        // so the pointer says nothing about whether `wlf_init`, `wlf_load_lang`
-        // and `wlf_set_active_lang` succeeded, and without a check here the
-        // failure is an editor that swallows every keystroke and shows nothing.
-        //
-        // So type at it. An engine that came up answers a letter — with kana
-        // from its own transliteration, with conversions of that kana, usually
-        // both — and one that did not answers neither. That is the same
-        // question the flag `load()` writes would answer, asked in a way that
-        // needs no address, which is what makes it survive a firmware.
+        // **`load()` returns a complete-looking table whether or not the
+        // engine came up**: its error paths log and fall through to the same
+        // return. So type at it — an engine that is up answers a letter with
+        // kana, with conversions, usually both; one that is not answers
+        // neither. No address involved, so the check holds across firmwares.
         plugin.call_key(PROBE_KEYS[0]);
         let candidates = plugin.call_candidates().len();
         let composed = plugin.call_preedit();
@@ -1564,10 +1390,9 @@ impl Ime for Japanese {
     /// for this to switch.
     fn set_traditional(&mut self, _traditional: bool) {}
 
-    /// The commit slot ends by zeroing the composition buffer, so a candidate
-    /// that covered part of the reading takes the rest with it and this reports
-    /// a finished word. The plugin is asked rather than assumed: it is one
-    /// call, and the answer is the plugin's to give.
+    /// The commit slot ends by zeroing the composition buffer, so a partial
+    /// candidate takes the rest of the reading with it; `call_preedit` asks
+    /// rather than assumes.
     fn commit(&mut self, index: usize) -> Option<Rest> {
         self.plugin.call_commit(index);
         let reading = self.plugin.call_preedit()?;
@@ -1579,13 +1404,11 @@ impl Ime for Japanese {
 
     fn clear(&mut self) {
         // Reopening resets the composition, the selection and the input mode
-        // together, which is exactly what abandoning a word should do.
+        // together.
         self.plugin.call_open();
     }
 
-    /// The kana, not the romaji. This is why the trait has the method: the
-    /// engine holds the ICU transliteration and karyll would otherwise show
-    /// `nihon` where the writer means にほん.
+    /// The kana, not the romaji: the engine holds the ICU transliteration.
     fn preedit(&self) -> Option<String> {
         self.plugin.call_preedit()
     }
@@ -1615,15 +1438,13 @@ unsafe fn c_string(p: *const c_char) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Room for the host callback table. The plugin's own host struct is opaque to
-/// us; this is comfortably larger than the sixteen slots filled below.
+/// Room for the host callback table: opaque to karyll, and larger than the
+/// sixteen slots filled below.
 const HOST_BLOCK: usize = 0x400;
 
-/// A host callback that does nothing.
-///
-/// The plugin calls into the host block to report a commit and to ask about
-/// surrounding text. karyll needs neither — it already holds the text it
-/// committed — but the pointers have to be callable, so they point here.
+/// A host callback that does nothing. The plugin calls into the host block
+/// to report a commit and to ask about surrounding text; karyll uses
+/// neither, and the pointers have to be callable.
 unsafe extern "C" fn host_noop(_a0: usize, _a1: usize, _a2: usize, _a3: usize) -> u32 {
     0
 }
@@ -1696,8 +1517,7 @@ impl Stub {
 impl Ime for Stub {
     fn key(&mut self, key: char) -> Vec<String> {
         match key {
-            // The engine handles these itself, so the stub has to as well or
-            // the editor would behave differently against the two.
+            // The engine handles these itself; the stub agrees.
             '\u{8}' => {
                 self.typed.pop();
             }
@@ -1724,8 +1544,7 @@ impl Ime for Stub {
         self.typed.clear();
     }
 
-    /// The stub has no engine to convert with, so it reports Traditional as
-    /// unavailable rather than pretending.
+    /// The stub has no converter; Traditional stays unavailable.
     fn set_traditional(&mut self, _traditional: bool) {}
 }
 
@@ -1736,11 +1555,8 @@ impl Default for Stub {
     }
 }
 
-/// An engine that composes something other than the keys it was given.
-///
-/// Enough romaji to show the difference that motivates [`Ime::preedit`]: the
-/// keys are `nihon` and the composition is にほん, so an editor that displayed
-/// what it typed rather than what the engine composed would be visibly wrong.
+/// An engine that composes something other than the keys it was given: the
+/// keys are `nihon` and the composition is にほん — [`Ime::preedit`]'s case.
 #[cfg(test)]
 pub struct KanaStub {
     typed: String,
@@ -1773,8 +1589,8 @@ impl KanaStub {
                     continue 'outer;
                 }
             }
-            // A partial syllable stays as the letters typed, which is what a
-            // real transliterator does too — `nih` composes にh.
+            // A partial syllable stays as the letters typed — `nih` composes
+            // にh.
             out.push_str(&rest[..1]);
             rest = &rest[1..];
         }
@@ -1923,7 +1739,7 @@ mod tests {
             assert_eq!(korean.preedit(), expected);
             assert_eq!(korean.backspace(), !expected.is_empty());
         }
-        // Empty, and the keystroke is the document.s.
+        // Empty, and the keystroke is the document's.
         assert!(!korean.backspace());
         assert_eq!(korean.preedit(), "");
     }
@@ -1953,8 +1769,8 @@ mod tests {
         }
     }
 
-    /// The layout covers every letter and touches nothing else, which leaves
-    /// Korean.s ASCII punctuation, digits and space to the editor.
+    /// The layout covers every letter and touches nothing else, leaving
+    /// Korean's ASCII punctuation, digits and space to the editor.
     #[test]
     fn the_layout_is_the_letters_and_only_the_letters() {
         for key in 'a'..='z' {
@@ -2079,10 +1895,9 @@ mod tests {
         assert_eq!(ime.key('h').first().map(String::as_str), Some("你好"));
     }
 
-    /// Backspace and space are handled inside `prv_key_handler` — `0x08` clears
-    /// one symbol, `0x20` clears all — so the editor forwards them rather than
-    /// intercepting them, and the stub has to agree or it would test a
-    /// different editor than the device runs.
+    /// Backspace and space are handled inside `prv_key_handler` — `0x08`
+    /// clears one symbol, `0x20` clears all — so the editor forwards them,
+    /// and the stub agrees.
     #[test]
     fn backspace_and_space_are_the_engines_job() {
         let mut ime = Stub::new();
@@ -2106,12 +1921,9 @@ mod tests {
         assert_eq!(ime.key('h').first().map(String::as_str), Some("和"));
     }
 
-    /// **A candidate does not have to cover the whole reading**, and the word
-    /// is not over when one that does not is taken: it carries on with what is
-    /// left, and the next keystroke belongs to that rather than to a new word.
-    ///
-    /// Ending it there is what strands a reading inside the engine, where it
-    /// arrives on the front of whatever is typed next.
+    /// **A candidate does not have to cover the whole reading**, and the
+    /// word is not over when one that does not is taken: it carries on with
+    /// what is left, and the next keystroke belongs to that.
     #[test]
     fn a_candidate_covering_part_of_the_reading_leaves_the_rest() {
         let mut ime = Stub::new();
@@ -2125,8 +1937,7 @@ mod tests {
         assert_eq!(rest.candidates.first().map(String::as_str), Some("界"));
     }
 
-    /// And one that covers all of it finishes the word, which is every other
-    /// time a candidate is taken.
+    /// One that covers all of it finishes the word.
     #[test]
     fn a_candidate_covering_the_reading_finishes_the_word() {
         let mut ime = Stub::new();
@@ -2137,9 +1948,8 @@ mod tests {
         assert_eq!(ime.key('h').first().map(String::as_str), Some("和"));
     }
 
-    /// Pinyin *is* the letters typed, so the Chinese engine reports no
-    /// composition of its own and the editor shows what it sent. This is the
-    /// default arm of [`Ime::preedit`], and the reason it has a default.
+    /// Pinyin *is* the letters typed: the Chinese engine reports no
+    /// composition of its own — [`Ime::preedit`]'s default arm.
     #[test]
     fn chinese_keeps_no_composition_of_its_own() {
         let mut ime = Stub::new();
@@ -2148,9 +1958,8 @@ mod tests {
         assert_eq!(ime.preedit(), None);
     }
 
-    /// Japanese does, and it is not the letters typed — which is the whole
-    /// reason the trait has the method. An editor showing `nihon` where the
-    /// writer means にほん is showing its own plumbing.
+    /// The Japanese composition is not the letters typed: にほん from
+    /// `nihon`.
     #[test]
     fn japanese_composes_kana_from_the_romaji_it_was_sent() {
         let mut ime = KanaStub::new();
@@ -2161,9 +1970,8 @@ mod tests {
         assert_eq!(ime.key(' ').first().map(String::as_str), Some("日本"));
     }
 
-    /// Backspace reaches the engine, so the composition shortens by a *kana*
-    /// rather than by a byte. An editor trimming its own copy would cut にほ
-    /// down the middle of a UTF-8 character.
+    /// Backspace reaches the engine, and the composition shortens by a
+    /// *kana*.
     #[test]
     fn backspace_shortens_the_japanese_composition_by_a_syllable() {
         let mut ime = KanaStub::new();
@@ -2209,8 +2017,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
 
         /// **The path karyll opens is not the path the kernel reports.**
         /// `libpredictor.so.1` is a symlink, `/proc/self/maps` names what it
-        /// resolves to, and looking the object up by the name it was opened
-        /// under would therefore find nothing at all.
+        /// resolves to, and a lookup by the opened name finds nothing.
         #[test]
         fn the_plugin_is_found_from_its_own_pointer_rather_than_from_a_path() {
             assert!(KINDLE.lines().filter_map(row).all(|r| r.path != PLUGIN_ZH));
@@ -2280,9 +2087,8 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         }
 
         /// **Two words next to each other in a snapshot need not be next to
-        /// each other in memory**, and the pending-key search reads a pair, so
-        /// it asks. Without this it could take the last word of one segment and
-        /// the first of another for an array of two.
+        /// each other in memory**, and the pending-key search reads a pair,
+        /// so it asks.
         #[test]
         fn the_last_word_of_a_segment_has_no_neighbour() {
             let map = locate(SPLIT, 0x0001_0100).unwrap();
@@ -2324,11 +2130,8 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
 
         #[test]
         fn a_capital_is_latin_and_never_reaches_the_engine() {
-            // Pinyin and romaji are both written in lower case, so an
-            // upper-case letter can only be Latin the writer wants on the page.
-            // Folded to lower case and fed to the engine, capitals are
-            // unreachable in every CJK mode — `NASA` comes out as a pinyin
-            // guess.
+            // Pinyin and romaji are written in lower case; a capital is
+            // Latin for the page.
             for script in BOTH {
                 assert_eq!(
                     compose(&Action::Insert('N'), true, script),
@@ -2345,9 +2148,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
 
         #[test]
         fn the_letters_as_struck_can_be_had_back() {
-            // Romaji has become kana by the time it is on screen, so with the
-            // mode on there was no way to write a lower-case Latin word at all.
-            // `F10` is where every Japanese IME puts the way out.
+            // `F10` inserts the letters as struck, in both languages.
             for script in BOTH {
                 assert_eq!(
                     compose(&Action::CommitTyped, true, script),
@@ -2356,10 +2157,8 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             }
         }
 
-        /// The rule that makes CJK mode usable rather than modal: with nothing
-        /// being composed, everything except letters and punctuation behaves
-        /// exactly as it does in English. Without this, switching the mode on
-        /// would make it impossible to type a number or press Enter.
+        /// With nothing composed, everything except letters and punctuation
+        /// behaves as it does in English.
         #[test]
         fn editing_keys_are_untouched_before_a_word_starts() {
             for script in BOTH {
@@ -2398,11 +2197,8 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             }
         }
 
-        /// **The one rule the two languages disagree on.** Pinyin predicts as
-        /// it goes, so by the time a word is spelled the best candidate is
-        /// already offered and space accepts it. Japanese kana is unambiguous
-        /// and it is the conversion to kanji that has to be asked for, which is
-        /// what space means there — so it goes to the engine instead.
+        /// Space accepts the best candidate in Chinese and asks the engine
+        /// for the conversion in Japanese.
         #[test]
         fn space_accepts_in_chinese_and_converts_in_japanese() {
             assert_eq!(
@@ -2443,10 +2239,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             }
         }
 
-        /// **The arrows are the only way to the rest of the list**, and there
-        /// is a rest precisely because the word wanted is so often not among
-        /// the first ten. Abandoning the word on an arrow put those candidates
-        /// out of reach altogether.
+        /// The arrows page the candidates; the word stays composing.
         #[test]
         fn the_arrows_page_the_candidates_rather_than_abandoning_the_word() {
             for script in BOTH {
@@ -2545,10 +2338,8 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             }
         }
 
-        /// **The comma is the one sentence mark that differs.** Chinese sets ，
-        /// and Japanese sets 、 — the same key, a different mark, and using the
-        /// Chinese one in Japanese prose is the sort of error that reads as
-        /// foreign rather than as a typo.
+        /// **The comma is the one sentence mark that differs**: Chinese sets
+        /// ， and Japanese sets 、 on the same key.
         #[test]
         fn japanese_takes_the_reading_comma_and_shares_the_rest() {
             let mut p = Punctuation::default();
@@ -2578,8 +2369,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             assert_eq!(p.resolve(JA, '_'), None);
         }
 
-        /// Both bracket pairs, matching macOS's Simplified Chinese input, which
-        /// is what this writer's hands already know.
+        /// Both bracket pairs, matching macOS's Simplified Chinese input.
         #[test]
         fn both_bracket_pairs_are_on_the_bracket_keys() {
             let mut p = Punctuation::default();
@@ -2618,8 +2408,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             assert_eq!(p.resolve(ZH, '"'), Some("“"));
         }
 
-        /// The two pairs alternate independently, or a single quote inside a
-        /// double one would flip the wrong mark.
+        /// The two pairs alternate independently.
         #[test]
         fn the_two_quote_pairs_do_not_share_state() {
             let mut p = Punctuation::default();
@@ -2629,8 +2418,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             assert_eq!(p.resolve(ZH, '"'), Some("”"));
         }
 
-        /// Left alone on purpose, in both languages: their CJK forms are rare
-        /// in prose, and a bilingual writer means these literally.
+        /// Their CJK forms are rare in prose; the keys stay ASCII.
         #[test]
         fn arithmetic_and_currency_stay_ascii() {
             let mut p = Punctuation::default();

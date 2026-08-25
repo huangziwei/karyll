@@ -142,8 +142,8 @@ build_sysroot() {
     relink "$src_usr" "$SYSROOT/usr-lib" "$SYSROOT/lib"
 
     # The loader under the name the linker records, and the name `-lgcc_s`
-    # looks for. Only where the flattening has left none: bookworm ships a real
-    # `ld-linux-armhf.so.3`, older glibc packages name it `ld-<version>.so`.
+    # looks for — only where the flattening has left none. Jessie's glibc
+    # names the loader file `ld-<version>.so`.
     if [ ! -e "$SYSROOT/lib/$loader" ]; then
         real=$(find "$SYSROOT/lib" -maxdepth 1 -type f -name 'ld-*.so' | head -1)
         [ -n "$real" ] && ln -sf "$(basename "$real")" "$SYSROOT/lib/$loader"
@@ -163,8 +163,7 @@ build_sysroot() {
 
     rm -rf "$work"
 
-    # A link the linker cannot follow fails with a message naming the wrong
-    # file.
+    # Dangling links fail here, before the link step.
     dangling=$(find "$SYSROOT/lib" "$SYSROOT/usr-lib" -type l ! -exec test -e {} \; -print)
     if [ -n "$dangling" ]; then
         echo "error: the sysroot has links that go nowhere:" >&2
@@ -256,12 +255,11 @@ build_abi() {
         exit 1
     }
 
-    # Everything it needs must be on the device, and these five are all it may
-    # need. Each name is checked against a device's own `/lib` first. Fatal: a
-    # binary naming a library the Kindle lacks never starts.
+    # These five are on every device's `/lib`; any name beyond them is fatal —
+    # a binary naming a library the device lacks never starts.
     NEEDED=$(elf_needed "$BIN" | sort -u)
     # A dynamically linked binary always names libc: an empty list means the
-    # file was not read, as against needing nothing.
+    # file was not read.
     [ -n "$NEEDED" ] || {
         echo "error: could not read the NEEDED list from $BIN" >&2
         echo "       install GNU binutils (readelf) or an objdump that reads ARM;" >&2
@@ -294,8 +292,8 @@ build_abi() {
         exit 1
     }
 
-    # The oldest glibc that can run it, decided by the sysroot and not by
-    # anything in this repo's source. A build log carries it.
+    # The oldest glibc that can run it, decided by the sysroot. A build log
+    # carries it.
     NEEDS=$(elf_versions "$BIN" | sort -uV | tail -1)
     echo "==> $(abi_binary "$abi"): $got-float, /lib/$(abi_loader "$abi"), ${NEEDS:-an unknown glibc} or newer"
 }
@@ -325,9 +323,8 @@ sed "s|<version>[^<]*</version>|<version>$VERSION</version>|" \
     "$EXT/config.xml" > "$EXT/config.xml.new"
 mv "$EXT/config.xml.new" "$EXT/config.xml"
 
-# The Bluetooth stack. Fetched here: 49 MB of someone else's release, changing
-# wholesale on every upstream bump, and the device fetches nothing. Downloaded
-# once and cached in deploy/hid, pinned by version and checksum.
+# The Bluetooth stack: downloaded once, cached in deploy/hid, pinned by
+# version and checksum. The device fetches nothing.
 HID_VERSION=v3.11.0
 HID_SHA256=ef30ed4b6f706ea44f789185cb300054d6126b590e8fb464122309be675e0922
 HID_URL="https://github.com/zampierilucas/kindle-hid-passthrough/releases/download/$HID_VERSION/kindle-hid-passthrough-armv7.tar.gz"
@@ -421,8 +418,8 @@ fonts_fetch() {
 
 mkdir -p "$FONTS_CACHE" "$EXT/fonts"
 echo "==> Bundling the writing faces (iA-Fonts $(echo "$FONTS_COMMIT" | cut -c1-7))"
-# Redirected, not piped: a pipeline runs the loop in a subshell, and a failed
-# checksum exits that shell alone.
+# The heredoc keeps the loop in this shell: a failed checksum exits the
+# script.
 while read -r sha dir name; do
     [ -n "$name" ] || continue
     fonts_fetch "$sha" "$dir" "$name"

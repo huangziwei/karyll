@@ -1,61 +1,33 @@
-//! Where one word ends and the next begins.
-//!
-//! Four things want this and none of them existed before: moving by word,
-//! deleting by word, selecting a word by double-tap, and wrapping the word
-//! under the cursor in emphasis.
-//!
-//! **This is the third character classification in this crate, and that is
-//! deliberate.** Each answers a different question and merging any two would be
-//! wrong:
-//!
-//! - `script::script_of` asks *which face draws this*, so it puts kana and
-//!   kanji together — they come from the same file.
-//! - `wrap::classify` asks *may a line break here*, so it puts kana and kanji
-//!   together again — both break between characters.
-//! - This asks *is this the same word as its neighbour*, and the answer is no:
-//!   書いた has to break at 書|いた, which is where the okurigana starts and
-//!   very often a real morpheme boundary.
-//!
-//! **A run of Han is cut by dictionary, and only by dictionary.** Chinese sets
-//! no spaces, so nothing in the characters themselves says where 今天天气很好
-//! comes apart; it takes a word list and an algorithm that weighs the readings
-//! against each other. The Kindle carries the list — see [`crate::dict`] — and
-//! [`crate::segment`] is the algorithm. Every function here takes the
-//! dictionary as an argument and answers without one, coarsely: a whole run of
-//! Han as a single word, which is what there is to go on when no list has been
-//! loaded.
-//!
-//! The same cut applies to the kanji inside Japanese, where it separates
-//! 東京 from 都庁; the kana rules above are untouched by it, because the word
-//! list holds dictionary forms and 書いた is not one of them.
+//! Word boundaries: where one word ends and the next begins, for moving,
+//! deleting and selecting by word.
 
 use crate::dict::Dict;
 use crate::segment;
 use std::ops::Range;
 
-/// What kind of character this is, for the purpose of telling words apart.
+/// A character's class for telling words apart — a third classification
+/// beside [`crate::script`] (which face draws it) and `wrap::classify`
+/// (where a line may break): 書いた is one run to both and breaks at 書|いた
+/// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// Letters and digits from an alphabet — Latin, and anything else that is
-    /// alphanumeric without being CJK.
+    /// Alphanumerics outside the CJK ranges.
     Word,
-    /// Han. A run of it is cut into words by dictionary, or left whole when
-    /// there is none; see the note above.
+    /// Han. A run of it is cut into words by [`crate::segment`] over a
+    /// [`Dict`], or held whole with `None`.
     Han,
     Hiragana,
     Katakana,
     /// Spaces and tabs.
     Space,
-    /// A line break, kept apart from other whitespace so that selecting a run
-    /// of blank space cannot swallow a paragraph break.
+    /// A line break, a kind of its own: a run of [`Kind::Space`] ends at it.
     Newline,
-    /// Punctuation and symbols — skipped over rather than moved through.
+    /// Punctuation and symbols.
     Other,
 }
 
 impl Kind {
-    /// Whether characters of this kind make up words, as opposed to separating
-    /// them.
+    /// Whether characters of this kind make up words.
     pub fn is_word(self) -> bool {
         matches!(
             self,
@@ -64,16 +36,13 @@ impl Kind {
     }
 }
 
-/// The kind of a character taken on its own.
-///
-/// The CJK ranges are tested before `is_alphanumeric`, which would otherwise
-/// claim all of them — Han and kana are alphabetic as far as Unicode is
-/// concerned, and this is the one place that has to disagree.
+/// The kind of a character taken on its own. The CJK arms come before
+/// `is_alphanumeric`, which is true of Han and kana.
 fn kind_of(c: char) -> Kind {
     match c as u32 {
         0x3040..=0x309F => Kind::Hiragana,
-        // The long-vowel mark ー lives in the katakana block and is used by
-        // both kana, so コーヒー stays one word.
+        // The long-vowel mark ー sits in the katakana block; コーヒー is one
+        // run.
         0x30A0..=0x30FF | 0xFF66..=0xFF9D => Kind::Katakana,
         0x2E80..=0x2FDF
         | 0x3400..=0x4DBF
@@ -87,13 +56,9 @@ fn kind_of(c: char) -> Kind {
     }
 }
 
-/// The kind of the character at `i`, in the context of its neighbours.
-///
-/// Context is needed for exactly one case: an apostrophe between two letters is
-/// part of the word. Without it "don't" is three words and reaching the end of
-/// it takes two presses, which is not what any editor a writer has used does.
-/// A hyphen deliberately does not get the same treatment — "well-known" reads
-/// as two words, and German compounds lean on that harder than English does.
+/// The kind of the character at `i`, in the context of its neighbours: an
+/// apostrophe between two [`Kind::Word`] characters is [`Kind::Word`], and
+/// `don't` is one word. A hyphen is [`Kind::Other`], and `well-known` is two.
 pub fn kind_at(chars: &[char], i: usize) -> Kind {
     let Some(&c) = chars.get(i) else {
         return Kind::Space;
@@ -110,12 +75,8 @@ pub fn kind_at(chars: &[char], i: usize) -> Kind {
     kind
 }
 
-/// The run of Han containing `i`, when that is what is there.
-///
-/// The run is what gets segmented, rather than the line or the paragraph:
-/// Chinese punctuation classifies as [`Kind::Other`], so a run is already about
-/// a clause long, and a reading never has to reach across a full stop to be
-/// decided.
+/// The maximal run of [`Kind::Han`] containing `i`, or `None` at any other
+/// kind. Chinese punctuation is [`Kind::Other`] and bounds the run.
 fn han_run(chars: &[char], i: usize) -> Option<Range<usize>> {
     if kind_at(chars, i) != Kind::Han {
         return None;
@@ -139,12 +100,9 @@ fn han_cuts(chars: &[char], i: usize, dict: Option<&Dict>) -> Option<(Range<usiz
     Some((run, cuts))
 }
 
-/// Where the word to the right of `idx` ends.
-///
-/// Anything that is not part of a word is skipped first, so pressing this at
-/// the end of one word lands at the end of the next rather than at the start of
-/// the space between them. That is what Word, Pages and a browser text field
-/// all do.
+/// Where the word to the right of `idx` ends. Non-word characters are
+/// skipped first: from the end of one word, the answer is the end of the
+/// next.
 pub fn word_end(chars: &[char], idx: usize, dict: Option<&Dict>) -> usize {
     let mut i = idx.min(chars.len());
     while i < chars.len() && !kind_at(chars, i).is_word() {
@@ -154,8 +112,8 @@ pub fn word_end(chars: &[char], idx: usize, dict: Option<&Dict>) -> usize {
         return i;
     }
     if let Some((run, cuts)) = han_cuts(chars, i, dict) {
-        // The last boundary is the end of the run, so there is always one past
-        // any position inside it.
+        // `cuts` ends with the run's end: one boundary lies past any `i`
+        // inside.
         if let Some(&cut) = cuts.iter().find(|&&cut| run.start + cut > i) {
             return run.start + cut;
         }
@@ -176,8 +134,8 @@ pub fn word_start(chars: &[char], idx: usize, dict: Option<&Dict>) -> usize {
     if i == 0 {
         return 0;
     }
-    // The first boundary is the start of the run, so there is always one before
-    // any position inside it.
+    // `cuts` opens with the run's start: one boundary lies before any `i`
+    // inside.
     if let Some((run, cuts)) = han_cuts(chars, i - 1, dict)
         && let Some(&cut) = cuts.iter().rev().find(|&&cut| run.start + cut < i)
     {
@@ -190,12 +148,9 @@ pub fn word_start(chars: &[char], idx: usize, dict: Option<&Dict>) -> usize {
     i
 }
 
-/// The run containing `idx` — what a double-tap selects.
-///
-/// Unlike the two above this does not skip: tapping a space selects the run of
-/// spaces, which is what a double-click does everywhere else. An index past the
-/// end selects the last run rather than nothing, because a tap beyond the final
-/// character is a tap on that character as far as the writer is concerned.
+/// The run containing `idx` — what a double-tap selects. No skipping: at a
+/// space, the run of spaces. An index past the end clamps to the last
+/// character.
 pub fn word_at(chars: &[char], idx: usize, dict: Option<&Dict>) -> Range<usize> {
     if chars.is_empty() {
         return 0..0;
@@ -228,9 +183,8 @@ mod tests {
         s.chars().collect()
     }
 
-    // The three below stand in for the public functions throughout this module,
-    // which fixes what every test here is about: the answer with no dictionary
-    // loaded. The tests that are about the dictionary pass one explicitly.
+    // Wrappers passing `None`; the dictionary tests call the `super::`
+    // functions directly.
     fn word_end(chars: &[char], idx: usize) -> usize {
         super::word_end(chars, idx, None)
     }
@@ -248,9 +202,6 @@ mod tests {
         Dict::parse(fixture::image(&pairs, Layout::Mmseg), Layout::Mmseg).expect("parses")
     }
 
-    /// Walking right by word across a sentence has to land where a writer
-    /// expects at every step, so this checks the whole walk rather than one
-    /// jump.
     #[test]
     fn walking_english_prose_by_word() {
         let c = chars("The quick brown fox.");
@@ -261,8 +212,7 @@ mod tests {
             stops.push(at);
         }
         assert_eq!(stops, vec![3, 9, 15, 19, 20]);
-        // The trailing 20 is the full stop: the walk stops at the end of the
-        // buffer rather than looping on a word that is not there.
+        // 20, the buffer's end, is a fixed point.
         assert_eq!(word_end(&c, 20), 20);
     }
 
@@ -278,8 +228,7 @@ mod tests {
         assert_eq!(stops, vec![16, 10, 4, 0]);
     }
 
-    /// The reason this module exists rather than reusing `script_of`: kanji and
-    /// the okurigana after it are one run to a font and two words to a writer.
+    /// One run to `script_of`, two words here: 書いた breaks at 書|いた.
     #[test]
     fn japanese_breaks_between_kanji_and_kana() {
         let c = chars("書いた");
@@ -292,13 +241,11 @@ mod tests {
     #[test]
     fn katakana_is_its_own_run_and_keeps_its_long_vowel() {
         let c = chars("私はコーヒーを飲む");
-        // 私 | は | コーヒー | を | 飲 | む — the katakana run holds together
-        // across ー, which lives in the katakana block for exactly this reason.
+        // 私 | は | コーヒー | を | 飲 | む — the katakana run holds across ー.
         assert_eq!(word_at(&c, 3), 2..6);
     }
 
-    /// What a run of Han comes to without a dictionary: one unit, because
-    /// nothing in the characters says otherwise.
+    /// A Han run with no dictionary is one unit.
     #[test]
     fn chinese_moves_a_whole_run_at_a_time_with_no_dictionary() {
         let c = chars("今天天氣很好");
@@ -337,9 +284,7 @@ mod tests {
         assert_eq!(back, vec![5, 4, 2, 0], "the mirror of the walk forward");
     }
 
-    /// The run is what gets segmented, so the words on either side of a full
-    /// stop are decided apart from each other and the punctuation is skipped
-    /// exactly as it is in Latin text.
+    /// The comma bounds the runs; each side is segmented apart.
     #[test]
     fn punctuation_ends_the_run_the_dictionary_sees() {
         let d = dict(&["今天", "很好"]);
@@ -355,8 +300,7 @@ mod tests {
         assert_eq!(super::word_end(&c, 2, Some(&d)), 5, "over the comma");
     }
 
-    /// Japanese gets the same cut through its kanji, and the kana rules are
-    /// left alone — the word list holds 東京 and 都庁 but no inflected forms.
+    /// The dictionary cuts kanji runs; the kana kinds stand apart from it.
     #[test]
     fn japanese_kanji_runs_are_cut_and_kana_is_not() {
         let d = dict(&["東京", "都庁", "書"]);
@@ -373,9 +317,7 @@ mod tests {
         );
     }
 
-    /// A dictionary that knows none of the characters must not change the
-    /// answer, so that a wrong or empty word list cannot make selection worse
-    /// than having none at all.
+    /// Characters absent from the word list cut one at a time.
     #[test]
     fn an_unhelpful_dictionary_falls_back_to_one_character_at_a_time() {
         let d = dict(&["東京"]);
@@ -402,15 +344,12 @@ mod tests {
         assert_eq!(word_end(&c, 2), 8, "over the ， and on to the end of world");
     }
 
-    /// "don't" is one word in every editor a writer has used, and three runs to
-    /// a naive classifier.
     #[test]
     fn an_apostrophe_inside_a_word_belongs_to_it() {
         let c = chars("don't stop");
         assert_eq!(word_end(&c, 0), 5);
         assert_eq!(word_at(&c, 2), 0..5);
-        // The typographic apostrophe too, since the Chinese punctuation table
-        // is not the only thing that produces one.
+        // The typographic apostrophe too.
         let curly = chars("don\u{2019}t");
         assert_eq!(word_at(&curly, 0), 0..5);
     }
@@ -443,8 +382,7 @@ mod tests {
         let c = chars("word");
         assert_eq!(word_end(&c, 4), 4);
         assert_eq!(word_start(&c, 0), 0);
-        // And an index past the end is clamped rather than panicking, because
-        // a tap can land anywhere.
+        // An index past the end clamps.
         assert_eq!(word_end(&c, 99), 4);
         assert_eq!(word_start(&c, 99), 0);
         assert_eq!(word_at(&c, 99), 0..4);
@@ -457,8 +395,6 @@ mod tests {
         assert_eq!(word_start(&[], 0), 0);
     }
 
-    /// Trailing whitespace has no word after it, and the walk must stop rather
-    /// than sit still forever.
     #[test]
     fn whitespace_at_the_end_terminates_the_walk() {
         let c = chars("word   ");

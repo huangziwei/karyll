@@ -942,9 +942,8 @@ impl Editor {
                 if matches!(action, Action::Quit) {
                     return Ok(());
                 }
-                // Writing puts the chrome away, which is iA Writer's rhythm in
-                // both modes: a freshly opened document has a toolbar and a
-                // document being typed into has none.
+                // Writing puts the chrome away: a freshly opened document has
+                // a toolbar, and a document being typed into has none.
                 self.set_chrome_hidden(true);
                 // Chinese input gets first refusal. It only takes keys it has
                 // a use for: English typing is untouched even while the engine
@@ -982,9 +981,9 @@ impl Editor {
         let Some(action) = keymap::action(event.code, mods, self.language.layout()) else {
             // Buttons are not keys and name no binding karyll lacks.
             if event.code < keymap::code::BTN_MISC {
-                // Named, since a key that does nothing reads like one that
-                // never arrived. Compact keyboards have no `Home`, and whether
-                // `fn`+← arrives as code 102 depends on an Apple quirk.
+                // Named: a key that does nothing reads like one that never
+                // arrived. Compact keyboards have no `Home`, and whether
+                // `fn`+← arrives as code 102 varies by keyboard.
                 eprintln!("key: {} unbound ({mods:?})", event.code);
             }
             return None;
@@ -1139,9 +1138,8 @@ impl Editor {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".to_string());
         let words = karyll_core::words::describe(karyll_core::words::count(&self.doc.chars()));
-        // Present tense either way: a document is written out a couple of
-        // seconds after the writer stops, and what is true in between is that
-        // there is something left to write.
+        // A document is written out a couple of seconds after the typing
+        // stops; `not yet saved` names the gap.
         let saved = if self.doc.is_dirty() {
             "not yet saved"
         } else {
@@ -1553,9 +1551,7 @@ impl Editor {
         // copy of the mapping puts the invert on one control and runs another:
         // after a 180° flip the right button lights and the wrong one fires.
         let (x, y) = self.point(raw_x, raw_y, extent);
-        // Any touch brings the chrome back. iA Writer reveals on mouse
-        // movement; the nearest thing a touchscreen has is a finger arriving,
-        // and the reveal is the whole glass, not a band along the bottom.
+        // Any touch brings the chrome back — the reveal is the whole glass.
         let waking = !self.strip_visible();
         self.set_chrome_hidden(false);
         // A tap landing where the strip is about to appear reveals it and stops
@@ -1651,8 +1647,8 @@ impl Editor {
                 }
             }
             // Every line of Config is a chip: a bare row is a heading or a
-            // label — nothing to run. Every line of Help is a fact, and a fact
-            // does nothing when you press it.
+            // label — nothing to run. Every line of Help is a fact, with
+            // nothing to run either.
             Mode::Config | Mode::Help | Mode::Writing | Mode::Naming { .. } => {}
         }
         Ok(())
@@ -1886,9 +1882,7 @@ impl Editor {
         self.paint()
     }
 
-    /// Open the find bar, seeded from the selection if there is one: select a
-    /// word you suspect you have overused, `Ctrl+F`, and the count is on
-    /// screen.
+    /// Open the find bar, seeded from the selection if there is one.
     fn open_find(&mut self) -> Result<()> {
         self.open_bar(false)
     }
@@ -1929,8 +1923,7 @@ impl Editor {
             field: if replacing { Field::With } else { Field::Query },
             ..Find::default()
         });
-        // The chrome is almost certainly away — the writer has been typing —
-        // and the bar is chrome.
+        // The bar is chrome, and opening it brings the chrome back.
         self.chrome_hidden = false;
         self.frame = None;
         self.research();
@@ -1952,8 +1945,7 @@ impl Editor {
         self.paint()
     }
 
-    /// Swap between the two fields, which is what Tab does in every find bar
-    /// that has two. Nothing while only one is showing.
+    /// Swap between the two fields. Nothing while only one is showing.
     fn swap_field(&mut self) -> Result<()> {
         let Some(find) = &self.find else {
             return Ok(());
@@ -2004,8 +1996,7 @@ impl Editor {
     }
 
     /// A tap on `[ All ]`: arm it, or carry it out. Two taps, the rule the
-    /// Delete chip follows. Replacing everything changes places the writer
-    /// cannot see, with no undo to reach for by touch.
+    /// Delete chip follows.
     fn arm_or_change_all(&mut self) -> Result<()> {
         let armed = self.find.as_ref().is_some_and(|f| f.arming_all);
         if !armed {
@@ -2043,8 +2034,7 @@ impl Editor {
     }
 
     /// Recompute the hits and go to the one nearest the cursor. Run on every
-    /// keystroke in the bar: a search that only answers on Enter makes the
-    /// writer type blind.
+    /// keystroke in the bar.
     fn research(&mut self) {
         let Some(find) = &self.find else { return };
         let needle: Vec<char> = find.query.chars().collect();
@@ -2070,9 +2060,7 @@ impl Editor {
     fn show_hit(&mut self) {
         let Some(find) = &self.find else { return };
         let Some(hit) = find.hits.get(find.at).cloned() else {
-            // Nothing matches: nothing is highlighted. Leaving the last hit
-            // inverted while the bar says "not found" shows the writer a match
-            // for a search that has none.
+            // Nothing matches: nothing is highlighted.
             self.doc.clear_selection();
             return;
         };
@@ -2145,9 +2133,8 @@ impl Editor {
             // in a find bar. Changing is its own chord.
             Action::Change => return self.change_one().map(|()| false),
             Action::ChangeAll => return self.change_all().map(|()| false),
-            // Tab moves between the two fields, as it does in every find bar
-            // that has two. It cannot mean an indent here: this is a one-line
-            // field, not the page.
+            // Tab moves between the two fields; an indent has no meaning in a
+            // one-line field.
             Action::Indent => return self.swap_field().map(|()| false),
             Action::Replace => return self.open_replace().map(|()| false),
             Action::Backspace => {
@@ -3090,8 +3077,8 @@ impl Editor {
             return Ok(());
         }
         if self.keyboard_present {
-            // Worth saying: the keyboard goes quiet for the duration and comes
-            // back on its own.
+            // The keyboard goes quiet for the duration and comes back on its
+            // own.
             self.show_status("Scanning disconnects the keyboard for a moment…")?;
         }
         // Coming up is not a failure. The editor does not wait for the radio:
@@ -3171,8 +3158,8 @@ impl Editor {
         Ok(())
     }
 
-    /// Follow the framework if it has turned the screen under us. The
-    /// compositor rotates our pixels, and the touchscreen is panel-fixed: the
+    /// Follow the framework when it has turned the screen. The compositor
+    /// rotates the window's pixels, and the touchscreen is panel-fixed: the
     /// mapping is what changes.
     fn poll_orientation(&mut self) {
         if self.orientation_checked.elapsed() < ORIENTATION_POLL {
@@ -4151,8 +4138,7 @@ impl Editor {
                         n => format!("{n} documents in {DOCUMENTS}"),
                     }
                 }
-                // Its own arm, or it falls through to whatever the last one
-                // says. There is no Save on this page and nothing to confirm.
+                // There is no Save on this page and nothing to confirm.
                 Mode::Config => "Changes apply at once.".to_string(),
                 // The two keys that are not in the list below: a list of what
                 // the keys do cannot name the key that opened it or the key
@@ -5021,8 +5007,8 @@ fn opening_cursor(path: &Path, len: usize) -> usize {
     opening_cursor_from(read_position(path), len)
 }
 
-/// Where documents live. Outside the extension on purpose: updating karyll
-/// replaces that directory wholesale, and prose must not go with it.
+/// Where documents live. Outside the extension: updating karyll replaces
+/// that directory wholesale, and prose must not go with it.
 const DOCUMENTS: &str = "/mnt/us/karyll";
 
 /// What the keys and the glass do, on the grid Config and Files use: the thing
@@ -5336,7 +5322,7 @@ fn ago(since: std::time::Duration) -> String {
         0..MINUTE => "just now".into(),
         MINUTE..HOUR => plural(s / MINUTE, "minute"),
         HOUR..DAY => plural(s / HOUR, "hour"),
-        // Not "1 day ago", which is a clumsy way to say a word that exists.
+        // The one unit with a word of its own.
         DAY..172_800 => "yesterday".into(),
         172_800..2_592_000 => plural(s / DAY, "day"),
         2_592_000..31_536_000 => plural(s / 2_592_000, "month"),
@@ -5437,8 +5423,7 @@ enum Bar {
     With,
     Change,
     All,
-    /// Start a document. On the Files strip, where a list of documents is what
-    /// you are looking at when you want another.
+    /// Start a document. On the Files strip, beside the list it adds to.
     New,
     /// Rename the open document — the one the Files list marks `open`, in
     /// words as well as in bold.
@@ -5455,8 +5440,7 @@ impl Bar {
             Bar::Outline => "Outline",
             Bar::Done => "Done",
             Bar::Cancel => "Cancel",
-            // The find bar's words: the same gesture, stepping through a
-            // sequence with a readout saying where you are.
+            // The find bar's words: the same stepping gesture, with a readout.
             Bar::PageBack => "Previous",
             Bar::PageOn => "Next",
             // Filled in by `strip_labels`, which knows how many pages there are.
@@ -5496,9 +5480,8 @@ impl Bar {
     }
 }
 
-/// What a chip in Config's Keyboard section does. Built alongside the labels,
-/// which holds the two together: arithmetic over three concatenated lists is
-/// how a tap forgets a keyboard it meant to connect.
+/// What a chip in Config's Keyboard section does. Built alongside the
+/// labels, holding the two together.
 #[derive(Debug, Clone)]
 enum KeyAction {
     /// Drop the link, keeping the pairing.
@@ -5510,9 +5493,9 @@ enum KeyAction {
     Scan,
 }
 
-/// What a line of the Config panel does. Built alongside its label, for the
-/// reason [`KeyAction`] is. The two with a list in them carry the list the
-/// chips were drawn from.
+/// What a line of the Config panel does. Built alongside its label, as
+/// [`KeyAction`] is. The two with a list in them carry the list the chips
+/// were drawn from.
 #[derive(Debug, Clone)]
 enum ConfigRow {
     /// A heading. Not tappable. One list holds every row.
@@ -5685,9 +5668,7 @@ mod tests {
         }
     }
 
-    /// Every shortcut that opens a surface closes it. The list is easy to get
-    /// half-right — one new panel with a chord and no matching arm here and the
-    /// rule quietly stops being a rule.
+    /// Every shortcut that opens a surface closes it.
     mod toggling {
         use super::*;
 
@@ -5747,8 +5728,7 @@ mod tests {
 
         #[test]
         fn replace_closes_only_a_bar_that_is_already_replacing() {
-            // On a plain find bar the chord reveals the second field, which is
-            // what it is for. Closing there loses a query the writer typed.
+            // On a plain find bar the chord reveals the second field.
             assert!(!reopens(&Mode::Writing, false, false, &Action::Replace));
             assert!(!reopens(&Mode::Writing, true, false, &Action::Replace));
             assert!(reopens(&Mode::Writing, true, true, &Action::Replace));
@@ -6158,8 +6138,7 @@ nine words in this one under the third level
 
     #[test]
     fn the_strip_never_hides_while_there_is_no_keyboard() {
-        // The rule that matters, and the one here that is safety: with nothing
-        // paired the strip is the only way out of the app.
+        // With nothing paired the strip is the only way out of the app.
         assert!(strip_visible(true, false, false, true));
     }
 
@@ -6172,7 +6151,7 @@ nine words in this one under the third level
         assert_eq!(secs(3599), "59 minutes ago");
         assert_eq!(secs(3600), "1 hour ago");
         assert_eq!(secs(86_399), "23 hours ago");
-        // The one unit with a word of its own, and using it is the point.
+        // The one unit with a word of its own.
         assert_eq!(secs(86_400), "yesterday");
         assert_eq!(secs(172_799), "yesterday");
         assert_eq!(secs(172_800), "2 days ago");
@@ -6403,8 +6382,7 @@ nine words in this one under the third level
 
     #[test]
     fn mid_sentence_does_not_autosave() {
-        // The whole point of the idle trigger: a pause between keystrokes must
-        // not be mistaken for the writer stopping.
+        // A pause between keystrokes is not the writer stopping.
         assert!(!autosave_due(
             Some(Duration::from_millis(400)),
             Duration::from_secs(5)
@@ -6431,8 +6409,7 @@ nine words in this one under the third level
         assert!(autosave_due(None, Duration::ZERO));
     }
 
-    /// The backstop has to be longer than the pause, or the pause never gets a
-    /// chance to be the thing that fires and every save lands mid-word.
+    /// The backstop is the looser of the two; the pause fires first.
     #[test]
     fn the_backstop_is_the_looser_of_the_two() {
         assert!(AUTOSAVE_MAX > AUTOSAVE_IDLE);
@@ -6469,8 +6446,7 @@ nine words in this one under the third level
 
         #[test]
         fn cycling_skips_the_ones_that_are_switched_off() {
-            // The point of switching them off: someone who writes two should
-            // press Ctrl+Space twice to get back, not five times.
+            // Two enabled sources cycle in two presses.
             let two = [Language::English, Language::Japanese];
             assert_eq!(Language::English.next(&two), Language::Japanese);
             assert_eq!(Language::Japanese.next(&two), Language::English);
@@ -6554,8 +6530,7 @@ nine words in this one under the third level
             assert_eq!(Language::ALL.iter().filter(|l| l.traditional()).count(), 1);
         }
 
-        /// The remembered letter has to survive a round trip, or a writer who
-        /// left in Chinese comes back to English.
+        /// The remembered letter survives a round trip.
         #[test]
         fn every_language_survives_being_written_down() {
             for language in Language::ALL {
@@ -6568,24 +6543,21 @@ nine words in this one under the third level
     mod position {
         use super::*;
 
-        /// The whole point of the feature: a draft opens where it was left.
+        /// A draft opens where it was left.
         #[test]
         fn a_remembered_place_is_where_the_document_opens() {
             assert_eq!(opening_cursor_from(Some(1200), 5000), 1200);
         }
 
-        /// The fallback is the top. The end is a claim that the file is a draft
-        /// being continued, which nothing supports for a document karyll has
-        /// never opened.
+        /// The fallback is the top.
         #[test]
         fn a_document_never_seen_before_opens_at_its_top() {
             assert_eq!(opening_cursor_from(None, 5000), 0);
             assert_eq!(opening_cursor_from(None, 0), 0);
         }
 
-        /// The file is plain Markdown on a volume that mounts over USB: it can
-        /// have been shortened elsewhere between sessions. Clamping beats
-        /// refusing to restore.
+        /// The file is plain Markdown on a volume that mounts over USB: it
+        /// can have been shortened elsewhere between sessions.
         #[test]
         fn a_stale_place_past_the_end_is_clamped() {
             assert_eq!(opening_cursor_from(Some(9000), 40), 40);

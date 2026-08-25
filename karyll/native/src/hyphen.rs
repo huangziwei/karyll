@@ -1,21 +1,6 @@
-//! Opening the hyphenation dictionaries the Kindle already carries.
-//!
-//! Ten of them, at `/usr/java/lib/dictionaries/hyphen/`, part of the rootfs on
-//! every device karyll runs on rather than something a locale download leaves
-//! behind. karyll reads the data and leaves `libhyphen.so` alone, the same
-//! bargain [`crate::lexicon`] strikes with the segmenter.
-//!
-//! **Two of the ten are used**, because they are the two languages karyll is
-//! written in. Chinese and Japanese do not hyphenate at all, and no dictionary
-//! is offered for a language karyll has no keyboard for: hyphenating French
-//! prose with English patterns is worse than leaving it alone.
-//!
-//! American English rather than British: `hyph_en_GB.dic` carries four
-//! patterns that respell the word around the break, which
-//! [`karyll_core::hyphen`] refuses rather than silently drop.
-//!
-//! The German file is the reformed orthography, and states no minimum word
-//! length, so it divides words as short as four letters.
+//! The firmware's hyphenation dictionaries: [`DICTIONARIES`] names one file
+//! under `/usr/java/lib/dictionaries/hyphen/` per hyphenated [`Language`],
+//! and [`load`] parses it with [`karyll_core::hyphen`] on first use.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -26,8 +11,8 @@ use karyll_core::hyphen::EN_CURATION;
 
 use crate::Language;
 
-/// Where the firmware keeps each dictionary, and the break decisions that go
-/// over it. Empty for a set used exactly as its author wrote it.
+/// Each hyphenated language: the dictionary's device path, and the curation
+/// applied over its patterns — empty applies none.
 const DICTIONARIES: [(Language, &str, &str); 2] = [
     (
         Language::English,
@@ -35,24 +20,19 @@ const DICTIONARIES: [(Language, &str, &str); 2] = [
         EN_CURATION,
     ),
     (
+        // Reformed orthography; the file states no minimum word length.
         Language::German,
         "/usr/java/lib/dictionaries/hyphen/hyph_de.dic",
         "",
     ),
 ];
 
-/// One slot per entry of [`DICTIONARIES`]. A dictionary is a megabyte or so of
-/// automaton and the writer can cycle back and forth between sources, so it is
-/// built once and held.
+/// One parsed dictionary per entry of [`DICTIONARIES`], built once and held.
 static LOADED: [OnceLock<Option<Hyphenator>>; DICTIONARIES.len()] =
     [OnceLock::new(), OnceLock::new()];
 
-/// The dictionary for `language`, or `None` where karyll hyphenates it not at
-/// all or the device has not got the file.
-///
-/// **A missing dictionary is not an error worth stopping for**: the page wraps
-/// at spaces, which is what it did before any of this, so the failure costs an
-/// evener rag and nothing else.
+/// The dictionary for `language`: `None` for a language with no
+/// [`DICTIONARIES`] entry, an unreadable file, or bytes that do not parse.
 pub fn load(language: Language) -> Option<&'static Hyphenator> {
     let at = DICTIONARIES.iter().position(|(l, _, _)| *l == language)?;
     let (_, path, curation) = DICTIONARIES[at];
@@ -94,14 +74,9 @@ fn read(path: &Path, curation: &str) -> Option<Hyphenator> {
 mod tests {
     use super::*;
 
-    /// The real firmware files, when a copy of one is to hand.
-    ///
-    /// `KARYLL_LEXICON_DIR` points at a directory holding the device's `usr`
-    /// tree — a system dump will do — and without it this says nothing, because
-    /// a development machine has none of these files. The reader is covered
-    /// either way by the fixtures in `karyll_core::hyphen`; what this adds is
-    /// the only thing a fixture cannot: that the real bytes parse, and divide
-    /// words where a typesetter would.
+    /// Parses the files under `$KARYLL_LEXICON_DIR` — a directory holding a
+    /// device's `usr` tree — and checks their divisions. Returns with the
+    /// variable unset.
     #[test]
     fn the_firmware_dictionaries_parse_and_divide_words_as_they_should() {
         let Ok(root) = std::env::var("KARYLL_LEXICON_DIR") else {
@@ -114,13 +89,13 @@ mod tests {
                     ("hyphenation", "hy-phen-ation"),
                     ("typography", "ty-pog-ra-phy"),
                     ("algorithm", "al-go-rithm"),
-                    // The curated decisions reach the firmware's patterns.
+                    // Breaks decided by `EN_CURATION`, over the file's own.
                     ("everything", "every-thing"),
                     ("understanding", "under-stand-ing"),
                     ("father", "father"),
                     // Five letters and fewer are left whole.
                     ("table", "table"),
-                    // A word that already breaks takes no mark against it.
+                    // A word containing a hyphen takes no soft hyphens.
                     ("well-thumbed", "well-thumbed"),
                 ],
             ),
@@ -130,7 +105,7 @@ mod tests {
                     ("Silbentrennung", "Sil-ben-tren-nung"),
                     ("Bibliothek", "Bi-blio-thek"),
                     ("Geschwindigkeit", "Ge-schwin-dig-keit"),
-                    // Reformed orthography, which divides both of these.
+                    // Reformed-orthography divisions.
                     ("Kiste", "Kis-te"),
                     ("Fenster", "Fens-ter"),
                     // Latin-1 in the file, UTF-8 in the word.
@@ -160,8 +135,7 @@ mod tests {
         }
     }
 
-    /// karyll hyphenates two languages and no others, and asking for one of the
-    /// rest is not an error.
+    /// The CJK languages have no [`DICTIONARIES`] entry.
     #[test]
     fn a_language_that_does_not_hyphenate_has_no_dictionary() {
         for language in [

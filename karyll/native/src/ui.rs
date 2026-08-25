@@ -130,7 +130,7 @@ pub struct Focus {
 }
 
 /// The chips of `item` a press can take, in the order they are drawn. A row's
-/// own action chip is reached by its named key, not by arrowing onto it.
+/// own action chip is reached by its named key alone.
 pub fn takeable(item: &Item) -> Vec<usize> {
     match item {
         Item::Choice { options, inert, .. } => (0..options.len())
@@ -409,7 +409,7 @@ pub fn chip_bounds(
 const SWATCH_W: u16 = 72;
 
 /// Where a row of swatches sits, from the column the chips start at. Every
-/// swatch is [`SWATCH_CELL`] wide.
+/// swatch is [`SWATCH_W`] wide.
 pub fn swatch_bounds(column: u16, width: u16, count: usize) -> Vec<(u16, u16)> {
     let right = width.saturating_sub(MARGIN_X);
     let mut x = column;
@@ -473,9 +473,8 @@ pub enum Hit {
     Option(usize, usize),
 }
 
-/// What a tap is on. Drawing and dispatch both come through here; see
-/// [`cell_bounds`]. `None` for a heading, a label, and the space past the last
-/// chip.
+/// What a tap is on: `None` for a heading, a label, and the space past the
+/// last chip.
 pub fn hit(
     items: &[Item],
     layout: Layout,
@@ -1209,8 +1208,7 @@ pub fn paint_row(
         if !detail.is_empty() {
             draw_line(window, fonts, detail, column, baseline, TEXT_PX, false, ink);
         }
-        // Drawn at rest while the row around it is inverted, which marks the
-        // chip as not the thing being pressed.
+        // Drawn at rest while the row around it is inverted.
         if let Some(text) = action {
             let chip = action_rect(layout, index, width, text, |s| {
                 measure(fonts, s, TEXT_PX) as u16
@@ -1348,8 +1346,7 @@ fn label_roles(label: &str) -> Vec<Role> {
         .collect()
 }
 
-/// How wide a label draws. The sum `ui::measure` does, over `Metrics`, which
-/// makes the geometry above checkable against a stub.
+/// How wide a label draws: the sum [`measure`] does, over `Metrics`.
 pub fn label_width(fonts: &mut impl Metrics, label: &str, px: f32) -> u16 {
     let width: f32 = label
         .chars()
@@ -1493,7 +1490,7 @@ mod tests {
 
     #[test]
     fn the_title_status_and_rows_never_overlap() {
-        // Spacing comes from the title face, not the body face.
+        // Spacing comes from the title face.
         let l = layout();
         assert!(l.status_top >= l.title_top + 58, "status clears the title");
         assert!(l.rows_top >= l.status_top + 44, "rows clear the status");
@@ -1537,7 +1534,7 @@ mod tests {
         assert_eq!(l.row_at(l.rows_top + 10, 0), None);
     }
 
-    /// A stub metric, as `wrap`'s tests use: ten pixels a character.
+    /// A stub metric: ten pixels a character.
     fn stub(text: &str) -> u16 {
         text.chars().count() as u16 * 10
     }
@@ -1556,7 +1553,7 @@ mod tests {
         }
     }
 
-    /// A row that opens something, as a Files line does.
+    /// A row that opens something.
     fn opener() -> Item {
         Item::Row {
             label: "draft.md".into(),
@@ -1644,8 +1641,8 @@ mod tests {
         );
     }
 
-    /// `field_room` and `cell_bounds` do one subtraction: the text is trimmed
-    /// against the width it is drawn into.
+    /// `stretch_room` and `cell_bounds` do one subtraction: the text is
+    /// trimmed against the width it is drawn into.
     #[test]
     fn the_room_offered_matches_the_cell_given() {
         let others = strings(&["[ 1 of 3 ]", "[ Previous ]", "[ Next ]", "[ Done ]"]);
@@ -1930,15 +1927,14 @@ mod tests {
         }
     }
 
-    /// A label is cut at its own value. A chip too wide for the margin is
-    /// dropped, and a candidate bar too wide for the panel is paged.
+    /// A label is cut at its own value.
     #[test]
     fn a_label_too_long_for_its_room_is_cut_at_the_mark() {
         assert_eq!(elided("draft.md", 200, stub), "draft.md", "it fits, whole");
         // Ten pixels a character, the mark included: five characters and the
         // mark are 60, and 65 keeps five.
         assert_eq!(elided("a-long-filename.md", 65, stub), "a-lon…");
-        // Cut by character: a Chinese name loses characters and not bytes.
+        // Cut by character: a Chinese name loses whole characters.
         assert_eq!(elided("第一章的草稿", 45, stub), "第一章…");
         // A space before the mark is trimmed.
         assert_eq!(elided("Focus on this", 75, stub), "Focus…");
@@ -2020,9 +2016,8 @@ mod tests {
         assert_eq!(chip_bounds(400, 600, long, &options, stub)[0].0, 400);
     }
 
-    /// What this pins: the invert must not land on one control while the tap
-    /// runs another. Drawing and hit-testing are the same two functions here,
-    /// and this is the test that says so.
+    /// Drawing and hit-testing measure through the same bounds: the invert
+    /// lands on the control the tap runs.
     #[test]
     fn a_tap_reported_on_a_chip_is_inside_the_chip_that_gets_drawn() {
         let l = layout();
@@ -2046,8 +2041,8 @@ mod tests {
         }
     }
 
-    /// The same bug class on the colour row, which has no text to be measured
-    /// from and lays itself out by its own arithmetic.
+    /// The colour row, with no text to measure, lays out by its own
+    /// arithmetic; a tap resolves inside the swatch drawn.
     #[test]
     fn a_tap_reported_on_a_swatch_is_inside_the_swatch_that_gets_drawn() {
         let l = layout();
@@ -2137,7 +2132,7 @@ mod tests {
         );
     }
 
-    /// Short is fine and empty is the common case, the way it is for `on`.
+    /// `inert` may be short or empty, as `on` may.
     #[test]
     fn an_option_past_the_end_of_inert_is_live() {
         let l = layout();
@@ -2339,9 +2334,8 @@ mod tests {
         );
     }
 
-    /// The two panel widths karyll has to fit: the one it was written on, and
-    /// the smaller one it is not allowed to break on. The narrow one is the
-    /// wider of the two small panels; the tighter one is a few pixels less.
+    /// The widest panel, and the wider of the two narrow ones — the tightest
+    /// is a few pixels less.
     const WIDE: u16 = 1860;
     const NARROW: u16 = 1272;
 
@@ -2382,7 +2376,7 @@ mod tests {
         }
     }
 
-    /// Candidates are drawn at the size being written in, not at [`TEXT_PX`].
+    /// Candidates are drawn at the size being written in.
     const BODY: f32 = crate::render::DEFAULT_SIZE;
 
     /// `count` candidates of `chars` Han characters each — the one thing about
