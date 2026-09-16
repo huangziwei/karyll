@@ -1,43 +1,19 @@
-//! Finding a phrase in the document.
-//!
-//! **Over characters, never over bytes.** The buffer is a `Vec<char>` and every
-//! index in this editor — the cursor, a selection, a wrap point, a focused
-//! sentence — counts characters. A search that worked on a UTF-8 string and
-//! handed back byte offsets would land three glyphs early on the first Han
-//! character before the match, and the further into a Chinese paragraph the
-//! worse it would get.
-//!
-//! **Every match at once, on every keystroke.** A document long enough for this
-//! to matter is a few tens of thousands of characters, which is microseconds to
-//! scan, and knowing how many there are is half of what a search bar is for —
-//! "3 of 12" tells a writer whether the word they think they overuse is a
-//! problem, and one match at a time never can.
+//! Finding a phrase in the document. **Over characters, never over bytes**:
+//! every index in this editor counts characters, and byte offsets would land
+//! early on Han. **Every match at once, on every keystroke** — "3 of 12".
 
 use std::ops::Range;
 
-/// Case-folded for comparison.
-///
-/// **Per character, and that is a constraint rather than a shortcut.** A match
-/// comes back as a range of *the haystack's* indices, so a fold that changed
-/// the length would put the highlight on the wrong glyph — the one thing this
-/// module must not do. `char::to_lowercase` yields more than one character for
-/// a handful of code points (İ is the common one), and taking the first keeps
-/// the indices honest.
-///
-/// It also means German `ß` does not match `SS`, which is the same answer every
-/// editor's plain find gives.
+/// Case-folded for comparison. **Per character, and a constraint rather than a
+/// shortcut**: a match is a range of *the haystack's* indices, so a fold that
+/// changed the length would highlight the wrong glyph. So `ß` does not match `SS`.
 fn fold(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-/// Every place `needle` occurs in `haystack`, in order and not overlapping.
-///
-/// Not overlapping, so `aa` in `aaa` is one match and not two, which is what
-/// stepping through hits with Enter has to mean if the step is to terminate.
-///
-/// An empty needle matches nothing rather than everything: the search bar is
-/// empty before a word is typed into it, and highlighting every position in the
-/// document at that moment would be a strange greeting.
+/// Every place `needle` occurs in `haystack`, in order and not overlapping — so
+/// `aa` in `aaa` is one match. An empty needle matches nothing rather than
+/// everything, since the search bar starts empty.
 pub fn matches(haystack: &[char], needle: &[char]) -> Vec<Range<usize>> {
     let needle: Vec<char> = needle.iter().copied().map(fold).collect();
     if needle.is_empty() || needle.len() > haystack.len() {
@@ -60,11 +36,9 @@ pub fn matches(haystack: &[char], needle: &[char]) -> Vec<Range<usize>> {
     out
 }
 
-/// The first match at or after `cursor` — where a fresh search lands.
-///
-/// **At**, not after: the writer has not moved yet, so a match starting exactly
-/// where they are is the nearest one and skipping it would look like the search
-/// had missed it.
+/// The first match at or after `cursor` — where a fresh search lands. **At**,
+/// not after: the writer has not moved, so a match starting where they are is
+/// the nearest one.
 pub fn from(matches: &[Range<usize>], cursor: usize) -> Option<usize> {
     (!matches.is_empty()).then(|| {
         matches
@@ -77,11 +51,8 @@ pub fn from(matches: &[Range<usize>], cursor: usize) -> Option<usize> {
     })
 }
 
-/// The next match after `cursor`, wrapping. What Enter does.
-///
-/// **Strictly after**, which is the difference from [`from`]: arriving at a
-/// match leaves the cursor inside it, and Enter has to move on rather than
-/// find the same one again.
+/// The next match after `cursor`, wrapping. What Enter does. **Strictly
+/// after**, unlike [`from`]: arriving at a match leaves the cursor inside it.
 pub fn next(matches: &[Range<usize>], cursor: usize) -> Option<usize> {
     (!matches.is_empty()).then(|| matches.iter().position(|m| m.start > cursor).unwrap_or(0))
 }

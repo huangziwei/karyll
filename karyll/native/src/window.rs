@@ -1,27 +1,6 @@
-//! The display surface: a real WM-managed X11 window.
-//!
-//! Not raw `/dev/fb0`. A window means the lab126 compositor owns the surface —
-//! it shows us fullscreen and recomposites the whole screen when we are torn
-//! down, so exiting leaves a live home screen instead of a stuck frame. This is
-//! the model kterm uses, and the one proven on this hardware.
-//!
-//! Two consequences worth knowing before tuning refresh:
-//!
-//! - **The X server picks the eink waveform, not us.** Drawing through a window
-//!   means we cannot ask for DU or GC16 the way an `eips` caller can. What we
-//!   still control is how much we dirty, which is why layout produces damage
-//!   rectangles and a keystroke presents one line rather than the page.
-//! - **The compositor rotates our window to the framework orientation.** We
-//!   render identity and never rotate pixels, or it happens twice. Input is
-//!   read raw from evdev, which is panel-fixed, so that side re-orients
-//!   instead.
-//!
-//! The backing store is one byte per pixel **on every device, colour included**.
-//! Carrying RGB would cost 1860×2480 13.8 MB instead of 4.6 against ~514 MB
-//! shared with the framework, and it is not needed: the byte is a grey level
-//! everywhere except for the handful of [`ink`] indices, which [`Palette`] turns
-//! into colours as the band goes out on the wire. So a colour panel costs the
-//! same memory as a grey one, and the two grey Kindles share its code paths.
+//! The display surface: a WM-managed X11 window, not raw `/dev/fb0`. **The X
+//! server picks the eink waveform**, so the only refresh control is how much is
+//! dirtied, and **the compositor rotates the window** — never rotate pixels.
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Instant;
@@ -35,7 +14,7 @@ use x11rb::connection::RequestConnection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     AtomEnum, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat,
-    PropMode, Visibility, Window as XWindow, WindowClass,
+    KeyButMask, PropMode, Visibility, Window as XWindow, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 // `change_property8` lives in the wrapper `ConnectionExt`.
@@ -44,37 +23,20 @@ use x11rb::wrapper::ConnectionExt as _;
 pub const WHITE: u8 = 0xFF;
 pub const BLACK: u8 = 0x00;
 /// Ink for marks that should recede rather than read: Markdown syntax and URLs.
-///
-/// **This asks the panel for one extra level, not for a ramp.** Coverage is
-/// still thresholded at 0.5, so every pixel is one of two values and the edges
-/// stay as hard as the body text's; only the value changes. That is a different
-/// request from antialiasing, which is what the two-level partial waveform
-/// genuinely cannot represent, and a 16-level panel has fifteen levels spare.
-///
-/// **Not a dither.** Dither averages over an *area*, and a stem at this size is
-/// 2–4 px — about one pattern cell — so it deletes half the mark instead of
-/// lightening it, and Han fares worse still.
+/// **One extra level, not a ramp and not a dither** — coverage is still
+/// thresholded at 0.5, so only the value changes and the edges stay hard.
 pub const QUIET: u8 = 0x88;
 
-/// A field behind text, on a panel with no colour to make one with.
-///
-/// Light enough that black prose on it is still black prose. This is what a
-/// `==highlight==` is drawn in on a grey Kindle; a colour one swaps the value
-/// for [`ink::FIELD`] and keeps everything else about it.
+/// A `==highlight==` on a grey panel: light enough that black prose on it is
+/// still black prose. A colour panel swaps the value for [`ink::FIELD`].
 pub const FIELD: u8 = 0xCC;
 
 /// The same field on a row focus mode has set back.
 pub const FIELD_QUIET: u8 = 0xE4;
 
-/// Palette indices — **never a grey level**.
-///
-/// These are only ever written on a panel that has colour, so their numeric
-/// values mean nothing except "not one of the greys above". Every other byte in
-/// the backing store is a luminance, and on an 8-bit visual reaches the panel
-/// as one without passing through a palette at all.
-///
-/// Kept low and contiguous so the match in `Palette::pixel` is a small jump
-/// table.
+/// Palette indices — **never a grey level**. Only written on a panel that has
+/// colour; every other byte in the backing store is a luminance. Kept low and
+/// contiguous so the match in `Palette::pixel` is a small jump table.
 pub mod ink {
     /// The caret.
     pub const CARET: u8 = 0x01;
@@ -82,11 +44,8 @@ pub mod ink {
     pub const FIELD: u8 = 0x02;
     /// The rule along the bottom of one.
     pub const FIELD_RULE: u8 = 0x03;
-    /// The first of [`super::COLOURS`] as its own index.
-    ///
-    /// The three above are whatever the writer has *chosen*; these are the
-    /// colours themselves, so the picker in Config can show all six at once
-    /// while the caret is only ever one of them.
+    /// The first of [`super::COLOURS`] as its own index. The three above are
+    /// what the writer *chose*; these are the colours themselves, for the picker.
     pub const SWATCH: u8 = 0x04;
 
     /// The index a swatch of `COLOURS[at]` is drawn in.
@@ -105,16 +64,9 @@ pub struct Colour {
     pub wash: (u8, u8, u8),
 }
 
-/// The six colours iA Writer offers, in its own order.
-///
-/// **Sampled from its picker rather than chosen**, the way every other value
-/// here was. What the picker shows is the *saturated* member of the pair: iA
-/// Writer draws the chosen colour as the highlight's underline and a pale wash
-/// of it as the field, which is why one entry carries two values.
-///
-/// `wash` is iA Writer's own for the two hues a capture pins down, and for the
-/// rest it is the hue taken to the lightness those two share — so a purple
-/// field is as pale as a yellow one rather than a slab with text on it.
+/// The six colours iA Writer offers, in its own order. Each entry carries two
+/// values because a highlight draws the saturated one as its rule and the pale
+/// `wash` as its field; every `wash` sits at one lightness.
 pub const COLOURS: [Colour; 6] = [
     Colour {
         name: "yellow",
@@ -198,12 +150,8 @@ pub enum Palette {
     /// Every byte is a luminance: memcpy'd to an 8-bit visual, replicated
     /// across the channels of a deeper one.
     Grey,
-    /// A panel with a colour filter array in front of it, on a visual deep
-    /// enough to address it.
-    ///
-    /// **The channel positions are read off the visual, not assumed.** A
-    /// TrueColor visual states its own masks, and two of them swapped turns the
-    /// caret orange on a panel nothing here can see.
+    /// A panel with a colour filter array, on a visual deep enough to address
+    /// it. **The channel positions are read off the visual, not assumed.**
     Colour {
         shifts: (u32, u32, u32),
         /// Bits the visual does not use: the pad at depth 24, alpha at 32. Set,
@@ -218,11 +166,8 @@ pub enum Palette {
 }
 
 impl Palette {
-    /// The pixel an ink byte becomes.
-    ///
-    /// Only the handful of [`ink`] indices are colours; every other value is
-    /// still the luminance it always was, so prose, syntax marks and paper come
-    /// out of the same arm they would on a grey panel.
+    /// The pixel an ink byte becomes. Only the [`ink`] indices are colours;
+    /// every other value is the luminance it always was.
     fn pixel(self, v: u8) -> [u8; 4] {
         let Palette::Colour {
             shifts,
@@ -233,11 +178,9 @@ impl Palette {
         else {
             return [v, v, v, 0xFF];
         };
-        // **One colour drives both halves of a highlight.** The rule along the
-        // bottom is the chosen colour and the field is its wash, which is the
-        // pairing iA Writer draws: the field is what the prose stays readable
-        // through, the rule is what gives the run an edge. A field dark enough
-        // to draw its own edge is a slab with text on it.
+        // **One colour drives both halves of a highlight**: the rule is the
+        // chosen colour, the field its wash. A field dark enough to draw its
+        // own edge is a slab with text on it.
         let last = ink::swatch(COLOURS.len() - 1);
         let (r, g, b) = match v {
             ink::CARET => COLOURS[inks.caret].rgb,
@@ -261,16 +204,9 @@ fn shift_of(mask: u32) -> u32 {
     if mask == 0 { 0 } else { mask.trailing_zeros() }
 }
 
-/// Whether the panel has a colour filter array in front of it.
-///
-/// **Asked of the panel, not of the visual.** A depth-24 TrueColor visual says
-/// the X server can represent a colour, not that the hardware can show one, and
-/// on this family those are different claims: the Colorsoft's device tree
-/// carries an `epd/cfa_panel` node and the Oasis 2's whole `/sys` has nothing
-/// matching `cfa` at all.
-///
-/// Unreadable means grey: a grey panel handed colour indices draws them as the
-/// near-black luminances they numerically are.
+/// Whether the panel has a colour filter array. **Asked of the panel, not of
+/// the visual** — a TrueColor visual says the server can represent a colour,
+/// not that the hardware can show one. Unreadable means grey.
 fn has_cfa() -> bool {
     let Ok(entries) = std::fs::read_dir("/sys/firmware/devicetree/base") else {
         return false;
@@ -284,12 +220,22 @@ fn has_cfa() -> bool {
 }
 
 /// What the server had to say about our window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Surface {
     /// Still mapped. `expose` is set when the server asked for a repaint, and
     /// `resized` when the window changed shape — which is how a rotation
     /// arrives.
-    Live { expose: bool, resized: bool },
+    Live {
+        expose: bool,
+        resized: bool,
+        /// Whether nothing is over us any more. The on-screen keyboard is the
+        /// only thing that covers part of the window without burying it, so
+        /// this is how a tap on its hide key reaches us.
+        uncovered: bool,
+        /// The keysym of every `KeyPress` drained, in order, while
+        /// [`Window::set_typing`] is on: the on-screen keyboard's keys.
+        typed: Vec<u32>,
+    },
     /// The window is gone and the app should exit.
     Gone,
 }
@@ -328,17 +274,15 @@ pub struct Window {
     app_id: String,
     orientation: Orientation,
     burial: Burial,
+    /// Whether [`Window::drain_events`] should read `KeyPress` events. Off
+    /// unless the on-screen keyboard is standing, because reading one costs a
+    /// round trip — see [`keysym_of`].
+    typing: bool,
 }
 
 /// Whether the framework's screen is over the editor's, and since when.
-///
-/// **Watched, not fought.** A `configure_window` raise and a re-set of the
-/// window name — the only levers an app has on this manager — are ignored while
-/// it is burying us: measured on the device, six burials answered three times
-/// each inside the first four seconds came back after 10.3, 12.2, 19.8, 15.5,
-/// 22.9 and 10.2 seconds, which is the manager's own schedule and not a reply.
-/// So the editor waits it out, and what it does with this is stay off the
-/// touchscreen while it cannot be seen — see [`Window::buried`].
+/// **Watched, not fought**: this manager ignores a raise or a name change while
+/// it is burying us, so the editor waits it out — see [`Window::buried`].
 #[derive(Default)]
 struct Burial {
     /// Whether the last thing the server said was that the window is wholly
@@ -377,11 +321,8 @@ impl Burial {
     }
 }
 
-/// Decide the palette from the screen's own visual and the panel in front of it.
-///
-/// Logged either way. A Colorsoft that came up grey because `/sys` was not
-/// readable is a silent, puzzling loss of every colour on the device, and the
-/// one line that says so costs nothing.
+/// Decide the palette from the screen's own visual and the panel in front of
+/// it. Logged either way: coming up grey by accident is otherwise silent.
 fn palette_for(conn: &RustConnection, screen: &x11rb::protocol::xproto::Screen) -> Palette {
     let visual = screen
         .allowed_depths
@@ -453,6 +394,21 @@ fn set_name(
     Ok(())
 }
 
+/// The keysym `keycode` carries under `state`. **Asked for on every press**:
+/// the on-screen keyboard rewrites keycodes 220–254 between keystrokes, so a
+/// cached mapping answers with the last character.
+fn keysym_of(conn: &RustConnection, keycode: u8, state: u16) -> Option<u32> {
+    let reply = conn.get_keyboard_mapping(keycode, 1).ok()?.reply().ok()?;
+    // A keycode with one keysym has no shifted column.
+    let shifted = usize::from(state & u16::from(KeyButMask::SHIFT) != 0);
+    let at = shifted.min(reply.keysyms.len().saturating_sub(1));
+    let keysym = match reply.keysyms.get(at).copied().unwrap_or(0) {
+        0 => reply.keysyms.first().copied().unwrap_or(0),
+        keysym => keysym,
+    };
+    (keysym != 0).then_some(keysym)
+}
+
 impl Window {
     /// Map a fullscreen window and clear it to paper white.
     pub fn open(app_id: &str, orientation: Orientation) -> Result<Self> {
@@ -476,14 +432,14 @@ impl Window {
             screen.root_visual,
             &CreateWindowAux::new()
                 .background_pixel(screen.white_pixel)
-                // **Visibility, because being covered is not being unmapped.**
-                // The manager stacks the home screen over the editor rather
-                // than taking its window away, so `STRUCTURE_NOTIFY` stays
-                // silent through the one event a writer actually notices.
+                // **Visibility, because being covered is not being unmapped**:
+                // the manager stacks the home screen over us. `KEY_PRESS` is
+                // the on-screen keyboard — a Bluetooth one is grabbed on evdev.
                 .event_mask(
                     EventMask::EXPOSURE
                         | EventMask::STRUCTURE_NOTIFY
-                        | EventMask::VISIBILITY_CHANGE,
+                        | EventMask::VISIBILITY_CHANGE
+                        | EventMask::KEY_PRESS,
                 ),
         )
         .context("create_window")?;
@@ -516,33 +472,31 @@ impl Window {
             app_id: app_id.to_string(),
             orientation,
             burial: Burial::default(),
+            typing: false,
         })
+    }
+
+    /// Read `KeyPress` events, or stop reading them. Set with the on-screen
+    /// keyboard: with it down there is nothing to read, and every press that
+    /// did arrive would cost the round trip in [`keysym_of`].
+    pub fn set_typing(&mut self, on: bool) {
+        self.typing = on;
     }
 
     pub fn orientation(&self) -> Orientation {
         self.orientation
     }
 
-    /// Whether the framework's screen is currently over the editor's.
-    ///
-    /// **A tap is not ours while this is true.** The touchscreen and the pen
-    /// are read, not grabbed, so the framework sees the same contacts the
-    /// editor does — which is how a tap on the tile still reaches it while
-    /// karyll is buried. Acting on those too means a writer tapping at the
-    /// home screen is silently working an editor they cannot see: moving the
-    /// caret, opening panels, and eventually finding `[ Exit ]`. The keyboard
-    /// is grabbed exclusively and so is nobody else's; what is typed still
-    /// belongs to the document and is kept.
+    /// Whether the framework's screen is over the editor's. **A tap is not ours
+    /// while this is true** — touch and pen are read, not grabbed, so the
+    /// framework sees the same contacts. Keys are grabbed, and stay ours.
     pub fn buried(&self) -> bool {
         self.burial.under
     }
 
-    /// Ask the window manager to turn the window.
-    ///
-    /// The `_O:` field of the window name is the only lever an app has here —
-    /// there is no X request for it, and the accelerometer only ever flips
-    /// 180°. The manager answers by resizing us, which arrives as a configure
-    /// event and is picked up by [`Window::drain_events`].
+    /// Ask the window manager to turn the window. The `_O:` field of the window
+    /// name is the only lever there is; the manager answers by resizing us,
+    /// which arrives at [`Window::drain_events`] as a configure event.
     pub fn set_orientation(&mut self, orientation: Orientation) -> Result<()> {
         self.orientation = orientation;
         set_name(&self.conn, self.win, &self.app_id, orientation)?;
@@ -598,11 +552,8 @@ impl Window {
         self.palette = if on { self.capable } else { Palette::Grey };
     }
 
-    /// Which of [`COLOURS`] the caret and the highlighter are set to.
-    ///
-    /// Read off `capable` rather than off the palette in force, so switching
-    /// colour off and back on returns the pair the writer picked rather than
-    /// the default.
+    /// Which of [`COLOURS`] the caret and the highlighter are set to. Read off
+    /// `capable`, so switching colour off and back on keeps the writer's pair.
     pub fn colours(&self) -> Inks {
         match self.capable {
             Palette::Colour { inks, .. } => inks,
@@ -637,11 +588,8 @@ impl Window {
         if self.colour() { ink::CARET } else { BLACK }
     }
 
-    /// The value a `==highlight==` field is filled with.
-    ///
-    /// **`quiet` outranks colour.** Focus mode sets a row back whatever the
-    /// panel can do, so a field off the focused sentence is grey even where
-    /// there is colour to draw it in.
+    /// The value a `==highlight==` field is filled with. **`quiet` outranks
+    /// colour**: a field off the focused sentence is grey on any panel.
     pub fn field_ink(&self, quiet: bool) -> u8 {
         match (quiet, self.colour()) {
             (true, _) => FIELD_QUIET,
@@ -676,18 +624,13 @@ impl Window {
         }
     }
 
-    /// Send `rect` to the server.
-    ///
-    /// Split into horizontal bands that each fit one request, so the server
-    /// sees whole rows rather than a partially transferred image. Presenting
-    /// the smallest rectangle that changed is the only refresh control a
-    /// windowed client has.
+    /// Send `rect` to the server, split into horizontal bands that each fit one
+    /// request. The smallest rectangle that changed is the only refresh control
+    /// a windowed client has.
     pub fn present(&mut self, rect: Rect) -> Result<()> {
         // **Widened to full rows.** The panel does not reliably refresh a
-        // narrow column: a quarter-width button could be inverted in the
-        // backing store, sent, and never visibly change, while the full-width
-        // button next to it worked every time. Rows are cheap — the cost is in
-        // how many of them, not how wide.
+        // narrow column, and rows are cheap: the cost is in how many, not
+        // how wide.
         let rect = Rect {
             x: 0,
             width: self.width,
@@ -742,24 +685,44 @@ impl Window {
         self.conn.stream().as_raw_fd()
     }
 
-    /// Take whatever the server has sent without blocking.
-    ///
-    /// Call this before waiting on [`Window::fd`]: x11rb buffers events
-    /// internally, so an event already decoded leaves nothing on the socket for
-    /// `poll` to report and waiting first would miss it.
+    /// Take whatever the server has sent without blocking. **Call this before
+    /// waiting on [`Window::fd`]**: x11rb buffers events internally, so one it
+    /// has decoded leaves nothing on the socket for `poll` to report.
     pub fn drain_events(&mut self) -> Result<Surface> {
         let mut expose = false;
+        let mut uncovered = false;
+        // Whether the window went wholly under during this drain.
+        let mut buried = false;
         let mut size = None;
+        let mut presses = Vec::new();
         let now = Instant::now();
         while let Some(event) = self.conn.poll_for_event().context("poll_for_event")? {
             match event {
                 Event::Expose(_) => expose = true,
                 Event::ConfigureNotify(event) => size = Some((event.width, event.height)),
                 Event::UnmapNotify(_) | Event::DestroyNotify(_) => return Ok(Surface::Gone),
-                Event::VisibilityNotify(event) => self.burial.saw(event.state, now),
+                // A burial and its return inside one drain is not an uncover:
+                // the caller reads an uncover as the on-screen keyboard
+                // having been dismissed.
+                Event::VisibilityNotify(event) => {
+                    match event.state {
+                        Visibility::UNOBSCURED => uncovered = !buried,
+                        Visibility::FULLY_OBSCURED => buried = true,
+                        _ => uncovered = false,
+                    }
+                    self.burial.saw(event.state, now);
+                }
+                // Decoded below: `keysym_of` is a round trip, and doing one
+                // inside the drain leaves the rest of the queue waiting on the
+                // server.
+                Event::KeyPress(event) if self.typing => presses.push(event),
                 _ => {}
             }
         }
+        let typed = presses
+            .iter()
+            .filter_map(|event| keysym_of(&self.conn, event.detail, event.state.into()))
+            .collect();
         let resized = match size {
             Some(size) if size != (self.width, self.height) => {
                 self.resize(size.0, size.1);
@@ -767,16 +730,17 @@ impl Window {
             }
             _ => false,
         };
-        Ok(Surface::Live { expose, resized })
+        Ok(Surface::Live {
+            expose,
+            resized,
+            uncovered,
+            typed,
+        })
     }
 
-    /// Present `rect` and wait for the server to have taken it.
-    ///
-    /// A plain [`Window::present`] only writes to the socket. Two updates to
-    /// the same region queued back to back — which is what an invert and its
-    /// restore are — get coalesced, and the panel only ever shows the second
-    /// one. The round trip here forces the first to be accepted before the
-    /// caller holds it on screen.
+    /// Present `rect` and wait for the server to have taken it. Two updates to
+    /// one region queued back to back — an invert and its restore — are
+    /// coalesced, and only the second is ever shown.
     pub fn present_sync(&mut self, rect: Rect) -> Result<()> {
         self.present(rect)?;
         // Any request with a reply is a round trip; this is the cheapest.
@@ -795,26 +759,9 @@ impl Window {
         self.present(full)
     }
 
-    /// Drive every pixel to black and hold it there, so the caller can paint the
-    /// real content over it.
-    ///
-    /// **This is what a flashing refresh is, done by hand.** A windowed client
-    /// cannot ask the X server for a waveform by name, and re-sending the same
-    /// image does not clear anything — the panel has no reason to move a pixel
-    /// that is not changing. Ghosting is residue left in cells that have been
-    /// nudged one way many times; the cure is to drive them fully the other way
-    /// and back, which is exactly a black frame followed by the content.
-    ///
-    /// **Presented synchronously, and that is the whole trick.** Two updates in
-    /// quick succession are coalesced by the server, so without the round trip
-    /// the black frame and the content would arrive as one and the panel would
-    /// show only the content — a refresh key that did nothing at all. This is
-    /// the same coalescing that [`Window::present_sync`] was written for when
-    /// press feedback kept vanishing.
-    ///
-    /// `/usr/sbin/eips -f` is on the device and would do it in one call, but it
-    /// writes straight to `/dev/fb0` under an X server that owns the display,
-    /// and its flags are unverified here. This needs neither.
+    /// Drive every pixel to black and hold it there: a flashing refresh by
+    /// hand, since a windowed client cannot name a waveform. **Presented
+    /// synchronously**, or the server coalesces it away — see `present_sync`.
     pub fn flash(&mut self) -> Result<()> {
         let full = self.full();
         self.fill(full, BLACK);
@@ -845,11 +792,8 @@ fn clip_rect(rect: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Bytes the server expects per pixel in a `Z_PIXMAP` image.
-///
-/// Depth 8 takes the backing store's byte as-is. A deeper visual takes the same
-/// grey replicated across the channels — four bytes per pixel on the wire, but
-/// it keeps this app working unchanged on a colour panel.
+/// Bytes the server expects per pixel in a `Z_PIXMAP` image. Depth 8 takes the
+/// backing store's byte as-is; a deeper visual replicates it across channels.
 fn wire_bytes_per_pixel(depth: u8) -> usize {
     if depth <= 8 { 1 } else { 4 }
 }
@@ -861,10 +805,8 @@ fn band_rows(budget: usize, row_bytes: usize) -> usize {
     (budget.saturating_sub(64) / row_bytes.max(1)).max(1)
 }
 
-/// Pack one band of the backing store into `Z_PIXMAP` wire format.
-///
-/// The 8-bit case is still the memcpy it always was. Both grey devices take it,
-/// and neither pays anything for the colour path existing.
+/// Pack one band of the backing store into `Z_PIXMAP` wire format. The 8-bit
+/// case, which both grey devices take, is a memcpy.
 fn encode_band(pixels: &[u8], stride: usize, band: Rect, bpp: usize, palette: Palette) -> Vec<u8> {
     let mut out = Vec::with_capacity(band.width as usize * band.height as usize * bpp);
     for y in band.y as usize..(band.y + band.height) as usize {
@@ -1031,11 +973,9 @@ mod tests {
 
     #[test]
     fn the_field_is_paler_than_the_rule_that_edges_it() {
-        // The highlighter is a wash under a line, not a slab. Inverted, the
-        // prose would be sitting on the saturated one.
-        //
-        // Read back through the palette rather than from the literals, so this
-        // fails if the colours move.
+        // The highlighter is a wash under a line, not a slab. Read back through
+        // the palette rather than from the literals, so this fails if the
+        // colours move.
         let light = |v: u8| {
             let [b, g, r, _] = colorsoft().pixel(v);
             r as u32 + g as u32 + b as u32
@@ -1051,9 +991,7 @@ mod tests {
     #[test]
     fn the_channels_follow_the_visuals_masks_rather_than_a_guess() {
         // The same ink on a BGR visual has to come out as the same *colour*,
-        // which means different bytes. Swapping these is how a blue caret
-        // becomes an orange one, and one visual's worth of test would not see
-        // it.
+        // which means different bytes: swapped, a blue caret turns orange.
         let bgr = Palette::Colour {
             shifts: (0, 8, 16),
             pad: 0,

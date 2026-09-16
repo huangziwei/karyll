@@ -8,6 +8,7 @@ mod ime;
 mod keymap;
 mod lexicon;
 mod orientation;
+mod osk;
 mod pen;
 mod power;
 mod render;
@@ -188,6 +189,9 @@ fn main() -> Result<()> {
         chrome_hidden: false,
         scroll: 0,
         keyboard_present: false,
+        osk: false,
+        osk_height: 0,
+        osk_wanted: true,
         paired: Vec::new(),
         connected: None,
         last_edit: None,
@@ -550,6 +554,17 @@ struct Editor {
     scroll: i32,
     /// Whether a keyboard is attached, for the panel to report.
     keyboard_present: bool,
+    /// Whether the framework's on-screen keyboard is standing over the foot of
+    /// the window. What it costs the page is [`Editor::osk_band`].
+    osk: bool,
+    /// How tall it is. **Held, because measuring reads a file** and the band is
+    /// asked for several times per keystroke; a keyboard language change
+    /// rewrites that file, and the next raise picks the new figure up.
+    osk_height: u16,
+    /// Whether the writer has put it away. It stands by itself wherever there
+    /// is nothing else to type on, so this is only ever cleared by a tap — on
+    /// `[ Keys ]`, or on the keyboard's own hide key.
+    osk_wanted: bool,
     /// Keyboards the daemon knows, refreshed when the panel opens and after
     /// anything changes them. Hit-testing a tap reads this, never the daemon.
     paired: Vec<hid::Device>,
@@ -630,6 +645,12 @@ impl Editor {
             eprintln!("closing: could not save ({err:#})");
         }
         self.remember_position();
+        // The on-screen keyboard is the framework's window, not ours, and
+        // nothing takes it down when we go. `panic = "abort"` leaves no `Drop`
+        // to do it in, so it is done here, on every way out of `session`.
+        if self.osk {
+            osk::close();
+        }
         power::prevent_screensaver(false);
         result
     }
@@ -655,22 +676,41 @@ impl Editor {
             }
             // Drain X first. x11rb decodes into its own buffer, and an event
             // it has read leaves nothing on the socket for `poll` to report.
-            match self.window.drain_events()? {
+            let typed = match self.window.drain_events()? {
                 window::Surface::Gone => return Ok(()),
-                // A rotation arrives as a resize, and the page is laid out
-                // again from nothing.
-                window::Surface::Live { resized: true, .. } => {
-                    eprintln!("window: {}x{}", self.window.width(), self.window.height());
-                    self.frame = None;
-                    // The candidate bar is paged by the width, which the paint
-                    // below leaves alone.
-                    let candidates = std::mem::take(&mut self.candidates);
-                    self.set_candidates(candidates);
-                    self.paint()?;
+                window::Surface::Live {
+                    expose,
+                    resized,
+                    uncovered,
+                    typed,
+                } => {
+                    // **The keyboard's own hide key says nothing.** What
+                    // arrives is the uncover, and nothing else covers part of
+                    // the window without burying it.
+                    if uncovered && self.osk {
+                        self.osk_wanted = false;
+                        self.reconcile_osk()?;
+                    }
+                    if resized {
+                        // A rotation arrives as a resize, and the page is laid
+                        // out again from nothing.
+                        eprintln!("window: {}x{}", self.window.width(), self.window.height());
+                        // A keymap states a figure per orientation.
+                        if self.osk {
+                            self.osk_height = self.measure_osk();
+                        }
+                        self.frame = None;
+                        // The candidate bar is paged by the width, which the
+                        // paint below leaves alone.
+                        let candidates = std::mem::take(&mut self.candidates);
+                        self.set_candidates(candidates);
+                        self.paint()?;
+                    } else if expose {
+                        self.window.refresh()?;
+                    }
+                    typed
                 }
-                window::Surface::Live { expose: true, .. } => self.window.refresh()?,
-                window::Surface::Live { .. } => {}
-            }
+            };
 
             // A held finger produces no events: waiting has to time out for
             // the long press to be noticed at all. The same tick is what looks
@@ -725,6 +765,21 @@ impl Editor {
             self.poll_orientation();
             self.poll_autosave();
             self.poll_sleep();
+            // Ahead of the keys below: a Bluetooth keyboard that arrived last
+            // tick has already taken the on-screen one down.
+            self.reconcile_osk()?;
+
+            // Keys off the on-screen keyboard: only ours while it stands.
+            if self.osk && !self.keyboard_present && !typed.is_empty() {
+                self.note_input();
+                let actions: Vec<Action> = typed
+                    .iter()
+                    .filter_map(|k| keymap::action_of_keysym(*k))
+                    .collect();
+                if self.dispatch(actions)? {
+                    return Ok(());
+                }
+            }
 
             // A read that fails drops the descriptor. `wait` reports a hangup
             // as ready, and a descriptor that is ready and keeps failing is a
@@ -824,6 +879,9 @@ impl Editor {
                     eprintln!("keyboard: lost ({err:#}) — looking for another");
                     keyboard = None;
                     self.keyboard_present = false;
+                    // A writer whose keyboard has just gone is left with no way
+                    // to type at all, whatever they last put away.
+                    self.osk_wanted = true;
                     // A modifier held as the link drops has no release to
                     // follow, and leaves every key reading as a chord.
                     self.mods = keymap::Mods::default();
@@ -835,130 +893,137 @@ impl Editor {
                 }
             };
 
-            // While naming, keys build the name. In any other panel they do
-            // nothing — that is a finger's screen.
-            if matches!(self.mode, Mode::Naming { .. }) {
-                // CJK gets first refusal here too: every letter reaches the
-                // engine while the mode is on, and a document can be named in
-                // Chinese. See [`Sink`].
-                let mut dirty = false;
-                for event in batch {
-                    let Some(action) = self.pressed_action(&event) else {
-                        continue;
-                    };
-                    match self.compose_key(&action) {
-                        Composed::Took => {
-                            dirty = true;
-                            continue;
-                        }
-                        Composed::Finished => dirty = true,
-                        Composed::Passed => {}
-                    }
-                    // Settled — the name is taken or abandoned, and whatever
-                    // that moved to has painted itself.
-                    if self.typed_name(&action)? {
-                        dirty = false;
-                        break;
-                    }
+            // Resolved here and dispatched below, because the modifier state
+            // and the Caps Lock latch belong to this device and to no other.
+            let mut actions = Vec::new();
+            for event in &batch {
+                if let Some(action) = self.pressed_action(event) {
+                    actions.push(action);
                 }
-                if dirty {
-                    self.paint()?;
-                }
-                continue;
             }
-            // A panel is worked from the keyboard or from the glass. Up and
-            // down walk the lines that do something, left and right move along
-            // a line's chips, Enter takes the mark, and Esc is the way out.
-            if !matches!(self.mode, Mode::Writing) {
-                for event in batch {
-                    let Some(action) = self.pressed_action(&event) else {
-                        continue;
-                    };
-                    match action {
-                        Action::Quit => return Ok(()),
-                        Action::Escape => {
-                            self.leave_panel()?;
-                            break;
-                        }
-                        Action::Up => self.move_focus(false)?,
-                        Action::Down => self.move_focus(true)?,
-                        // These do the work of the page keys, which a compact
-                        // Bluetooth keyboard does not carry.
-                        Action::Left => self.move_chip(false)?,
-                        Action::Right => self.move_chip(true)?,
-                        Action::PageUp => self.page_or_nothing(true)?,
-                        Action::PageDown => self.page_or_nothing(false)?,
-                        Action::Newline => self.take_focus()?,
-                        Action::Backspace => self.delete_focus()?,
-                        Action::Files
-                        | Action::Config
-                        | Action::Help
-                        | Action::Outline
-                        | Action::NewDocument
-                        | Action::Refresh => self.apply(action)?,
-                        _ => {}
-                    }
-                }
-                continue;
+            if self.dispatch(actions)? {
+                return Ok(());
             }
+        }
+    }
 
-            // The find bar takes the keyboard while it is open. It is not a
-            // mode — the document is on screen and scrolled to the hits — and
-            // the keys build the query, not the draft.
-            if self.find.is_some() {
-                // CJK gets first refusal here as it does on the page, and by
-                // the same call: without it the bar takes pinyin letters
-                // literally. See [`Sink`].
-                let mut dirty = false;
-                for event in batch {
-                    let Some(action) = self.pressed_action(&event) else {
-                        continue;
-                    };
-                    match self.compose_key(&action) {
-                        Composed::Took => {
-                            dirty = true;
-                            continue;
-                        }
-                        Composed::Finished => dirty = true,
-                        Composed::Passed => {}
-                    }
-                    // The bar has closed, and closing it painted.
-                    if self.typed_query(&action)? {
-                        dirty = false;
-                        break;
-                    }
-                }
-                if dirty {
-                    self.paint()?;
-                }
-                continue;
-            }
-
+    /// Take a run of keystrokes into whatever holds the keyboard — name prompt,
+    /// panel, find bar or page — and paint what moved; `true` ends the session.
+    /// **One place, because there are two keyboards**, evdev's and the glass's.
+    fn dispatch(&mut self, actions: Vec<Action>) -> Result<bool> {
+        // While naming, keys build the name. In any other panel they do
+        // nothing — that is a finger's screen.
+        if matches!(self.mode, Mode::Naming { .. }) {
+            // CJK gets first refusal here too: every letter reaches the
+            // engine while the mode is on, and a document can be named in
+            // Chinese. See [`Sink`].
             let mut dirty = false;
-            for event in batch {
-                let Some(action) = self.pressed_action(&event) else {
-                    continue;
-                };
-                if matches!(action, Action::Quit) {
-                    return Ok(());
+            for action in actions {
+                match self.compose_key(&action) {
+                    Composed::Took => {
+                        dirty = true;
+                        continue;
+                    }
+                    Composed::Finished => dirty = true,
+                    Composed::Passed => {}
                 }
-                // Writing puts the chrome away: a freshly opened document has
-                // a toolbar, and a document being typed into has none.
-                self.set_chrome_hidden(true);
-                // Chinese input gets first refusal. It only takes keys it has
-                // a use for: English typing is untouched even while the engine
-                // is switched on.
-                if self.compose_key(&action) == Composed::Took {
-                    dirty = true;
-                    continue;
+                // Settled — the name is taken or abandoned, and whatever
+                // that moved to has painted itself.
+                if self.typed_name(&action)? {
+                    dirty = false;
+                    break;
                 }
-                self.apply(action)?;
-                dirty = true;
             }
             if dirty {
                 self.paint()?;
             }
+            return Ok(false);
         }
+        // A panel is worked from the keyboard or from the glass. Up and
+        // down walk the lines that do something, left and right move along
+        // a line's chips, Enter takes the mark, and Esc is the way out.
+        if !matches!(self.mode, Mode::Writing) {
+            for action in actions {
+                match action {
+                    Action::Quit => return Ok(true),
+                    Action::Escape => {
+                        self.leave_panel()?;
+                        break;
+                    }
+                    Action::Up => self.move_focus(false)?,
+                    Action::Down => self.move_focus(true)?,
+                    // These do the work of the page keys, which a compact
+                    // Bluetooth keyboard does not carry.
+                    Action::Left => self.move_chip(false)?,
+                    Action::Right => self.move_chip(true)?,
+                    Action::PageUp => self.page_or_nothing(true)?,
+                    Action::PageDown => self.page_or_nothing(false)?,
+                    Action::Newline => self.take_focus()?,
+                    Action::Backspace => self.delete_focus()?,
+                    Action::Files
+                    | Action::Config
+                    | Action::Help
+                    | Action::Outline
+                    | Action::NewDocument
+                    | Action::Refresh => self.apply(action)?,
+                    _ => {}
+                }
+            }
+            return Ok(false);
+        }
+
+        // The find bar takes the keyboard while it is open. It is not a
+        // mode — the document is on screen and scrolled to the hits — and
+        // the keys build the query, not the draft.
+        if self.find.is_some() {
+            // CJK gets first refusal here as it does on the page, and by
+            // the same call: without it the bar takes pinyin letters
+            // literally. See [`Sink`].
+            let mut dirty = false;
+            for action in actions {
+                match self.compose_key(&action) {
+                    Composed::Took => {
+                        dirty = true;
+                        continue;
+                    }
+                    Composed::Finished => dirty = true,
+                    Composed::Passed => {}
+                }
+                // The bar has closed, and closing it painted.
+                if self.typed_query(&action)? {
+                    dirty = false;
+                    break;
+                }
+            }
+            if dirty {
+                self.paint()?;
+            }
+            return Ok(false);
+        }
+
+        let mut dirty = false;
+        for action in actions {
+            if matches!(action, Action::Quit) {
+                return Ok(true);
+            }
+            // Writing puts the chrome away: a document being typed into has no
+            // toolbar. Not with the on-screen keyboard up, where the strip
+            // carries the only way to dismiss it.
+            self.set_chrome_hidden(true);
+            // Chinese input gets first refusal. It only takes keys it has
+            // a use for: English typing is untouched even while the engine
+            // is switched on.
+            if self.compose_key(&action) == Composed::Took {
+                dirty = true;
+                continue;
+            }
+            self.apply(action)?;
+            dirty = true;
+        }
+        if dirty {
+            self.paint()?;
+        }
+        Ok(false)
     }
 
     /// What a key event means, or `None` for a release, a modifier, or a key
@@ -1032,8 +1097,26 @@ impl Editor {
         }
         let mut cells = match self.mode {
             // Ordered by how often a finger reaches for it. The status line
-            // reports the autosave, and Outline is `Ctrl`/`⌘`+`Shift`+`O`.
-            Mode::Writing => vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help],
+            // reports the autosave, and what is here depends on what there is
+            // to type on: see below.
+            Mode::Writing => {
+                let mut cells = vec![Bar::Exit, Bar::Files, Bar::Config];
+                if self.osk {
+                    // The two things a writer on the glass has no other route
+                    // to. **`[ Help ]` is what the strip gives up**: six cells
+                    // is what a 1264 px panel holds, per the `strips` tests.
+                    cells.extend([Bar::Find, Bar::Outline]);
+                } else {
+                    cells.push(Bar::Help);
+                }
+                // **Only where it is the way a writer types at all.** Last, and
+                // so as far from `[ Exit ]` as the strip goes: this cell is
+                // reached for constantly and that one must not be.
+                if !self.keyboard_present {
+                    cells.push(Bar::Keys);
+                }
+                cells
+            }
             Mode::Naming { .. } => vec![Bar::Cancel],
             // The Files panel's own actions, on the strip and not among the
             // documents they act on.
@@ -1201,7 +1284,34 @@ impl Editor {
     fn layout(&mut self) -> ui::Layout {
         let text = self.fonts.line_height(ui::TEXT_PX, font::LATIN_ROW) as u16;
         let title = self.fonts.line_height(ui::TITLE_PX, font::LATIN_ROW) as u16;
-        ui::Layout::compute(text, title, self.window.height())
+        // The height the window has, less what the on-screen keyboard is
+        // standing on. Every other measure comes off this one.
+        ui::Layout::compute(text, title, self.usable_height())
+    }
+
+    /// How tall the window is as far as anything drawn is concerned.
+    fn usable_height(&self) -> u16 {
+        self.window.height().saturating_sub(self.osk_band())
+    }
+
+    /// How much of the foot the on-screen keyboard is standing on, or 0 while
+    /// it is down. Measured by [`Editor::measure_osk`].
+    fn osk_band(&self) -> u16 {
+        if self.osk { self.osk_height } else { 0 }
+    }
+
+    /// Read how tall the keyboard about to come up is. **Measured against the
+    /// panel, not the window**: the firmware's figure is a hardware property
+    /// and does not turn with us.
+    fn measure_osk(&self) -> u16 {
+        let panel = self.window.width().max(self.window.height());
+        osk_band(osk::height(panel as i32), self.window.height())
+    }
+
+    /// Whether a window y falls on the keyboard rather than on anything of
+    /// ours.
+    fn under_osk(&self, y: u16) -> bool {
+        self.osk && y >= self.usable_height()
     }
 
     /// Raw panel coordinates in, window coordinates out. Split out from
@@ -1290,15 +1400,16 @@ impl Editor {
         ui::cell_at(&cells, x)
     }
 
-    /// Whether the action strip is on screen. Without a keyboard the strip is
-    /// the only way out of the app, which overrides the hidden flag. Composing
-    /// does not: a Chinese word leaves the chrome away.
+    /// Whether the action strip is on screen. Without a keyboard it is the only
+    /// way out of the app, and under the on-screen one the only way to dismiss
+    /// it; either overrides the hidden flag. Composing does not.
     fn strip_visible(&self) -> bool {
         strip_visible(
             self.chrome_hidden,
             self.keyboard_present,
             self.find.is_some(),
             matches!(self.mode, Mode::Writing),
+            self.osk,
         )
     }
 
@@ -1308,7 +1419,7 @@ impl Editor {
         if self.strip_visible() {
             self.layout().strip_top
         } else {
-            self.window.height()
+            self.usable_height()
         }
     }
 
@@ -1434,6 +1545,17 @@ impl Editor {
         extent: (touch::Extent, touch::Extent),
     ) -> Result<bool> {
         for tap in taps {
+            // **A contact on the keyboard is not ours**: touch is not grabbed,
+            // so the framework acts on the same finger. The lift still releases
+            // whatever a press on the strip inverted.
+            let (_, y) = match tap {
+                touch::Touch::Down { x, y } | touch::Touch::Up { x, y } => self.point(x, y, extent),
+            };
+            if self.under_osk(y) {
+                self.touch_down = None;
+                self.release()?;
+                continue;
+            }
             match tap {
                 touch::Touch::Down { x, y } => self.pressed(x, y, extent)?,
                 touch::Touch::Up { x, y } => {
@@ -2711,6 +2833,8 @@ impl Editor {
             }
             Bar::Help => self.open_help()?,
             Bar::Outline => self.open_outline()?,
+            Bar::Keys => self.toggle_osk()?,
+            Bar::Find => self.open_find()?,
             Bar::New => self.start_naming(true)?,
             Bar::Rename => self.start_naming(false)?,
             Bar::PageBack => self.turn_page(true)?,
@@ -3156,6 +3280,54 @@ impl Editor {
             None => {}
         }
         Ok(())
+    }
+
+    /// Put the on-screen keyboard away, or ask for it back. What the `[ Keys ]`
+    /// cell does, and the only thing that overrides [`Editor::reconcile_osk`].
+    fn toggle_osk(&mut self) -> Result<()> {
+        self.osk_wanted = !self.osk_wanted;
+        // A writer reaching for the keyboard wants the page it is about to
+        // cover, not the bare draft: the chrome comes back with it.
+        if self.osk_wanted {
+            self.set_chrome_hidden(false);
+        }
+        self.reconcile_osk()
+    }
+
+    /// Stand the on-screen keyboard up wherever there is nothing else to type
+    /// on, and lay the page out again. Called every tick: a keyboard arriving or
+    /// leaving is the whole of the question, and neither announces itself.
+    fn reconcile_osk(&mut self) -> Result<()> {
+        let want = self.osk_wanted && !self.keyboard_present && !self.window.buried();
+        if want == self.osk {
+            return Ok(());
+        }
+        // A keyboard that would not come up must not leave the page laid out
+        // around a band that is not there. Asking again every tick would be a
+        // `lipc-set-prop` five times a second, so the ask is dropped instead.
+        if want && !osk::open() {
+            self.osk_wanted = false;
+            return Ok(());
+        }
+        if !want {
+            osk::close();
+        }
+        self.osk_height = if want { self.measure_osk() } else { 0 };
+        eprintln!(
+            "osk: {}",
+            if want {
+                format!("up, {} px of {}", self.osk_height, self.window.height())
+            } else {
+                "down".to_string()
+            }
+        );
+        self.osk = want;
+        // Only ours to read while it is standing. See
+        // [`window::Window::set_typing`].
+        self.window.set_typing(want);
+        // Every row moves: the band is a third of the screen.
+        self.frame = None;
+        self.paint()
     }
 
     /// Follow the framework when it has turned the screen. The compositor
@@ -4202,7 +4374,9 @@ impl Editor {
             std::mem::take(&mut self.landing),
             self.theme.margin_y as i32,
             bottom as i32,
-            self.window.height() as i32,
+            // What the writer can see: focus mode centres the sentence in
+            // this, and the window would put it behind the keys.
+            self.usable_height() as i32,
         );
         // Display indices throughout: the caret belongs past the preedit,
         // which is where the next keystroke lands.
@@ -4668,11 +4842,24 @@ fn document_index(display: usize, cursor: usize, preedit: usize) -> usize {
     }
 }
 
-/// Whether the action strip is on screen. Free of the editor, which leaves the
-/// safety rule below testable: without a keyboard the strip is the only way
-/// out, and a search puts the bar there.
-fn strip_visible(hidden: bool, keyboard_present: bool, finding: bool, writing: bool) -> bool {
-    !writing || finding || !hidden || !keyboard_present
+/// A band `said` px tall at the foot of a window `height` px tall, **capped at
+/// half the window**: the figure comes out of a firmware file that a keyboard
+/// language change rewrites underneath us.
+fn osk_band(said: i32, height: u16) -> u16 {
+    (said.clamp(0, u16::MAX as i32) as u16).min(height / 2)
+}
+
+/// Whether the action strip is on screen. Free of the editor, so the safety
+/// rules stay testable: the strip is the only way out without a keyboard, and
+/// the only way to dismiss the on-screen one.
+fn strip_visible(
+    hidden: bool,
+    keyboard_present: bool,
+    finding: bool,
+    writing: bool,
+    osk: bool,
+) -> bool {
+    !writing || finding || !hidden || !keyboard_present || osk
 }
 
 /// Whether `action` asks for the surface on screen. Every
@@ -5075,6 +5262,8 @@ fn help_items() -> Vec<ui::Item> {
         row("Select a run", "Press at one end, lift at the other"),
         row("Extend a selection", "Shift + tap"),
         row("The pen", "Places the cursor. It does not write."),
+        row("With no keyboard", "One comes up on screen by itself"),
+        row("Putting it away", "The Keys button, along the foot"),
         row("Delete a document", "Its Delete chip, twice"),
         row("Replace every match", "Its All chip, twice"),
         heading("Markdown it understands"),
@@ -5428,6 +5617,13 @@ enum Bar {
     /// Rename the open document — the one the Files list marks `open`, in
     /// words as well as in bold.
     Rename,
+    /// Raise the framework's on-screen keyboard, or put it away. Only on the
+    /// strip where there is no Bluetooth keyboard, because that is the only
+    /// place it is the answer to anything.
+    Keys,
+    /// Open the find bar. It has a shortcut and no cell, because a writer with
+    /// keys has `Ctrl`/`⌘`+`F` — and one typing on the glass has neither.
+    Find,
 }
 
 impl Bar {
@@ -5447,6 +5643,8 @@ impl Bar {
             Bar::PageAt => "",
             Bar::New => "New document",
             Bar::Rename => "Rename",
+            Bar::Keys => "Keys",
+            Bar::Find => "Find",
             // Filled in by `strip_labels`, which knows what was typed.
             Bar::Query => "Find:",
             Bar::Count => "",
@@ -5900,6 +6098,36 @@ nine words in this one under the third level
         }
     }
 
+    /// [`ui::chip_bounds`] drops chips from the tail where they do not fit, and
+    /// a dropped chip is a setting that cannot be reached.
+    #[test]
+    fn no_keyboard_setting_loses_a_chip_on_any_panel() {
+        use crate::font::Proportional;
+        let rows: [(&str, &[&str]); 2] = [
+            ("When karyll closes", &["Turn Bluetooth off", "Keep it on"]),
+            ("Beside the space bar", &["⌘", "Alt"]),
+        ];
+        for panel in [1264u16, 1272, 1680, 1696, 1860, 2480] {
+            // `ui::chip_column` never puts the column past half the panel,
+            // however long a paired keyboard's name is. That is the worst the
+            // chips can be squeezed to.
+            let column = panel / 2;
+            for (label, options) in rows {
+                let options: Vec<String> = options.iter().map(|o| o.to_string()).collect();
+                let bounds = ui::chip_bounds(column, panel, label, &options, |s| {
+                    ui::label_width(&mut Proportional, s, ui::TEXT_PX)
+                });
+                assert_eq!(
+                    bounds.len(),
+                    options.len(),
+                    "on a {panel} px panel, {label:?} draws only {} of its {} chips",
+                    bounds.len(),
+                    options.len()
+                );
+            }
+        }
+    }
+
     /// Which candidates are on the bar, given where the pages fall. The split
     /// itself is [`ui::candidate_pages`]'s and tested there.
     mod candidates {
@@ -5981,11 +6209,36 @@ nine words in this one under the third level
                 ),
             ];
             // A list longer than the panel adds all three paging cells.
-            for (name, cells) in [("files", 2), ("panel", 3)] {
-                let mut paged = out[cells].1.clone();
+            // Looked up by name: a strip added above must not silently
+            // renumber these.
+            for name in ["files", "panel"] {
+                let mut paged = out
+                    .iter()
+                    .find(|(that, _)| *that == name)
+                    .unwrap_or_else(|| panic!("no {name} strip to page"))
+                    .1
+                    .clone();
                 paged.extend(paging);
                 out.push((name, paged));
             }
+            // The writing strip's other two forms: with no Bluetooth keyboard
+            // attached, and with the on-screen one standing. Appended, so the
+            // lookup above keeps its meaning.
+            out.push((
+                "writing, no keyboard",
+                vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help, Bar::Keys],
+            ));
+            out.push((
+                "writing, keyboard up",
+                vec![
+                    Bar::Exit,
+                    Bar::Files,
+                    Bar::Config,
+                    Bar::Find,
+                    Bar::Outline,
+                    Bar::Keys,
+                ],
+            ));
             out
         }
 
@@ -6139,7 +6392,43 @@ nine words in this one under the third level
     #[test]
     fn the_strip_never_hides_while_there_is_no_keyboard() {
         // With nothing paired the strip is the only way out of the app.
-        assert!(strip_visible(true, false, false, true));
+        assert!(strip_visible(true, false, false, true, false));
+    }
+
+    /// The same rule for the other keyboard: with the on-screen one standing,
+    /// the strip carries `[ Keys ]`, which is the only way to put it away.
+    #[test]
+    fn the_strip_never_hides_under_the_on_screen_keyboard() {
+        assert!(strip_visible(true, true, false, true, true));
+        // And the case that actually happens — nothing paired, keyboard up.
+        assert!(strip_visible(true, false, false, true, true));
+    }
+
+    /// What the firmware states, on the panels karyll targets. The band does
+    /// not turn with the screen, so sideways it is a bigger share.
+    #[test]
+    fn the_keyboard_takes_the_band_the_firmware_states() {
+        // Band, window, and which panel held which way. The cap below must
+        // not bite on any of them: a sideways Scribe gives up the largest
+        // share, 808 of 1860, and that is still short of half.
+        for (band, window, panel) in [
+            (808, 2480, "Scribe, portrait"),
+            (808, 1860, "Scribe, landscape"),
+            (578, 1680, "Colorsoft and Oasis 2"),
+        ] {
+            assert_eq!(osk_band(band, window), band as u16, "{panel}");
+        }
+    }
+
+    /// A keyboard language change rewrites that file underneath us, and one
+    /// absurd figure in it must cost a cramped page rather than no page.
+    #[test]
+    fn an_absurd_figure_still_leaves_half_the_window() {
+        assert_eq!(osk_band(9999, 2480), 1240);
+        assert_eq!(osk_band(i32::MAX, 1680), 840);
+        // And a nonsensical one reads as no band at all.
+        assert_eq!(osk_band(0, 2480), 0);
+        assert_eq!(osk_band(-1, 2480), 0);
     }
 
     #[test]
@@ -6364,12 +6653,12 @@ nine words in this one under the third level
 
     #[test]
     fn typing_with_a_keyboard_is_the_one_case_that_hides_it() {
-        assert!(!strip_visible(true, true, false, true));
+        assert!(!strip_visible(true, true, false, true, false));
         // And it comes straight back when the flag is cleared.
-        assert!(strip_visible(false, true, false, true));
+        assert!(strip_visible(false, true, false, true, false));
         // A search puts the bar on the strip, and a hidden field is not a
         // field: the strip stays whatever the chrome flag says.
-        assert!(strip_visible(true, true, true, true));
+        assert!(strip_visible(true, true, true, true, false));
     }
 
     #[test]
@@ -6377,7 +6666,7 @@ nine words in this one under the third level
         // Opening a panel from the keyboard leaves the hidden flag set by the
         // keystroke that opened it, and `set_chrome_hidden` declines to touch
         // the flag outside `Mode::Writing`. A panel's strip is its controls.
-        assert!(strip_visible(true, true, false, false));
+        assert!(strip_visible(true, true, false, false, false));
     }
 
     #[test]

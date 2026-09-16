@@ -1,33 +1,12 @@
-//! Where one sentence ends and the next begins.
-//!
-//! Focus mode is the only caller: it sets everything back but the sentence the
-//! cursor is in, which is iA Writer's signature and therefore karyll's.
-//!
-//! **A sentence never crosses a newline**, and that one rule replaces a table of
-//! special cases. A heading has no full stop and sits on its own line, so it is
-//! one sentence; so is a list item, a quote line, and a line inside a code
-//! fence. Nothing here has to know what a block is.
-//!
-//! **This is not a fourth character classification.** `script::script_of` asks
-//! which face draws a character, `wrap::classify` asks whether a line may break,
-//! and `word::kind_at` asks whether two characters are the same word. This asks
-//! where a *run* ends, which is a question about context rather than about a
-//! character, so it shares nothing with them and takes no `Kind`.
-//!
-//! **Full-width marks are unambiguous and ASCII ones are not.** 。！？ end a
-//! sentence always — there are no decimals, no abbreviations and no following
-//! space to interpret. A `.` has to be argued with, and three cheap rules cover
-//! what a writer actually types; see `is_full_stop`.
+//! Where one sentence ends and the next begins; focus mode is the only caller.
+//! **A sentence never crosses a newline**, so a heading, a list item and a
+//! fenced line are each one and nothing here knows what a block is.
 
 use std::ops::Range;
 
-/// The sentence containing `idx`, as character indices.
-///
-/// A cursor sitting in the gap after a full stop belongs to the sentence that
-/// just ended rather than to the empty one about to begin. Without that, typing
-/// the `.` at the end of a paragraph would dim the page for one keystroke and
-/// light it again on the next — two full repaints on a panel that charges for
-/// every one of them.
+/// The sentence containing `idx`, as character indices. A cursor in the gap
+/// after a full stop belongs to the sentence that just ended, or typing the `.`
+/// would dim the page for one keystroke and light it again on the next.
 pub fn sentence_at(chars: &[char], idx: usize) -> Range<usize> {
     let idx = idx.min(chars.len());
 
@@ -82,11 +61,9 @@ fn end_of(chars: &[char], idx: usize) -> usize {
     chars.len()
 }
 
-/// Take in whatever rides along with the mark at `i` — a second mark in `What?!`
-/// and the closing quote in `he said "Go."`.
-///
-/// Without this the quote is left to open the next sentence, which puts one
-/// solid character in the middle of a dimmed paragraph.
+/// Take in whatever rides along with the mark at `i` — a second mark in
+/// `What?!`, the closing quote in `he said "Go."` — which would otherwise open
+/// the next sentence as one solid character in a dimmed paragraph.
 fn absorb(chars: &[char], i: usize) -> usize {
     let mut end = i + 1;
     while let Some(&c) = chars.get(end) {
@@ -119,21 +96,9 @@ fn terminates(chars: &[char], i: usize) -> bool {
     }
 }
 
-/// Whether a `.` ends a sentence or is doing one of its other jobs.
-///
-/// Three rules, each for something a writer types often:
-///
-/// - **A dot between digits is a decimal point**, so `3.5` stays whole.
-/// - **A dot after a lone letter is an abbreviation** — `e.g.`, `z.B.`,
-///   `U.S.A.` The German cases matter as much as the English ones here.
-/// - **A lowercase word after the dot means the sentence did not end**, which
-///   catches `etc. and so on` and the tail of the abbreviations above.
-///
-/// **Known miss: `Mr. Smith`** and the other title abbreviations, where the dot
-/// is followed by a capital. Catching those needs a list of titles per language,
-/// which is a dictionary by another name. The cost of the miss is one sentence
-/// shown as two in focus mode, which is a dimmer paragraph rather than a wrong
-/// one.
+/// Whether a `.` ends a sentence: not between digits (`3.5`), not after a lone
+/// letter (`e.g.`, `z.B.`), not before a lowercase word (`etc. and so on`).
+/// **Known miss: `Mr. Smith`**, which would need a list of titles per language.
 fn is_full_stop(chars: &[char], i: usize) -> bool {
     let before = i.checked_sub(1).and_then(|p| chars.get(p)).copied();
     let after = chars.get(i + 1).copied();

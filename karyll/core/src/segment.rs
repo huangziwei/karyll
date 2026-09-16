@@ -1,37 +1,12 @@
-//! Where one word ends and the next begins inside a run of Han.
-//!
-//! Chinese sets no spaces, so a run of Han is a string of characters that could
-//! be cut in many places and reads correctly in only one of them. 研究生命起源
-//! is 研究生 · 命 · 起源 by longest match and 研究 · 生命 · 起源 to a reader.
-//! Picking between those is what this does, by MMSEG: at each position, take
-//! every way the next three words could be read, and score the readings against
-//! each other rather than the words in isolation.
-//!
-//! Four measures decide it, each breaking the ties the one before it left:
-//!
-//! 1. the most characters covered by the three words,
-//! 2. the longest words on average, which separates readings that ran out of
-//!    text from readings that covered the same span in fewer words,
-//! 3. the most even word lengths, which prefers 研究 · 生命 over 研究生 · 命,
-//! 4. the commonest single characters, read from the frequency the dictionary
-//!    records for one-character words alone.
-//!
-//! The first word of the winning reading is committed and the whole question is
-//! asked again from the character after it.
-//!
-//! **The arithmetic is integer throughout.** An average is compared by
-//! cross-multiplying, a variance by clearing its denominator, and the fourth
-//! measure by multiplying frequencies where the published rule adds their
-//! logarithms — the same ordering, since a logarithm is monotonic, without a
-//! float on a device that has two of them.
+//! Word boundaries inside a run of Han, by MMSEG: score every reading of the
+//! next three words on characters covered, mean length, evenness and character
+//! frequency, then commit the first word. **The arithmetic is integer.**
 
 use crate::dict::{Dict, MAX_WORD};
 
-/// Every boundary in `chars`, starting at 0 and ending at its length.
-///
-/// A character the dictionary knows nothing about is a word on its own, so the
-/// boundaries always tile the run and a run of unknown characters comes back
-/// one character at a time.
+/// Every boundary in `chars`, starting at 0 and ending at its length. A
+/// character the dictionary does not know is a word on its own, so the
+/// boundaries always tile the run.
 pub fn cuts(chars: &[char], dict: &Dict) -> Vec<usize> {
     // Every position is asked about once, before any of it is decided. Each is
     // read by up to three of the readings below, and the dictionary answers the
@@ -80,10 +55,7 @@ fn first_word(spots: &[Spot], at: usize) -> usize {
 }
 
 /// What the dictionary says about one position: the lengths of the words that
-/// start there, and what the character on its own is worth.
-///
-/// Held without allocating — there can never be more candidate lengths than the
-/// longest word the dictionary admits.
+/// start there, and what the character alone is worth. Held without allocating.
 struct Spot {
     lens: [u8; MAX_WORD],
     n: u8,

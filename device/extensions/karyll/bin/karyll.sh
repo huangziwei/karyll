@@ -1,50 +1,31 @@
 #!/bin/sh
-# The editor launcher, run by the home-screen tile (documents/Karyll.sh).
-#
-# Thin on purpose. karyll manages the Bluetooth stack itself over the daemon's
-# local API — starting it, scanning, pairing, stopping it again — so there is no
-# daemon logic here to drift out of step with the app. This script only handles
-# what a shell is actually better at: not launching twice, and capturing output
-# that would otherwise go nowhere.
+# The editor launcher, run by the home-screen tile (documents/Karyll.sh). Thin
+# on purpose: karyll manages the Bluetooth stack itself, so this only handles
+# not launching twice and capturing output that would otherwise go nowhere.
 
 EXT=/mnt/us/extensions/karyll
 VAR="$EXT/var"
 LOG="$VAR/karyll.log"
 DOCS=/mnt/us/karyll
 
-# Both, and both every time. The documents directory is outside the extension
-# so that an update cannot take a draft with it, which also means nothing else
-# creates it: on a Kindle karyll has never run on, it is not there, and then the
-# welcome document cannot be written and the editor opens a path whose directory
-# does not exist.
+# Both, and both every time. The documents directory is outside the extension so
+# that an update cannot take a draft with it, which also means nothing else
+# creates it.
 mkdir -p "$VAR" "$DOCS" 2>/dev/null
 
 log() { echo "[$(date)] $*" >> "$LOG"; }
 
-# **A tap on the tile replaces whatever is running.** Two editors at once would
-# fight over an exclusive keyboard grab and over the daemon's lifetime, so only
-# one may live — but refusing the launch is the worse half of that: the
-# framework can take the screen back from karyll while it goes on running
-# behind the home screen, and pairing a keyboard is exactly when it does,
-# because the Bluetooth daemon kills `bsa_server` out from under it. A tile that
-# does nothing then is a writer with no way back to their page.
-#
-# What is lost by killing is the last couple of seconds of typing that autosave
-# has not reached, which by the time someone has walked to the library and
-# tapped a tile is nothing. A second tap by mistake costs a restart, which is
-# the cheaper mistake of the two.
+# **A tap on the tile replaces whatever is running.** Two editors would fight
+# over the keyboard grab and the daemon, and refusing the launch is worse: the
+# framework can take the screen while karyll runs on behind the home screen.
 LOCK="$VAR/karyll.pid"
 if [ -f "$LOCK" ]; then
     OLD=$(cat "$LOCK" 2>/dev/null)
     if [ -n "$OLD" ] && [ -d "/proc/$OLD" ]; then
         log "already running (pid $OLD), replacing it"
-        # **The lock is claimed before the kill.** The launcher being replaced
-        # asks for its own origin screen as it exits, and only holds that back
-        # when the lock has stopped naming its editor. It reaches that test the
-        # instant its editor dies — sooner than the loop below, which is asleep,
-        # can notice — so a claim made after the wait is a claim made too late,
-        # and the framework's screen comes up over the editor that just replaced
-        # it. `$$` stands in until the new editor exists.
+        # **The lock is claimed before the kill**, or the launcher being
+        # replaced asks for its origin screen and puts it over the editor that
+        # replaced it. `$$` stands in until the new editor exists.
         echo $$ > "$LOCK"
         kill "$OLD" 2>/dev/null
         # The editor catches the signal and leaves through the same door as
@@ -61,33 +42,15 @@ if [ -f "$LOCK" ]; then
     fi
 fi
 
-# **The lock names the editor, not this shell.** A signal to the shell is not a
-# signal to the editor: a foreground child never receives one, and the shell's
-# own trap cannot run until that child has finished, so the editor outlives
-# both the `kill` and the `kill -9` that follows it. It is then orphaned and
-# still holding the exclusive keyboard grab, the touchscreen and its Bluetooth
-# daemon, and the launch that meant to replace it comes up beside it instead:
-# two editors painting one screen, splitting every tap, each restoring the
-# framework's screen over the other on the way out. That is the tile that will
-# not give a writer their page back.
-#
-# So the editor is started in the background and the lock names it, which makes
-# `kill` reach the process that can act on it and `/proc/$PID` mean what the
-# waiting launcher above reads it to mean. `$$` holds the claim only for the
-# moment before the editor exists, so a tap landing in that gap still finds
-# something alive and waits for it.
+# **The lock names the editor, not this shell.** A foreground child never
+# receives the shell's signals, so the editor is started in the background and
+# the lock names it, which makes `kill` and `/proc/$PID` reach the right process.
 PID=$$
 echo "$PID" > "$LOCK"
 
-# The screen the tap came from, asked for once the editor is gone. The app
-# manager holds nothing of karyll's on its history stack — a `documents/`
-# scriptlet is registered without a `lipcId`, so nothing is ever put there —
-# and its own fallback is the home screen. The tile carries the originating
-# view in; with neither variable set, the manager chooses.
-#
-# `startView` takes `<view_name>:<layer>:<app_uri>` and acts on the view name,
-# so the address is built from the same name it carries. Layer 0 is the top
-# level, which the home screen and the library both are.
+# The screen the tap came from, asked for once the editor is gone: the app
+# manager keeps no history for a `documents/` scriptlet, so the tile carries it
+# in. `startView` takes `<view_name>:<layer>:<app_uri>`, layer 0 being the top.
 land() {
     log "origin ${KARYLL_ORIGIN_VIEW:-none}"
     case "${KARYLL_ORIGIN_VIEW:-}" in
@@ -99,39 +62,19 @@ land() {
         2>/dev/null
 }
 
-# Let the device sleep again on the way out. karyll holds powerd's
-# `preventScreenSaver` for the session, because it grabs the keyboard and a
-# grabbed key cannot reset the idle timer. The binary is built `panic = "abort"`
-# and so skips its own cleanup on an abort, which would leave the Kindle unable
-# to sleep after the editor is gone. This trap fires however the binary died.
-#
-# **The lock goes only if it is still ours, and so does the landing.** A launch
-# that replaced this one has already written its own pid there; removing it then
-# would leave the next tap unable to see the editor that is running, and asking
-# for a screen then would throw the writer off the editor that just replaced us.
+# Let the device sleep again on the way out: karyll holds `preventScreenSaver`
+# for the session and is built `panic = "abort"`, so it can die without its own
+# cleanup. **The lock and the landing go only if the lock is still ours.**
 trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "$PID" ]; then rm -f "$LOCK"; land; fi; lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null' EXIT
 
-# **Passed on, not swallowed.** The framework signals the launcher when it takes
-# the screen back, and the editor is the one that can save and let go of the
-# window. Nothing here may exit on its own account: the lock names the editor,
-# so the launcher has to outlive it.
+# **Passed on, not swallowed.** The framework signals the launcher, and the
+# editor is the one that can save and let go of the window; nothing here may
+# exit on its own account.
 trap '[ "$PID" != "$$" ] && kill "$PID" 2>/dev/null' INT TERM
 
-# The most recently touched document, or the welcome one. Documents live
-# outside the extension so replacing it on update cannot take them with it.
-#
-# **Only when there is nothing at all**, which is a fresh install and nothing
-# else: a writer who deletes the welcome document has said what they think of
-# it, and it must not come back the next time they empty the directory. It used
-# to be an empty `draft.md`, which opened onto a blank page with nothing saying
-# what any of the controls did.
-#
-# **Found by glob and `-nt`, never by `ls`.** BusyBox `ls` prints a `?` for
-# every byte it thinks is unprintable, and with no Unicode support compiled in
-# that is every byte above 0x7F — so a document named in Chinese or Japanese
-# came back as a row of question marks, a path that does not exist, and the
-# editor opened a blank page called `???.md`. The Files panel never had the bug
-# because it reads the directory itself. A glob hands the bytes over untouched.
+# The most recently touched document, or the welcome one on a fresh install.
+# **Found by glob and `-nt`, never by `ls`**: BusyBox `ls` has no Unicode support
+# and prints a `?` for every byte above 0x7F, so a CJK name comes back unusable.
 DOC="$1"
 if [ -z "$DOC" ]; then
     for f in "$DOCS"/*.md; do
@@ -147,12 +90,9 @@ if [ -z "$DOC" ]; then
     fi
 fi
 
-# **Which binary this Kindle can start, asked rather than assumed.** Two are
-# shipped, one for each ARM float ABI, and a Kindle has the loader for one of
-# them and not the other. Starting the wrong one fails as `not found` — the
-# shell reporting the missing interpreter, which reads exactly like the binary
-# itself being absent, so it is worth naming here rather than leaving to be
-# rediscovered.
+# **Which binary this Kindle can start, asked rather than assumed.** One is
+# shipped per ARM float ABI, and the wrong one fails as `not found` — the shell
+# reporting the missing interpreter, which reads like an absent binary.
 BIN="$EXT/bin/karyll"
 if [ ! -e /lib/ld-linux-armhf.so.3 ]; then
     BIN="$EXT/bin/karyll-softfloat"
@@ -166,9 +106,8 @@ echo "$PID" > "$LOCK"
 wait "$PID"
 STATUS=$?
 
-# A trapped signal returns from `wait` while the editor is still on its way
-# out. The next tap watches this lock for the editor to be gone, so wait again
-# for what it actually exited with rather than reporting the interruption.
+# A trapped signal returns from `wait` while the editor is still on its way out,
+# and the next tap watches this lock for it to be gone.
 while [ -d "/proc/$PID" ]; do
     sleep 1
     wait "$PID"

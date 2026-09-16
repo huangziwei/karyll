@@ -162,10 +162,9 @@ impl Hid {
         self.keep_alive
     }
 
-    /// Choose whether quitting takes the Bluetooth stack down with it.
-    ///
-    /// A daemon left running leaves its uhid keyboard node live and ungrabbed,
-    /// and holds `/dev/stpbt` away from `bsa_server`. See [`Hid::start`].
+    /// Choose whether quitting takes the Bluetooth stack down with it. One left
+    /// running leaves its uhid node live and ungrabbed, and holds `/dev/stpbt`
+    /// away from `bsa_server`.
     pub fn set_keep_alive(&mut self, on: bool) {
         self.keep_alive = on;
     }
@@ -392,11 +391,9 @@ impl Hid {
             .unwrap_or(0)
     }
 
-    /// The last thing the daemon said about the pairing started at `mark`.
-    ///
-    /// A BLE keyboard has no display: the daemon pairs with `mitm=True` and
-    /// DisplayYesNo against a keyboard's KeyboardOnly, and prints the passkey
-    /// to its own stdout alone. `/pair-status` does not carry it.
+    /// The last thing the daemon said about the pairing started at `mark`. The
+    /// passkey is printed to the daemon's own stdout alone; `/pair-status` does
+    /// not carry it.
     pub fn pair_prompt(&self, mark: u64) -> Option<Prompt> {
         prompt_in(&self.log_since(mark)?)
     }
@@ -479,12 +476,9 @@ fn is_daemon(pid: u32, base: &Path) -> bool {
     cmdline(pid).is_some_and(|line| line.contains(&*base.to_string_lossy()))
 }
 
-/// Kill every running copy of the daemon by scanning `/proc` for its command
-/// line, returning how many were signalled. The match is on the install path:
-/// the daemon runs as `dist/main.bin` and its own name appears nowhere.
-/// End the daemon: `SIGTERM`, then `SIGKILL` after [`STOP_GRACE`]. The daemon
-/// freezes `btd` to take the radio and thaws it from its `SIGTERM` handler.
-/// A `SIGKILL` leaves `btd` frozen and costs the next launch fifteen seconds.
+/// End the daemon: `SIGTERM`, then `SIGKILL` once [`STOP_TIMEOUT`] is up. It
+/// freezes `btd` to take the radio and thaws it from its `SIGTERM` handler, so a
+/// `SIGKILL` leaves `btd` frozen and costs the next launch fifteen seconds.
 fn end(pid: u32) {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     let deadline = Instant::now() + STOP_TIMEOUT;

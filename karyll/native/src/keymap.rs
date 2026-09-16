@@ -480,6 +480,48 @@ pub fn action(code: u16, mods: Mods, layout: Layout) -> Option<Action> {
     }
 }
 
+/// X keysyms from the `0xFF00` block, which is where every key that names no
+/// character lives.
+mod keysym {
+    pub const BACKSPACE: u32 = 0xFF08;
+    pub const TAB: u32 = 0xFF09;
+    pub const RETURN: u32 = 0xFF0D;
+    pub const ESCAPE: u32 = 0xFF1B;
+    pub const KEYPAD_ENTER: u32 = 0xFF8D;
+    pub const DELETE: u32 = 0xFFFF;
+
+    /// `UNICODE + cp` is the standard form of a Unicode keysym, and `TOP` caps
+    /// `cp`. The on-screen keyboard delivers anything outside Latin-1 this way.
+    pub const UNICODE: u32 = 0x0100_0000;
+    pub const UNICODE_TOP: u32 = 0x0110_FFFF;
+}
+
+/// What a key tapped on the on-screen keyboard means: the sibling of [`action`],
+/// for keys arriving over X as keysyms. **No modifier state, and none wanted** —
+/// the framework holds its own Shift, so [`action`]'s chords are unreachable.
+pub fn action_of_keysym(keysym: u32) -> Option<Action> {
+    match keysym {
+        // Ahead of the character arms: these are in the 0xFF00 block, which is
+        // no codepoint, and `Delete` is the key the keyboard draws as ⌫.
+        keysym::BACKSPACE | keysym::DELETE => return Some(Action::Backspace),
+        keysym::RETURN | keysym::KEYPAD_ENTER => return Some(Action::Newline),
+        keysym::ESCAPE => return Some(Action::Escape),
+        keysym::TAB => return Some(Action::Indent),
+        _ => {}
+    }
+    let scalar = match keysym {
+        // Latin-1 keysyms are their own codepoint, less C0 and C1.
+        0x20..=0x7E | 0xA0..=0xFF => keysym,
+        // The explicit Unicode form.
+        keysym::UNICODE..=keysym::UNICODE_TOP => keysym - keysym::UNICODE,
+        // A bare scalar. 0xE000..=0xF8FF is private use, and 0xFD00 up holds
+        // the modifiers, arrows and function keys that name no character.
+        0x0100..=0xDFFF | 0xF900..=0xFCFF => keysym,
+        _ => return None,
+    };
+    char::from_u32(scalar).map(Action::Insert)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1114,6 +1156,67 @@ mod tests {
             let before = codes.len();
             codes.dedup();
             assert_eq!(codes.len(), before, "{} binds a code twice", layout.name());
+        }
+    }
+
+    /// The other input: keys tapped on the framework's on-screen keyboard,
+    /// which reach us over X as keysyms.
+    mod on_screen {
+        use super::*;
+
+        #[test]
+        fn latin_is_its_own_codepoint() {
+            assert_eq!(action_of_keysym(0x61), Some(Action::Insert('a')));
+            assert_eq!(action_of_keysym(0x41), Some(Action::Insert('A')));
+            assert_eq!(action_of_keysym(0x20), Some(Action::Insert(' ')));
+            assert_eq!(action_of_keysym(0xE9), Some(Action::Insert('é')));
+        }
+
+        /// Anything past Latin-1 arrives in either form, and both name the
+        /// same character.
+        #[test]
+        fn a_character_off_the_map_arrives_in_either_form() {
+            for keysym in [0x56F3, keysym::UNICODE + 0x56F3] {
+                assert_eq!(action_of_keysym(keysym), Some(Action::Insert('図')));
+            }
+            assert_eq!(action_of_keysym(0x3042), Some(Action::Insert('あ')));
+            assert_eq!(action_of_keysym(0x0430), Some(Action::Insert('а')));
+        }
+
+        /// The 0xFF00 block is read before the character arms: those keysyms
+        /// are no codepoint.
+        #[test]
+        fn the_named_keys_are_read_first() {
+            assert_eq!(action_of_keysym(keysym::RETURN), Some(Action::Newline));
+            assert_eq!(
+                action_of_keysym(keysym::KEYPAD_ENTER),
+                Some(Action::Newline)
+            );
+            assert_eq!(action_of_keysym(keysym::BACKSPACE), Some(Action::Backspace));
+            assert_eq!(action_of_keysym(keysym::DELETE), Some(Action::Backspace));
+            assert_eq!(action_of_keysym(keysym::ESCAPE), Some(Action::Escape));
+            assert_eq!(action_of_keysym(keysym::TAB), Some(Action::Indent));
+        }
+
+        /// Shift_L, Left, F1, Multi_key, NoSymbol and a bare ESC byte.
+        #[test]
+        fn a_key_naming_no_character_means_nothing() {
+            for keysym in [0xFFE1, 0xFF51, 0xFFBE, 0xFF20, 0xFD1E, 0, 0x1B] {
+                assert_eq!(action_of_keysym(keysym), None, "{keysym:#x}");
+            }
+            assert_eq!(action_of_keysym(0xD800), None, "a surrogate is no char");
+            assert_eq!(action_of_keysym(0xE001), None, "private use is no char");
+        }
+
+        /// Pinyin tapped on the glass reaches [`crate::ime`] as the same
+        /// `Insert`s a Bluetooth keyboard sends, so karyll keeps its own engine.
+        #[test]
+        fn the_glass_and_the_keyboard_agree_on_every_letter() {
+            for (code, letter) in [(35u16, 'h'), (18, 'e'), (38, 'l'), (24, 'o')] {
+                let keys = action(code, plain(), Layout::Us);
+                assert_eq!(keys, Some(Action::Insert(letter)));
+                assert_eq!(action_of_keysym(letter as u32), keys, "{letter}");
+            }
         }
     }
 

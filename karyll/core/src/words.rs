@@ -4,10 +4,8 @@
 
 use crate::script::{Script, is_invisible, script_of};
 
-/// How many words `chars` holds.
-///
-/// A word is a run holding at least one alphanumeric: `---` counts none,
-/// `don't` and `well-meaning` count one each.
+/// How many words `chars` holds. A word is a run holding at least one
+/// alphanumeric: `---` counts none, `don't` and `well-meaning` one each.
 pub fn count(chars: &[char]) -> usize {
     let mut words = 0;
     let mut inside = false;

@@ -1,80 +1,13 @@
-//! CJK input: two languages through the device's own predictor plugins, and
-//! one karyll composes itself.
-//!
-//! [`Korean`] is the composed one — a Hangul syllable is arithmetic on a code
-//! point, so it is three tables and a state machine, all under `cargo test`.
-//! The rest of this file is a binding.
-//!
-//! The device ships an IME per locale under
-//! `/usr/share/keyboard/<locale>/libpredictor.so.1` — engine, dictionaries
-//! and keyboard databases. Two are driven: **Chinese** is `zh_CN`, XT9 over
-//! `libxt9a`; **Japanese** is `ja`, Omron iWnn over `libwlf` with ICU doing
-//! romaji to kana from `hiragana_rules.txt`. The plugins share one ABI —
-//! `libkb`'s — so [`Plugin`] is written once.
-//!
-//! `load(host)` performs the entire engine initialisation — for Chinese
-//! `ET9CPSysInit`, `ET9CPLdbInit`, `ET9CPSetInputMode`,
-//! `ET9CPSetFullSentence`, `ET9CPUdbActivate`, the `ET9KDB_*` setup and the
-//! `mmap` of both databases; for Japanese `wlf_init`, `wlf_set_state`,
-//! `wlf_load_lang` on `JA.conf` and `wlf_set_active_lang` — and returns a
-//! 48-byte block of function pointers, a *session* API:
-//!
-//! | slot | signature |
-//! |---|---|
-//! | `+0x00` | `prv_unload(userData) -> int` |
-//! | `+0x04` | `prv_open(flags, userData) -> int` — begin a session |
-//! | `+0x08` | `prv_close(userData) -> int` — ends it, writes the user dictionary |
-//! | `+0x0c` | `prv_set_surround(str, position, userData) -> int` |
-//! | `+0x10` | `(out: *mut c_char, capacity: usize)` — the composition so far |
-//! | `+0x14` | `prv_key_handler(key: u32, userData) -> int` |
-//! | `+0x18` | commit: `(index: u32, userData) -> int` |
-//! | `+0x1c` | `prv_get_candidate_list(out: *mut *mut c_char, count: *mut u32, userData)` |
-//!
-//! The calling convention:
-//!
-//! * **No `self`/context argument.** Every slot resolves its own context
-//!   PC-relative from the plugin's `.bss`; the pointer `load()` stores at
-//!   `+0x2c` is its own bookkeeping.
-//! * **`userData` is the last argument**, and the plugin only logs it.
-//!   [`USER_DATA`] is what karyll sends.
-//! * **`+0x00` and `+0x08` are the teardown pair.** Called first, they close
-//!   and unload the engine `load()` built, and every call after them runs on
-//!   freed memory.
-//!
-//! **The order is the ABI. The addresses are not**: the same function sits
-//! somewhere different in every firmware, and two builds of one language can
-//! agree on all their code and still differ in `.bss`. No address is written
-//! down here — the plugin is found in `/proc/self/maps` from a pointer it
-//! produced itself (see [`Mapping`]), and engine state is found by asking
-//! the running engine: the phonetic context by the magic it stamps on
-//! itself, the pending keys by typing at it and watching which words move.
-//!
-//! All slots return `int`, 0 = ok — **except `+0x1c`, which returns
-//! nothing**: its exit path never sets `r0`, and the out-count is the
-//! answer. It fills the caller's array with pointers **borrowed** from the
-//! plugin's own fixed-stride candidate table, valid until the next call, and
-//! overwrites `*count` with how many it produced. Commit takes an index into
-//! that same table, so the caller holds the text it committed; the host
-//! callback reporting it is confirmation, not delivery.
-//!
-//! **A commit need not consume the whole reading.** Chinese's commit slot
-//! re-feeds every key past the chosen phrase through `prv_key_handler` and
-//! returns composing the remainder; Japanese's ends by zeroing its
-//! composition buffer. Either way the caller asks what is left — a remainder
-//! left inside the engine joins the front of the next word typed.
-//!
-//! The key is a **Unicode codepoint** — ASCII for pinyin and romaji, not a
-//! keycode and not an index. Each engine handles a couple of keys itself.
+//! CJK input: Chinese and Japanese through the device's own
+//! `/usr/share/keyboard/<locale>/libpredictor.so.1`, Korean composed here. The
+//! plugin's 48-byte session API is ordered, not addressed — never hardcode one.
 
 use std::ffi::{c_char, c_void};
 use std::ops::Range;
 
-/// Which language's rules apply — the input method, and the punctuation that
-/// goes with it.
-///
-/// Not the same thing as the plugin: Simplified and Traditional Chinese are one
-/// engine and one set of rules, differing only in what the candidates are
-/// converted to on the way out. Korean names no plugin at all.
+/// Which language's rules apply. Not the same as the plugin: Simplified and
+/// Traditional Chinese are one engine, differing only in the conversion on the
+/// way out, and Korean names no plugin at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Script {
     Chinese,
@@ -83,20 +16,14 @@ pub enum Script {
     Korean,
 }
 
-/// What the editor needs from an input method.
-///
-/// Small on purpose, and a trait so the contract can be tested against a stub:
-/// the real engine is a device file that cannot be redistributed, so anything
-/// only exercisable through it would be exercised once, on hardware, by hand.
+/// What the editor needs from an input method. A trait so the contract can be
+/// tested against a stub: the real engine is a device file.
 pub trait Ime {
     /// Feed one key and return the candidates now available, best first.
     fn key(&mut self, key: char) -> Vec<String>;
 
-    /// Accept candidate `index`, and hand back whatever reading it left
-    /// unconverted: a candidate can cover the front of the reading, and the
-    /// word then carries on with the rest. `None` is a finished word. The
-    /// committed text is the candidate the caller selected, and is not
-    /// returned.
+    /// Accept candidate `index`, and hand back the reading it left unconverted;
+    /// `None` is a finished word. The committed text is not returned.
     fn commit(&mut self, index: usize) -> Option<Rest>;
 
     /// Abandon whatever is being composed.
@@ -134,15 +61,9 @@ pub const WANTED: usize = 10;
 /// `ET9CPGetPhrase` on every keystroke.
 pub const KEPT: usize = 5 * WANTED;
 
-/// CJK punctuation for the ASCII key that produces it.
-///
-/// Neither engine supplies any: `hiragana_rules.txt` maps letters and
-/// nothing else, so a `.` typed in Japanese mode reaches the preedit as a
-/// full stop and stays one. Every CJK mark comes from here.
-///
-/// **macOS's CJK inputs are the reference** where a mapping is arguable.
-/// Not exhaustive: `-`, `/`, `=`, `+`, `%`, `#`, `&`, `*` and `$` stay
-/// ASCII — their CJK forms are rare in prose.
+/// CJK punctuation for the ASCII key that produces it. Neither engine supplies
+/// any. Not exhaustive: `-`, `/`, `=`, `+`, `%`, `#`, `&`, `*` and `$` stay
+/// ASCII.
 fn punctuation(script: Script, key: char) -> Option<Punct> {
     let fixed = |s| Some(Punct::Fixed(s));
     // Shared by both: sentence marks differing only in the comma, and the
@@ -187,10 +108,8 @@ fn punctuation(script: Script, key: char) -> Option<Punct> {
             // 読点, not the fullwidth comma. Japanese sets ， only in
             // horizontal technical writing; prose takes 、.
             ',' => fixed("、"),
-            // The corner brackets are Japanese's primary quotation marks and
-            // sit on the unshifted bracket keys, where a JIS keyboard has them
-            // and where macOS puts them. 『』 quote inside a quotation, and
-            // title works.
+            // Japanese's primary quotation marks, on the unshifted bracket
+            // keys where a JIS keyboard has them. 『』 quote inside a quotation.
             '[' => fixed("「"),
             ']' => fixed("」"),
             '{' => fixed("『"),
@@ -249,10 +168,9 @@ pub enum Compose {
     /// Take one jamo back off the syllable — 앉 → 안 → 아. [`Script::Korean`]
     /// only, through [`Korean::backspace`].
     Decompose,
-    /// **The composition is finished text.** Commit it and let the editor have
-    /// the keystroke as usual. [`Script::Korean`] only: a half-typed Hangul
-    /// syllable is correct Korean, so every key that is not a jamo ends it and
-    /// then means what it always means.
+    /// **The composition is finished text.** Korean only: a half-typed syllable
+    /// is correct Korean, so every non-jamo key ends it and then means what it
+    /// always means.
     Finish,
     /// Take candidate `n` of the ten on screen, counting from zero.
     Select(usize),
@@ -281,20 +199,13 @@ pub enum Compose {
 /// the romaji rules map no hyphen onto it.
 const CHOONPU: char = 'ー';
 
-/// Decide what a keystroke means while CJK input is on.
-///
-/// `composing` is whether anything has been typed towards a word yet, and it
-/// changes almost every rule: a digit is a candidate number mid-word and a
-/// digit otherwise, space converts mid-word and is a space otherwise.
-///
-/// Pure: tested without an engine, a window or a keyboard.
+/// Decide what a keystroke means while CJK input is on. `composing` — whether
+/// anything has been typed towards a word — changes almost every rule.
 pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) -> Compose {
     use crate::keymap::Action;
 
     // **A Korean keyboard types Korean.** Every letter is a jamo, capitals
-    // included — the tense consonants — and Latin is reached by switching
-    // source (`Ctrl + Space`). Every other key finishes the syllable and
-    // goes on to mean what it means; no candidate list, no pages.
+    // included; Latin is reached by switching source. No candidate list.
     if script == Script::Korean {
         return match action {
             Action::Insert(c) if jamo_for(*c).is_some() => Compose::Jamo(*c),
@@ -334,9 +245,7 @@ pub fn compose(action: &crate::keymap::Action, composing: bool, script: Script) 
         Action::Insert('0') => Compose::Select(9),
 
         // **Space is the one rule the two languages disagree on.** Pinyin
-        // predicts as it goes and space accepts the best candidate; Japanese
-        // converts on space — `prv_key_handler` routes 0x20 to start and
-        // advance the selection.
+        // accepts the best candidate; Japanese converts.
         Action::Insert(' ') => match script {
             Script::Chinese => Compose::Select(0),
             Script::Japanese => Compose::Feed(' '),
@@ -378,11 +287,8 @@ const MEDIALS: [char; 21] = [
     'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ',
 ];
 
-/// The 27 종성 a syllable can end in, counted from one: index zero of the
-/// formula means no 받침 at all.
-///
-/// ㄸ, ㅃ and ㅉ are absent: Korean never writes them there, so [`Korean::key`]
-/// opens a new syllable on one.
+/// The 27 종성, counted from one: index zero of the formula is no 받침 at all.
+/// ㄸ, ㅃ and ㅉ are absent — Korean never writes them there.
 const CODAS: [char; 27] = [
     'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ',
     'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
@@ -391,10 +297,8 @@ const CODAS: [char; 27] = [
 /// Where the precomposed syllables start: 가.
 const FIRST_SYLLABLE: u32 = 0xAC00;
 
-/// The vowels two keys make, and the pair each is made of.
-///
-/// 두벌식 has one key per simple vowel, so ㅘ is typed ㅗ then ㅏ, and
-/// [`Korean::backspace`] takes it back to the pair.
+/// The vowels two keys make, and the pair each is made of: 두벌식 has one key
+/// per simple vowel, so ㅘ is typed ㅗ then ㅏ.
 const COMPOUND_MEDIALS: [(char, char, char); 7] = [
     ('ㅗ', 'ㅏ', 'ㅘ'),
     ('ㅗ', 'ㅐ', 'ㅙ'),
@@ -405,11 +309,8 @@ const COMPOUND_MEDIALS: [(char, char, char); 7] = [
     ('ㅡ', 'ㅣ', 'ㅢ'),
 ];
 
-/// The 받침 two consonants make.
-///
-/// **Every one of these splits under a vowel**, and only its tail moves: 앉
-/// followed by ㅏ is 안자. The tense finals ㄲ and ㅆ are absent — they are
-/// single keys on the shifted row of [`jamo_for`].
+/// The 받침 two consonants make. **Every one splits under a vowel**, and only
+/// its tail moves: 앉 followed by ㅏ is 안자. ㄲ and ㅆ are single keys.
 const COMPOUND_CODAS: [(char, char, char); 11] = [
     ('ㄱ', 'ㅅ', 'ㄳ'),
     ('ㄴ', 'ㅈ', 'ㄵ'),
@@ -425,21 +326,8 @@ const COMPOUND_CODAS: [(char, char, char); 11] = [
 ];
 
 /// The jamo a key writes under 두벌식, or `None` for a key that is not one.
-///
-/// **두벌식 is the standard Korean arrangement**, defined against QWERTY:
-/// consonants under the left hand, vowels under the right.
-///
-/// ```text
-/// q ㅂ  w ㅈ  e ㄷ  r ㄱ  t ㅅ  y ㅛ  u ㅕ  i ㅑ  o ㅐ  p ㅔ
-/// a ㅁ  s ㄴ  d ㅇ  f ㄹ  g ㅎ  h ㅗ  j ㅓ  k ㅏ  l ㅣ
-/// z ㅋ  x ㅌ  c ㅊ  v ㅍ  b ㅠ  n ㅜ  m ㅡ
-/// ```
-///
-/// `key` is the character [`crate::keymap::Layout`] resolved, not a scan code,
-/// so this holds for whatever keyboard is attached.
-///
-/// **Nothing but the letters.** Korean sets its punctuation in ASCII, so every
-/// other key writes what it says and `None` leaves it to the editor.
+/// `key` is the character the layout resolved, not a scan code. Korean sets its
+/// punctuation in ASCII, so every other key writes what it says.
 fn jamo_for(key: char) -> Option<char> {
     Some(match key {
         'q' => 'ㅂ',
@@ -484,33 +372,9 @@ fn jamo_for(key: char) -> Option<char> {
     })
 }
 
-/// The Korean input method: 두벌식 in, Hangul out.
-///
-/// **No dictionary, no candidate list and nothing that can fail to load.** A
-/// syllable is three slots, and the code point is the formula:
-///
-/// ```text
-/// syllable = 0xAC00 + (초성 × 21 + 중성) × 28 + 종성
-/// ```
-///
-/// It does not implement [`Ime`]: that trait is a session with an engine that
-/// offers candidates and is told which one to take. [`Korean::key`] offers
-/// none, and commits without being asked.
-///
-/// **The 받침 migrates.** A final belongs to the syllable it was typed into
-/// until a vowel arrives, and then to the next one — ㅎㅏㄴ is 한 and ㅎㅏㄴㅏ is
-/// 하나. So [`Korean::key`] hands back two things: text that is finished with,
-/// and the syllable under construction. The finished half is empty for most
-/// keystrokes.
-///
-/// The three tables hold **compatibility jamo**, which is what a lone jamo is
-/// written as. The conjoining jamo of U+1100 appear nowhere here: a
-/// half-composed syllable shows as ㄱ.
-///
-/// A syllable holds a lone consonant (ㄱ), a lone vowel (ㅏ), or all three
-/// slots — and a 받침 only once the other two are filled, which keeps
-/// [`Korean::preedit`] a single code point wherever one exists. Empty is not
-/// composing.
+/// The Korean input method: 두벌식 in, Hangul out. **The 받침 migrates** — a
+/// final belongs to the syllable it was typed into until a vowel arrives, so
+/// ㅎㅏㄴ is 한 and ㅎㅏㄴㅏ is 하나. The tables hold compatibility jamo.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Korean {
     initial: Option<char>,
@@ -519,16 +383,9 @@ pub struct Korean {
 }
 
 impl Korean {
-    /// Compose one key, and hand back the text this keystroke finished.
-    ///
-    /// Empty for the keystrokes that go on building the same syllable, which
-    /// is most of them; what they build is [`Korean::preedit`]. It carries a
-    /// syllable when the one in hand is full and a new one starts, and in the
-    /// 받침 case, where a vowel takes the final away.
-    ///
-    /// `key` is what the keyboard resolved. One that [`jamo_for`] does not
-    /// know leaves the composition alone and hands back the empty string;
-    /// [`Compose::Finish`] is that key's case.
+    /// Compose one key, and hand back the text this keystroke finished — empty
+    /// for most, a syllable when the one in hand is full or when a vowel takes
+    /// a 받침 away. A key [`jamo_for`] does not know leaves the composition be.
     pub fn key(&mut self, key: char) -> String {
         let Some(jamo) = jamo_for(key) else {
             return String::new();
@@ -540,11 +397,8 @@ impl Korean {
         }
     }
 
-    /// Take one jamo back off the syllable: 앉 → 안 → 아 → ㅇ → nothing.
-    ///
-    /// **A Korean backspace decomposes.** A compound falls back to its head,
-    /// and each slot empties in turn. `false` says the syllable was empty and
-    /// the keystroke belongs to the document.
+    /// Take one jamo back off the syllable: 앉 → 안 → 아 → ㅇ → nothing. `false`
+    /// says it was empty and the keystroke belongs to the document.
     pub fn backspace(&mut self) -> bool {
         if let Some(coda) = self.coda {
             self.coda = split(&COMPOUND_CODAS, coda).map(|(head, _)| head);
@@ -558,10 +412,8 @@ impl Korean {
         true
     }
 
-    /// The syllable under construction, as it appears on the page.
-    ///
-    /// A complete syllable is one precomposed code point. One missing a slot
-    /// is the jamo typed so far — ㄱ, ㅏ — and both are correct Korean text.
+    /// The syllable under construction. Complete, that is one precomposed code
+    /// point; short of it, the jamo typed so far — and both are correct Korean.
     pub fn preedit(&self) -> String {
         if let (Some(initial), Some(medial)) = (self.initial, self.medial)
             && let Some(syllable) = compose_syllable(initial, medial, self.coda)
@@ -678,21 +530,16 @@ const PLUGIN_ZH: &str = "/usr/share/keyboard/zh_CN/libpredictor.so.1";
 /// one of them on the device.
 const PLUGIN_JA: &str = "/usr/share/keyboard/ja/libpredictor.so.1";
 
-/// How many candidate pointers the plugin is given room to write.
-///
-/// **Sized to the plugins' own tables, not to [`WANTED`]: Japanese ignores
-/// the count asked for and writes as many as it produced.** The Japanese
-/// table holds 250 entries at a 50-byte stride; Chinese preallocates 500
-/// buffers of 41 bytes. Shrinking this is a memory-safety change.
+/// How many candidate pointers the plugin may write. **Japanese ignores the
+/// count asked for**: its table holds 250 at a 50-byte stride, Chinese
+/// preallocates 500 of 41 bytes. Shrinking this is a memory-safety change.
 const MAX_CANDIDATES: usize = 500;
 
 /// Opaque host cookie, passed last to every slot and only ever logged.
 const USER_DATA: u32 = 0;
 
-/// The word the ET9 engine stamps into its Chinese-phonetic context, and
-/// where in the context it puts it: `ET9CPSimplifiedToTraditional` refuses a
-/// context whose word at `+0x88` is not this, and the mark is what
-/// [`Chinese::find_converter`] scans for.
+/// The word ET9 stamps into its Chinese-phonetic context, and where:
+/// `ET9CPSimplifiedToTraditional` refuses a context without it at `+0x88`.
 const CP_MAGIC_OFFSET: usize = 0x88;
 const CP_MAGIC: u32 = 0x1428_1428;
 
@@ -745,31 +592,21 @@ fn cstr(s: &str) -> Vec<u8> {
     v
 }
 
-/// `ET9CPSimplifiedToTraditional(ctx, buf, count)`, from `libxt9a`.
-///
-/// Converts a run of ET9 symbols **in place**. Returns 0 on success, 2 for a
-/// context that fails the magic check, `0x1b` for a null buffer.
+/// `ET9CPSimplifiedToTraditional(ctx, buf, count)` from `libxt9a`: converts a
+/// run of ET9 symbols **in place**. 0 ok, 2 bad context, `0x1b` null buffer.
 type ToTraditional = unsafe extern "C" fn(*mut c_void, *mut u16, u16) -> i32;
 
 /// Where the kernel says a mapped file is.
 const MAPS: &str = "/proc/self/maps";
 
-/// Where the dynamic linker put a plugin, and what of it karyll may read.
-///
-/// Every address inside a plugin moves between builds, so every pointer
-/// derived from one is checked against the kernel's map before it is read; a
-/// pointer that fails the check is a message, not a read.
-///
-/// The object is found from a pointer the plugin itself produced:
-/// `libpredictor.so.1` is a symlink to `libpredictor.so.1.0`,
-/// `/proc/self/maps` names the file it resolves to, and the path handed to
-/// `dlopen` never appears there at all.
+/// Where the linker put a plugin, and what of it karyll may read. Every address
+/// inside one moves between builds, so every derived pointer is checked against
+/// the kernel's map before it is read.
 struct Mapping {
     /// What the kernel calls the object. Reported, never matched against.
     path: String,
-    /// The object's lowest address. Only used to report a discovered address as
-    /// the offset a disassembly would show, which is what makes a device log
-    /// comparable with one.
+    /// The object's lowest address, for reporting one as the offset a
+    /// disassembly would show.
     base: usize,
     /// The executable ranges. A vtable slot outside them is not a function of
     /// this plugin.
@@ -821,15 +658,9 @@ impl Mapping {
         )
     }
 
-    /// Every writable word of the object, in address order.
-    ///
-    /// Volatile: the plugin writes this memory from the other side of an FFI
-    /// call, and two reads taken either side of a keystroke differ.
-    ///
-    /// # Safety
-    /// The ranges must be this process's own, which they are for any `Mapping`
-    /// that came from [`locate`] on [`MAPS`]. The parsing is kept apart from
-    /// the reading so that it can be tested on text.
+    /// Every writable word of the object, in address order; volatile, since the
+    /// plugin writes it from the other side of an FFI call. Unsafe: the ranges
+    /// must be this process's own, which [`locate`] on [`MAPS`] guarantees.
     unsafe fn read(&self) -> Vec<u32> {
         let mut words = Vec::with_capacity(self.words());
         for r in &self.data {
@@ -842,10 +673,8 @@ impl Mapping {
         words
     }
 
-    /// The address of every writable word that reads `value`.
-    ///
-    /// # Safety
-    /// As [`Mapping::read`].
+    /// The address of every writable word that reads `value`. Unsafe as
+    /// [`Mapping::read`].
     unsafe fn scan(&self, value: u32) -> Vec<usize> {
         unsafe { self.read() }
             .iter()
@@ -905,11 +734,9 @@ fn locate(maps: &str, addr: usize) -> Option<Mapping> {
         if r.path == path {
             data.push(r.range.clone());
         } else if r.path.is_empty() {
-            // `.bss` runs past the end of the file's last page and the loader
-            // maps the remainder anonymously, so writable anonymous memory
-            // butted against the object's own data is the rest of that `.bss`.
-            // It is most of it here: the Chinese plugin's is 228 KB against a
-            // file of 18.
+            // `.bss` runs past the file's last page and the loader maps the
+            // remainder anonymously, so writable anonymous memory butted
+            // against the object's own data is the rest of that `.bss`.
             match data.last_mut() {
                 Some(last) if last.end == r.range.start => last.end = r.range.end,
                 _ => {}
@@ -924,11 +751,8 @@ fn locate(maps: &str, addr: usize) -> Option<Mapping> {
     })
 }
 
-/// One of the device's predictor plugins, loaded and ready.
-///
-/// The ABI is `libkb`'s, one for every language. What differs lives in
-/// [`Chinese`] and [`Japanese`]: which file to open, whether the session has
-/// to be opened explicitly, and what to do with the candidates.
+/// One of the device's predictor plugins, loaded and ready. The ABI is
+/// `libkb`'s; what differs lives in [`Chinese`] and [`Japanese`].
 struct Plugin {
     table: *const usize,
     handle: *mut c_void,
@@ -939,12 +763,8 @@ struct Plugin {
 
 impl Plugin {
     /// `dlopen` the plugin and call `load()`, which brings its engine up.
-    ///
-    /// Nothing is preloaded alongside it: each plugin's own `DT_NEEDED`
-    /// names the engine it was built against, and neither `kb` nor
-    /// `libkb.so` links any `libxt9*`. The three XT9 engines are one build
-    /// with different embedded data, every entry point at an identical
-    /// address — a preloaded wrong one interposes silently.
+    /// **Nothing is preloaded alongside it**: the three XT9 engines are one
+    /// build with different data at identical addresses, and interpose silently.
     fn open(path: &str) -> Result<Plugin, String> {
         // The host block is what the plugin calls back into — committing a
         // candidate calls it — and a zeroed slot is a call through null, so
@@ -971,11 +791,9 @@ impl Plugin {
         }
         let table = table as *const usize;
 
-        // `load()`'s return value cannot be checked before it is read.
-        // Everything derived from it is checked against the mapping the
-        // first slot leads to — the whole table: the slot order is `libkb`'s
-        // ABI, and a table failing the check is an error, not a call. The
-        // Thumb bit comes off first: every address in a Thumb-2 build is odd.
+        // Everything derived from `load()`'s table is checked against the
+        // mapping the first slot leads to; the slot order is `libkb`'s ABI.
+        // The Thumb bit comes off first: a Thumb-2 address is odd.
         let slots: Vec<usize> = (0..SLOTS).map(|i| unsafe { *table.add(i) } & !1).collect();
         let maps = std::fs::read_to_string(MAPS)
             .map_err(|e| format!("{path}: cannot read {MAPS}: {e}"))?;
@@ -1034,16 +852,9 @@ impl Plugin {
         unsafe { f(key as u32, USER_DATA) };
     }
 
-    /// `+0x1c` `prv_get_candidate_list` — whatever the engine now offers.
-    ///
-    /// **The count out is a report, not an answer to the count in.** Chinese
-    /// clamps to what was asked for; Japanese overwrites it with however many
-    /// it produced and fills that many array slots — so the array is sized to
-    /// the plugins' whole preallocation, and the result is cut to [`KEPT`]
-    /// here.
-    ///
-    /// The strings are borrowed from the plugin's own fixed-stride table,
-    /// valid until the next call, and are copied here.
+    /// `+0x1c` `prv_get_candidate_list`. **The count out is a report, not an
+    /// answer to the count in**: Japanese overwrites it with what it produced.
+    /// The strings are borrowed until the next call, and are copied here.
     fn call_candidates(&self) -> Vec<String> {
         let mut slots: Vec<*mut c_char> = vec![std::ptr::null_mut(); MAX_CANDIDATES];
         let mut count: u32 = KEPT as u32;
@@ -1080,9 +891,7 @@ impl Plugin {
 
 impl Drop for Plugin {
     /// Close and unload, in that order — the plugin's own lifecycle. Closing
-    /// writes the user dictionary back to disk (Amazon's `xt9-zh.*` for
-    /// Chinese, the iWnn learning data for Japanese), so a session's learned
-    /// phrases survive. `panic = "abort"` skips `Drop` and loses that write.
+    /// writes the user dictionary to disk; `panic = "abort"` loses that write.
     fn drop(&mut self) {
         let close: unsafe extern "C" fn(u32) -> i32 =
             unsafe { std::mem::transmute(self.slot(SLOT_CLOSE)) };
@@ -1142,16 +951,8 @@ impl Chinese {
     }
 
     /// Find where the plugin keeps the keys it has not converted yet, by
-    /// watching it keep some: an open session holds no keys, a key makes it
-    /// hold that key, a second makes it two, reopening empties it. The
-    /// writable memory is copied at each of those four moments; the count is
-    /// the word that read 0, 1, 2, 0, and the keys are the pair that became
-    /// `a`, then `a` and `b`.
-    ///
-    /// The halves are searched for independently — they are not always
-    /// neighbours — and a counter immediately in front of the array is
-    /// preferred: that one is the count *of that array*. The search costs
-    /// four copies and three calls, and leaves the session as it found it.
+    /// watching it keep some: writable memory is copied over open, one key, two
+    /// keys and reopen. Leaves the session as it found it.
     fn find_pending(&mut self) {
         let quiet = unsafe { self.plugin.mapping.read() };
         self.plugin.call_key(PROBE_KEYS[0]);
@@ -1201,12 +1002,8 @@ impl Chinese {
     }
 
     /// The reading the plugin is still holding, as the letters it was sent.
-    ///
-    /// `Some("")` is a word the engine has finished with and `None` is not
-    /// knowing, which are different things to the caller: one ends a word, the
-    /// other means the engine has to be told to let go of it. Anything that is
-    /// not pinyin says the record is not the one this was written against, and
-    /// is `None` for the same reason.
+    /// `Some("")` is a word the engine has finished with; `None` is not
+    /// knowing, and the engine then has to be told to let go of it.
     fn pending(&self) -> Option<String> {
         let at = self.pending.as_ref()?;
         let count = unsafe { std::ptr::read_volatile(at.count) } as usize;
@@ -1232,12 +1029,9 @@ impl Chinese {
         }
     }
 
-    /// Find the engine's own Simplified-to-Traditional converter, and the
-    /// context it needs. The context is a static that moves with every build
-    /// and announces itself: the engine stamps [`CP_MAGIC`] into it — the
-    /// check `ET9CPSimplifiedToTraditional` itself performs — so the magic
-    /// is scanned for in the plugin's writable memory, and [`converts`]
-    /// confirms a hit.
+    /// Find the engine's own Simplified-to-Traditional converter and the
+    /// context it needs. That context is a static that moves with every build
+    /// and announces itself: [`CP_MAGIC`] is scanned for, [`converts`] confirms.
     fn find_converter(&mut self) {
         let convert = self.plugin.symbol("ET9CPSimplifiedToTraditional");
         if convert.is_null() {
@@ -1268,12 +1062,9 @@ impl Chinese {
         );
     }
 
-    /// Convert one candidate to Traditional, in the engine's own terms.
-    ///
-    /// The engine works in 16-bit symbols and converts in place, so the
-    /// string makes a round trip through UTF-16. Anything outside the basic
-    /// plane is left alone: `encode_utf16` splits it into a surrogate pair,
-    /// two characters to the converter.
+    /// Convert one candidate to Traditional. The engine works in 16-bit symbols
+    /// and converts in place, so the string round-trips through UTF-16; anything
+    /// outside the basic plane is left alone.
     fn to_traditional(&self, text: &str) -> String {
         let Some((convert, ctx)) = self.converter else {
             return text.to_string();
@@ -1293,11 +1084,8 @@ impl Chinese {
     }
 }
 
-/// Whether a candidate context really is the engine's own, asked by converting
-/// a character that differs between the scripts.
-///
-/// The magic is the engine's own check on the pointer; this is karyll's. 国
-/// comes back as 國 only from a context that is what it claims to be.
+/// Whether a candidate context really is the engine's own: 国 comes back as 國
+/// only from a context that is what it claims to be.
 fn converts(convert: ToTraditional, ctx: *mut c_void) -> bool {
     let mut buf = [SIMPLIFIED];
     let st = unsafe { convert(ctx, buf.as_mut_ptr(), 1) };
@@ -1315,11 +1103,8 @@ impl Ime for Chinese {
     }
 
     /// The commit slot re-feeds the keys the phrase did not cover, so the
-    /// engine returns from a commit composing the remainder; this notices,
-    /// and restarts nothing. Without the pending record a finished word and
-    /// a half-converted one look the same, and the engine is cleared — at
-    /// the cost of the context the commit set — so no stranded reading lands
-    /// on the front of the next word typed.
+    /// engine can return from a commit composing the remainder. Without the
+    /// pending record it is cleared, so no reading strands onto the next word.
     fn commit(&mut self, index: usize) -> Option<Rest> {
         self.plugin.call_commit(index);
         match self.pending() {
@@ -1360,10 +1145,8 @@ impl Japanese {
         }
 
         // **`load()` returns a complete-looking table whether or not the
-        // engine came up**: its error paths log and fall through to the same
-        // return. So type at it — an engine that is up answers a letter with
-        // kana, with conversions, usually both; one that is not answers
-        // neither. No address involved, so the check holds across firmwares.
+        // engine came up**, so type at it: one that is up answers a letter
+        // with kana. No address involved, so this holds across firmwares.
         plugin.call_key(PROBE_KEYS[0]);
         let candidates = plugin.call_candidates().len();
         let composed = plugin.call_preedit();
@@ -1414,11 +1197,9 @@ impl Ime for Japanese {
     }
 }
 
-/// Copy a NUL-terminated UTF-8 string out of the plugin's buffers. They are 41
-/// bytes each, so 64 is past any valid end.
-///
-/// # Safety
-/// `p` must be null or point at a NUL-terminated string.
+/// Copy a NUL-terminated UTF-8 string out of the plugin's buffers; they are 41
+/// bytes each, so 64 is past any valid end. Unsafe: `p` must be null or point
+/// at a NUL-terminated string.
 unsafe fn c_string(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
@@ -1449,10 +1230,8 @@ unsafe extern "C" fn host_noop(_a0: usize, _a1: usize, _a2: usize, _a3: usize) -
     0
 }
 
-/// Fill a host block with callable no-ops.
-///
-/// # Safety
-/// `host` must point to at least [`HOST_BLOCK`] writable bytes.
+/// Fill a host block with callable no-ops. Unsafe: `host` must point to at
+/// least [`HOST_BLOCK`] writable bytes.
 unsafe fn install_host_table(host: *mut c_void) {
     let f: unsafe extern "C" fn(usize, usize, usize, usize) -> u32 = host_noop;
     for i in 0..16 {
@@ -1460,12 +1239,8 @@ unsafe fn install_host_table(host: *mut c_void) {
     }
 }
 
-/// A canned pinyin table standing in for the engine.
-///
-/// Not an IME, and not shipped: the real engine is a device file that cannot be
-/// redistributed, so this is how the [`Ime`] contract itself gets tested —
-/// including the parts the editor relies on, like backspace and space being the
-/// engine's job rather than the editor's.
+/// A canned pinyin table standing in for the engine, so the [`Ime`] contract
+/// can be tested without a device file.
 #[cfg(test)]
 pub struct Stub {
     typed: String,
@@ -1706,8 +1481,6 @@ mod tests {
         assert_eq!(typed("dlT"), "있");
     }
 
-    /// Whole words, typed the way they are typed.
-    ///
     /// 반갑습니다 carries a compound 받침 through one word: ㅂ takes ㅅ as ㅄ,
     /// and the ㅡ after it splits the pair, leaving 갑 and carrying ㅅ into 스.
     #[test]
@@ -1819,8 +1592,7 @@ mod tests {
     }
 
     /// **A Korean keyboard types Korean**, capitals included: a capital is the
-    /// tense consonant on the shifted row. Latin is reached by switching
-    /// source.
+    /// tense consonant on the shifted row.
     #[test]
     fn every_letter_is_a_jamo_while_korean_is_on() {
         use crate::keymap::Action;
@@ -1843,8 +1615,7 @@ mod tests {
     }
 
     /// **Every key that is not a letter finishes the syllable and goes on to
-    /// mean what it always means.** No candidate to number, no page to turn,
-    /// and no CJK punctuation: Korean writes ASCII marks.
+    /// mean what it always means.** Korean writes ASCII marks.
     #[test]
     fn a_key_that_is_not_a_jamo_ends_the_syllable_without_being_eaten() {
         use crate::keymap::Action;
@@ -1895,9 +1666,8 @@ mod tests {
         assert_eq!(ime.key('h').first().map(String::as_str), Some("你好"));
     }
 
-    /// Backspace and space are handled inside `prv_key_handler` — `0x08`
-    /// clears one symbol, `0x20` clears all — so the editor forwards them,
-    /// and the stub agrees.
+    /// Backspace and space are handled inside `prv_key_handler` — `0x08` clears
+    /// one symbol, `0x20` clears all — so the editor forwards them.
     #[test]
     fn backspace_and_space_are_the_engines_job() {
         let mut ime = Stub::new();
@@ -1921,9 +1691,8 @@ mod tests {
         assert_eq!(ime.key('h').first().map(String::as_str), Some("和"));
     }
 
-    /// **A candidate does not have to cover the whole reading**, and the
-    /// word is not over when one that does not is taken: it carries on with
-    /// what is left, and the next keystroke belongs to that.
+    /// **A candidate does not have to cover the whole reading**: the word
+    /// carries on with what is left.
     #[test]
     fn a_candidate_covering_part_of_the_reading_leaves_the_rest() {
         let mut ime = Stub::new();
@@ -1985,16 +1754,12 @@ mod tests {
     }
 
     /// Finding a plugin in memory, which is everything about the discovery that
-    /// can be tested without one. What is left over — the magic scan, the
-    /// pending-key search, the Japanese engine answering a letter — is a
-    /// conversation with a proprietary library and happens on the device.
+    /// can be tested without one.
     mod mapping {
         use super::*;
 
         /// An armv7 Kindle's `/proc/self/maps`, cut to karyll, the Chinese
-        /// plugin, the XT9 engine it pulled in, and the neighbours that make
-        /// the rules matter. The columns are the kernel's: range, permissions,
-        /// file offset, device, inode, and the path if there is one.
+        /// plugin, the XT9 engine it pulled in, and the telling neighbours.
         const KINDLE: &str = "\
 00010000-000d4000 r-xp 00000000 b3:0c 2101       /mnt/us/extensions/karyll/bin/karyll
 000e3000-000e5000 rw-p 000c3000 b3:0c 2101       /mnt/us/extensions/karyll/bin/karyll
@@ -2015,9 +1780,8 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         /// address karyll has to start from: a vtable slot.
         const A_SLOT: usize = 0xb6d2_a3c4;
 
-        /// **The path karyll opens is not the path the kernel reports.**
-        /// `libpredictor.so.1` is a symlink, `/proc/self/maps` names what it
-        /// resolves to, and a lookup by the opened name finds nothing.
+        /// **The path karyll opens is not the path the kernel reports**:
+        /// `libpredictor.so.1` is a symlink and the map names its target.
         #[test]
         fn the_plugin_is_found_from_its_own_pointer_rather_than_from_a_path() {
             assert!(KINDLE.lines().filter_map(row).all(|r| r.path != PLUGIN_ZH));
@@ -2027,8 +1791,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         }
 
         /// `.bss` is a few hundred kilobytes against a file of eighteen, so
-        /// almost all of it is the anonymous mapping the loader puts on the end
-        /// — and every address karyll goes looking for is in there.
+        /// almost all of it is the anonymous mapping on the end.
         #[test]
         fn the_bss_past_the_end_of_the_file_belongs_to_the_object() {
             let map = locate(KINDLE, A_SLOT).unwrap();
@@ -2046,8 +1809,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         }
 
         /// The check that a vtable is still the vtable: eight pointers into
-        /// this plugin's own code. The engine's code is not this plugin's, and
-        /// neither is the plugin's own data.
+        /// this plugin's own code, not the engine's and not its own data.
         #[test]
         fn only_this_objects_code_counts_as_a_slot() {
             let map = locate(KINDLE, A_SLOT).unwrap();
@@ -2057,9 +1819,8 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
             assert!(!map.holds_code(0xb6f0_0100));
         }
 
-        /// A code pointer in anonymous memory names no file, and an address in
-        /// nothing at all names nothing. Either way there is no object to check
-        /// the rest of the table against, so there is no plugin.
+        /// A code pointer in anonymous memory names no file, so there is no
+        /// object to check the rest of the table against.
         #[test]
         fn a_pointer_into_no_file_locates_nothing() {
             assert!(locate(KINDLE, 0xb6e0_0100).is_none());
@@ -2087,8 +1848,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         }
 
         /// **Two words next to each other in a snapshot need not be next to
-        /// each other in memory**, and the pending-key search reads a pair,
-        /// so it asks.
+        /// each other in memory**, and the pending-key search reads a pair.
         #[test]
         fn the_last_word_of_a_segment_has_no_neighbour() {
             let map = locate(SPLIT, 0x0001_0100).unwrap();
@@ -2261,8 +2021,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         }
 
         /// The syllable separator is only a separator once there is something
-        /// to separate; before that it is a quotation mark. Japanese romaji has
-        /// no separator at all, so there it is always the quotation mark.
+        /// to separate; Japanese romaji has none, so there it is always a quote.
         #[test]
         fn the_apostrophe_separates_syllables_only_in_chinese_and_only_mid_word() {
             assert_eq!(
@@ -2280,8 +2039,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         }
 
         /// カレー and コーヒー need it, so mid-word a hyphen is the prolonged
-        /// sound mark rather than punctuation — and it goes to the engine as
-        /// that character, which `prv_key_handler` tests for by code point.
+        /// sound mark, and reaches the engine as that code point.
         #[test]
         fn a_hyphen_mid_word_is_the_japanese_prolonged_sound_mark() {
             assert_eq!(
@@ -2380,8 +2138,7 @@ b6f00000-b6f20000 r-xp 00000000 b3:0c 1044       /lib/libc-2.20.so
         }
 
         /// Japanese quotes with 「」 far more than Chinese does, so they take
-        /// the unshifted keys — where a JIS keyboard has them, and where macOS
-        /// puts them — and 『』 takes the shifted pair.
+        /// the unshifted keys and 『』 the shifted pair.
         #[test]
         fn japanese_puts_the_corner_brackets_on_the_unshifted_keys() {
             let mut p = Punctuation::default();

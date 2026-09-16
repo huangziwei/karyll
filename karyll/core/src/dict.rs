@@ -1,36 +1,10 @@
-//! The word lists the Kindle already carries, read as data.
-//!
-//! Three files, one per regional convention, in two layouts that differ only in
-//! what each entry records:
-//!
-//! | convention | path | entries | longest |
-//! | --- | --- | --- | --- |
-//! | Simplified | `/usr/lib/mmseg/data_mmap` | 132,946 | 8 |
-//! | Traditional | `/usr/lib/mmseg/tcn/data_mmap` | 114,552 | 20 |
-//! | Japanese | `/usr/lib/resegmenter/words_list.mem` | 155,459 | 18 |
-//!
-//! Each file opens with a bucket count and the offset of the hash table it
-//! indexes, the entries fill the space between, and the table is the tail.
-//! **The table is never read.** Every entry carries the address of the one
-//! after it, so the entries are a plain sequence, and the file's own hash
-//! function — which differs between the two layouts and is written down nowhere
-//! — is not needed to walk them.
-//!
-//! An entry is a 32-bit link, a byte count and the word's UTF-8. The mmseg
-//! layout puts two more fields before the text: the length in characters, and a
-//! frequency that is set for one-character words and nothing else — 4,518 of
-//! them in the simplified file, `的` highest at 65,535. That column is what the
-//! segmenter's last tie-break reads.
-//!
-//! **Nothing here opens a file.** The image arrives as bytes so that this
-//! parses under `cargo test` on a machine that has none of these files.
+//! The word lists at `/usr/lib/mmseg/` and `/usr/lib/resegmenter/`, read as
+//! data. **The file's hash table is never read**: an entry is a link to the
+//! next, a byte count and UTF-8, so they walk as a sequence. Opens no file.
 
-/// The longest run of characters that may be claimed as one word.
-///
-/// The simplified file's own longest entry is 8 characters, and the entries
-/// past that length in the other two are proverbs and institution names —
-/// 無一事而不學，無一時而不學，無一處而不得 is one of them. A double-tap that
-/// selected twenty characters would be answering a question nobody asked.
+/// The longest run of characters that may be claimed as one word. The entries
+/// past this length are proverbs and institution names, and a double-tap that
+/// selected twenty characters answers a question nobody asked.
 pub const MAX_WORD: usize = 8;
 
 /// Which of the two entry layouts a file uses.
@@ -42,10 +16,8 @@ pub enum Layout {
     Words,
 }
 
-/// One word's place in the file image.
-///
-/// `at` is the offset of its text, and zero marks an empty slot: the first
-/// eight bytes of a file are its header, so no word's text can begin there.
+/// One word's place in the file image. `at` is the offset of its text, and zero
+/// marks an empty slot — the first eight bytes are the header.
 #[derive(Debug, Clone, Copy, Default)]
 struct Entry {
     at: u32,
@@ -53,17 +25,9 @@ struct Entry {
     freq: u16,
 }
 
-/// A dictionary, held as the file's own bytes plus a table into them.
-///
-/// **The table is built here rather than taken from the file.** Both files
-/// carry one, but the hash behind it differs between the two layouts and is
-/// written down nowhere, so the entries are re-hashed on the way in. That costs
-/// one pass and buys a lookup that reads a single slot — which is what the
-/// segmenter does several times per character of text.
-///
-/// Nothing is copied out of the image: a slot points into it, and a candidate
-/// is hashed and compared a character at a time against the stored bytes where
-/// they lie, so a lookup neither decodes the file nor allocates.
+/// A dictionary: the file's own bytes plus a table into them. **The table is
+/// built here**, since the file's own hash is written down nowhere. Nothing is
+/// copied out of the image, so a lookup neither decodes nor allocates.
 pub struct Dict {
     bytes: Vec<u8>,
     slots: Vec<Entry>,
@@ -73,11 +37,8 @@ pub struct Dict {
 }
 
 impl Dict {
-    /// Read a dictionary image.
-    ///
-    /// Returns `None` for a file whose entries do not tile the space the header
-    /// claims for them, which is the one check that distinguishes an image of
-    /// the given layout from any other file.
+    /// Read a dictionary image. `None` where the entries do not tile the space
+    /// the header claims, which is the one check that identifies the layout.
     pub fn parse(bytes: Vec<u8>, layout: Layout) -> Option<Self> {
         let table_at = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
         if table_at > bytes.len() || table_at < 8 {
@@ -157,11 +118,8 @@ impl Dict {
         self.longest
     }
 
-    /// The frequency recorded for `word`, or `None` if the dictionary has no
-    /// such word.
-    ///
-    /// A word the file holds without a frequency answers `Some(0)`, which is
-    /// every word of more than one character.
+    /// The frequency recorded for `word`, or `None` if there is no such word. A
+    /// word held without one answers `Some(0)` — every word past one character.
     pub fn lookup(&self, word: &[char]) -> Option<u16> {
         if word.is_empty() {
             return None;
@@ -189,12 +147,9 @@ fn word_of(bytes: &[u8], e: Entry) -> &[u8] {
     &bytes[at..at + e.nbytes as usize]
 }
 
-/// FNV-1a over the bytes of a word.
-///
-/// Written out rather than reached for, because this crate takes no
-/// dependencies and the standard hasher would need the word gathered into
-/// something that implements `Hash` — which is the allocation this whole
-/// arrangement exists to avoid.
+/// FNV-1a over the bytes of a word. Written out because the standard hasher
+/// would need the word gathered into something that implements `Hash`, which is
+/// the allocation this arrangement exists to avoid.
 fn hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -232,11 +187,8 @@ fn same_word(stored: &[u8], cand: &[char]) -> bool {
     rest.is_empty()
 }
 
-/// Characters in a UTF-8 string, counted from its lead bytes.
-///
-/// Continuation bytes are the ones that match `0b10xxxxxx`; everything else
-/// starts a character. Invalid bytes cannot make this panic, only wrong, and a
-/// word that is wrong here is a word that never matches.
+/// Characters in a UTF-8 string, counted from its lead bytes. Invalid bytes
+/// cannot make this panic, only wrong, and a wrong word never matches.
 fn count_chars(bytes: &[u8]) -> usize {
     bytes.iter().filter(|b| (*b & 0xC0) != 0x80).count()
 }
@@ -247,10 +199,6 @@ pub(crate) mod fixture {
 
     /// Build a dictionary image the way the device's own writer does, so the
     /// parser is exercised against the layout rather than against itself.
-    ///
-    /// The hash table is written as the zeroes a lookup would find if anything
-    /// read it, and the link in each entry as the address of the next, which is
-    /// what the real files hold.
     pub fn image(words: &[(&str, u16)], layout: Layout) -> Vec<u8> {
         let mut entries = Vec::new();
         for (word, freq) in words {

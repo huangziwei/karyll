@@ -1,23 +1,6 @@
-//! Where a word may be broken at the end of a line.
-//!
-//! Hyphenation is a pattern set in the Liang tradition: short letter sequences
-//! carrying digits, the odd values marking a legal break, matched everywhere in
-//! a word at once. The Kindle carries ten of them, at
-//! `/usr/java/lib/dictionaries/hyphen/`, in the text form `libhyphen`
-//! distributes — so karyll reads the firmware's data and bundles no patterns of
-//! its own, the way [`crate::dict`] reads the firmware's word lists.
-//!
-//! A dictionary is levelled. The first level finds the breaks a word already
-//! carries, where a hyphen or an apostrophe divides it, and each part it finds
-//! is then run through the language's own patterns on its own.
-//!
-//! **The patterns are matched as bytes, against the word's UTF-8.** A file that
-//! declares `ISO8859-1` — which the German, French, Italian, Dutch and
-//! Portuguese ones do — is decoded on the way in, so a pattern spelling `ä`
-//! carries the same two bytes the word does.
-//!
-//! **Nothing here opens a file.** The image arrives as bytes so that this
-//! parses under `cargo test` on a machine that has none of them.
+//! Where a word may be broken: levelled Liang patterns, read from the ten
+//! `libhyphen` files at `/usr/java/lib/dictionaries/hyphen/`. **Matched as
+//! bytes**, so an `ISO8859-1` file is decoded on the way in. Opens no file.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -73,14 +56,9 @@ struct State {
     trans_len: u32,
 }
 
-/// One level of a dictionary: a pattern set plus the limits it applies.
-///
-/// A level is a set of Liang patterns arranged as a trie of byte transitions
-/// with fallback links, so one pass over a word finds every pattern that
-/// matches anywhere in it. Each state carries the digit string of the pattern
-/// that ends there, merged with the digit strings of every shorter pattern
-/// ending at the same place, which is what lets a match be read off the state
-/// alone rather than by walking the fallback chain at every byte.
+/// One level of a dictionary: Liang patterns as a trie of byte transitions with
+/// fallback links. Each state's digit string absorbs those of every shorter
+/// pattern ending there, so a match reads off the state alone.
 #[derive(Debug, Clone)]
 struct Level {
     left_min: usize,
@@ -171,9 +149,8 @@ impl Level {
 // ---------------------------------------------------------------------------
 
 /// The level that finds the breaks a word already carries, generated for a
-/// dictionary that declares patterns alone. Each mark a word contains is a
-/// place it may break, and `NOHYPHEN` keeps a soft hyphen from being printed
-/// against a mark that is already visible.
+/// dictionary that declares patterns alone. `NOHYPHEN` keeps a soft hyphen off
+/// a mark that is already visible.
 const COMPOUND_LEVEL: &str = "\
 NOHYPHEN ',–,’,-
 1-1
@@ -190,10 +167,8 @@ const DEFAULT_MIN: usize = 2;
 /// file names neither that limit nor the plain one.
 const DEFAULT_COMPOUND_MIN: usize = 3;
 
-/// Decode a dictionary image to text, by the character set it declares.
-///
-/// The first line names it. `ISO8859-1` maps byte for byte onto the first 256
-/// code points, so decoding it is one cast per byte and no table.
+/// Decode a dictionary image to text, by the character set its first line
+/// declares. `ISO8859-1` is one cast per byte and no table.
 fn decode(bytes: &[u8]) -> Result<String, HyphenationError> {
     let end = bytes
         .iter()
@@ -209,33 +184,9 @@ fn decode(bytes: &[u8]) -> Result<String, HyphenationError> {
     Err(HyphenationError::UnsupportedCharset(charset))
 }
 
-/// Read a text dictionary into its levels.
-///
-/// # Layout
-///
-/// The first line names the character set. Every line after it is one of:
-///
-/// | line | meaning |
-/// |---|---|
-/// | `LEFTHYPHENMIN n`, `RIGHTHYPHENMIN n` | characters a break must leave on each side of itself |
-/// | `COMPOUNDLEFTHYPHENMIN n`, `COMPOUNDRIGHTHYPHENMIN n` | the same, for a part of a word that already breaks |
-/// | `NOHYPHEN a,b,c` | sequences that forbid a break next to them |
-/// | `NEXTLEVEL` | ends the compound level; the patterns of the language follow |
-/// | `%…` | a comment |
-/// | anything else | a pattern: letters carrying digits, `.` anchoring to a word edge |
-///
-/// A file that never says `NEXTLEVEL` is patterns alone, and the compound level
-/// that finds the breaks a word already carries is generated for it.
-///
-/// # Building the automaton
-///
-/// Patterns go into a trie of byte transitions. A state's fallback is the
-/// longest proper suffix of its own pattern that is also a state, so a walk
-/// that runs out of transitions resumes at the longest still-matching suffix
-/// rather than at the root. Because a match is read off the state alone, each
-/// state's digit string absorbs the digit strings of its fallback chain — the
-/// shorter patterns that end in the same place — merged digit by digit from the
-/// right, keeping the larger of each pair.
+/// Read a text dictionary into its levels. `NEXTLEVEL` ends the compound level,
+/// and a file without one is patterns alone. A state's fallback is the longest
+/// proper suffix of its pattern that is also a state.
 fn parse_levels(text: &str) -> Result<Vec<Level>, HyphenationError> {
     let mut lines = text.lines();
     // The charset line is consumed by `decode`, which has already acted on it.
@@ -504,31 +455,9 @@ fn merge(a: &[u8], b: &[u8]) -> Vec<u8> {
 // Break decisions taken by hand.
 // ---------------------------------------------------------------------------
 
-/// The words a dictionary breaks by hand rather than by pattern.
-///
-/// A pattern set is generated from a word list by machine and is judged on
-/// aggregate: it may break a rare word in an odd place and still be a good set.
-/// A writer meets the commonest words on every line, though, so a poor break in
-/// one of those is seen constantly, and no adjustment of the pattern machinery
-/// reaches it — the decision is per word.
-///
-/// # Layout
-///
-/// One entry per line, plus one keyword:
-///
-/// | line | meaning |
-/// |---|---|
-/// | `MINWORDLENGTH n` | words shorter than this are never broken |
-/// | `word` | never broken |
-/// | `wo-rd` | broken only where the marks are |
-/// | `%…` | a comment |
-///
-/// An entry replaces the patterns for the word it names, and stands whatever
-/// the word's length, being itself the exception to the line above. The
-/// dictionary's own limits on how near an edge a break may fall still apply, as
-/// they do to every break. Entries are matched without regard to case, and a
-/// word that already carries a mark cannot be named by one, the marks being the
-/// breaks; a word inside such a compound can.
+/// The words a dictionary breaks by hand: `word` never breaks, `wo-rd` only at
+/// its marks, `MINWORDLENGTH n` sets a floor an entry itself overrides. Matched
+/// without regard to case; the dictionary's own edge limits still apply.
 #[derive(Debug, Clone, Default)]
 struct Curation {
     /// Words shorter than this are not broken at all.
@@ -633,11 +562,8 @@ impl Hyphenator {
         self.curation.min_word_length = characters;
     }
 
-    /// Character offsets within `word` at which it may be broken, ascending.
-    ///
-    /// The unit the wrapper works in — [`crate::wrap::wrap_with`] indexes
-    /// characters, and a byte offset would have to be converted at every call
-    /// site.
+    /// Character offsets within `word` at which it may be broken, ascending:
+    /// the unit [`crate::wrap::wrap_with`] indexes in.
     pub fn breaks_in(&self, word: &[char]) -> Vec<usize> {
         let text: String = word.iter().collect();
         let mut at = self.hyphenate(&text).into_iter().peekable();
@@ -786,9 +712,8 @@ fn chars_between(s: &str, from: usize, to: usize) -> usize {
 }
 
 /// `word` in lower case, and where each byte offset of it sits in the original.
-/// A character whose lower case spells out as several characters has no offset
-/// of its own past its first byte, so a break inside one is not a break in the
-/// word.
+/// A character whose lower case spells out as several has no offset past its
+/// first byte, so a break inside one is not a break in the word.
 fn lowercase_with_origins(word: &str) -> (String, Vec<Option<usize>>) {
     let mut lowered = String::with_capacity(word.len());
     let mut origin = Vec::with_capacity(word.len() + 1);

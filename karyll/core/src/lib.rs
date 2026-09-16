@@ -1,7 +1,6 @@
 //! Text handling for karyll: the buffer, the edit model, and line breaking.
-//!
 //! Nothing here touches a font, a screen or a file, so all of it runs under
-//! `cargo test` on a development machine rather than only on the device.
+//! `cargo test` off the device.
 
 pub mod buffer;
 pub mod dict;

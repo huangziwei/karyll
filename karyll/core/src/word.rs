@@ -5,10 +5,9 @@ use crate::dict::Dict;
 use crate::segment;
 use std::ops::Range;
 
-/// A character's class for telling words apart — a third classification
-/// beside [`crate::script`] (which face draws it) and `wrap::classify`
-/// (where a line may break): 書いた is one run to both and breaks at 書|いた
-/// here.
+/// A character's class for telling words apart, beside [`crate::script`] (which
+/// face) and `wrap::classify` (where a line may break): 書いた is one run to
+/// both and breaks at 書|いた here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Alphanumerics outside the CJK ranges.

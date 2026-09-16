@@ -1,27 +1,6 @@
-//! Reading the pen.
-//!
-//! **As a pointer, and only as a pointer.** The pen places the cursor, drags a
-//! selection and presses buttons — the same vocabulary a finger has, and the
-//! same code path: this reports [`Touch`] and [`crate::Editor::tapped`] cannot
-//! tell which device a tap came from. Handwriting is not wanted and is not here.
-//!
-//! A nib is a few tenths of a millimetre across against a fingertip's several,
-//! so placing a caret between two characters is a thing the pen can do and a
-//! finger cannot — and the pen is already in the hand of anyone using a Scribe.
-//!
-//! The digitizer is a plain single-touch device — `ABS_X`, `ABS_Y` and
-//! `BTN_TOUCH` — rather than the multitouch protocol the finger panel speaks, so
-//! it has its own small state machine. `SYN_REPORT` closes each packet.
-//!
-//! **Hover is ignored.** `BTN_TOOL_PEN` says the nib is *near* the glass, and the
-//! digitizer streams position the whole time it is: several hundred packets for a
-//! pen resting in a hand over the page. Only `BTN_TOUCH` — the nib actually down
-//! — begins anything.
-//!
-//! Which node: `WacomDigitizer` at `/dev/input/event2`, in the panel's own
-//! coordinate space. The `stylus-custom` node beside it is a virtual mirror the
-//! framework maintains for X, already rotated; taking that one would apply the
-//! framework's rotation on top of [`crate::orientation`]'s.
+//! Reading the pen **as a pointer only**: it reports [`Touch`] and shares the
+//! finger's code path. Plain single-touch — `ABS_X`, `ABS_Y`, `BTN_TOUCH`,
+//! `SYN_REPORT`. **Hover is ignored**, since `BTN_TOOL_PEN` streams position.
 
 use std::fs::File;
 use std::io::Read;
@@ -187,11 +166,9 @@ fn find_by_scan() -> Result<PathBuf> {
     }
 }
 
-/// The digitizer's `eventN`, by name.
-///
-/// `WacomDigitizer` outranks the `stylus-custom` mirror beside it, which
-/// reports the same axes under the framework's rotation. Both match "stylus" in
-/// spirit, so the maker's name is tried first and the generic word last.
+/// The digitizer's `eventN`, by name. **`WacomDigitizer` outranks the
+/// `stylus-custom` mirror beside it**, which reports the same axes already under
+/// the framework's rotation — taking that one would rotate twice.
 fn pick_pen(raw: &str) -> Option<String> {
     const NAMES: [&str; 3] = ["wacom", "digitizer", "stylus"];
     let mut found: Vec<(usize, String)> = Vec::new();

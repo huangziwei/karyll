@@ -1,8 +1,6 @@
-//! Undo history.
-//!
-//! Edits are grouped, so one undo removes a burst of typing rather than one
-//! character. A group stays open while typing continues at the same place and
-//! closes at a natural boundary — a newline, a cursor move, a save.
+//! Undo history. Edits are grouped, so one undo removes a burst of typing: a
+//! group stays open while typing continues at the same place and closes at a
+//! newline, a cursor move or a save.
 
 use crate::buffer::Buffer;
 
@@ -55,10 +53,8 @@ impl History {
         Self::default()
     }
 
-    /// Record an edit into the open group, opening one if needed.
-    ///
-    /// Any new edit invalidates the redo stack — the future it led to is no
-    /// longer reachable.
+    /// Record an edit into the open group, opening one if needed. Any new edit
+    /// invalidates the redo stack.
     pub fn record(&mut self, edit: Edit) {
         self.undone.clear();
         self.open.get_or_insert_with(Vec::new).push(edit);

@@ -1,31 +1,6 @@
-//! Line breaking for mixed Latin and CJK text.
-//!
-//! Latin breaks at spaces. Chinese breaks between almost any two characters,
-//! which is why a wrapper written for English alone produces a ragged right
-//! edge on Chinese prose — it can only break where there are spaces, and there
-//! are none. The exceptions are punctuation rules: a line may not begin with
-//! closing punctuation, and may not end with opening punctuation.
-//!
-//! Those two rules are kept by *push-out* — 追い出し, the remedy that moves the
-//! character before the mark down with it, so the mark never opens a line. It
-//! is what a break opportunity refused before a mark amounts to, and it is the
-//! default because it costs a slightly shorter line and nothing else: this sets
-//! ragged right, so there is no justification to stretch.
-//!
-//! A mark can also *hang* past the measure instead — ぶら下げ. That happens for
-//! two unrelated reasons, and [`wrap_with`] tells them apart: as a style the
-//! caller asks for, and as the last resort when a line holds no legal break at
-//! all and push-out has nowhere to go.
-//!
-//! Line breaking is not all of it. Mixed Japanese and Chinese prose also takes
-//! a quarter em between a Han character and Latin beside it — 四分アキ, which
-//! [`aki`] decides and [`Rules::aki`] gives a width to. It is charged here
-//! rather than by the caller because it is space *between* two characters, and
-//! space between two characters vanishes when a line breaks there.
-//!
-//! This is a deliberately small subset of UAX #14 — the part that matters for
-//! prose. Widths come from a caller-supplied measure function so that nothing
-//! here depends on a font.
+//! Line breaking for mixed Latin and CJK: a small subset of UAX #14. No line
+//! begins with closing punctuation or ends with opening, kept by push-out
+//! (追い出し) or, as a style, by hanging (ぶら下げ). 四分アキ is charged here.
 
 use std::ops::Range;
 
@@ -63,26 +38,16 @@ pub fn classify(c: char) -> Class {
     }
 }
 
-/// Whether a line may begin with `c`.
-///
-/// The same two refusals [`can_break_between`] makes — no break before a
-/// closing mark, none before a space — read as a property of the character
-/// alone, for the one caller that has no pair to ask about: the fallback in
-/// [`wrap_with`], which is choosing where to split a run that offers it no
-/// legal break at all.
+/// Whether a line may begin with `c`: the two refusals [`can_break_between`]
+/// makes, read as a property of the character alone, for the fallback in
+/// [`wrap_with`] that has no pair to ask about.
 fn may_open_a_line(c: char) -> bool {
     !matches!(classify(c), Class::Space | Class::Close)
 }
 
-/// Whether a mark may be set past the measure rather than pushed down.
-///
-/// **The stops only, and deliberately not [`Class::Close`].** A hung 。 or 、
-/// carries its ink in the lower-left of its em box, so almost nothing of it
-/// crosses the margin and it reads as intentional. A closing bracket has ink
-/// against its right edge and a hung one reads as a mistake, which is why the
-/// convention pushes brackets and quotes down and hangs only the stops. `…`
-/// and `—` are `Close` for the same reason 」 is — a line may not open on one —
-/// and are full-width ink, so neither hangs either.
+/// Whether a mark may be set past the measure rather than pushed down. **The
+/// stops only, not [`Class::Close`]**: 。 and 、 carry their ink in the
+/// lower-left, while a hung bracket or 、… reads as a mistake.
 pub fn hangable(c: char) -> bool {
     matches!(c, '。' | '、' | '．' | '，' | '.' | ',')
 }
@@ -116,27 +81,9 @@ pub fn can_break_between(a: char, b: char) -> bool {
     }
 }
 
-/// Whether a quarter em belongs between `a` and the `b` that follows it.
-///
-/// **四分アキ** (JLREQ §3.2). Japanese and Chinese setting puts a quarter of an
-/// em between a Han or kana character and Latin letters or digits beside it, in
-/// either order. Without it `karyllはRustで書いた` runs the two scripts together
-/// at a boundary a reader of either one expects to see marked, and a CJK reader
-/// reads its absence as an error rather than as a style.
-///
-/// **Letters and digits only on the Latin side.** [`Class::Other`] is
-/// everything that is not CJK or punctuation, so it holds `*`, `#` and `~` as
-/// well as words — and a gap opened between `*` and 世 would push the emphasis
-/// marker off the character it marks.
-///
-/// **Hangul is not 欧文.** It classifies as [`Class::Other`] and is
-/// alphanumeric, which is the pair `latin` tests, so the predicate names the
-/// script as well. A quarter em between 漢字 and 한글 is a gap Korean does not
-/// write: Hangul is set on the same even em Han is.
-///
-/// **Nothing against punctuation on either side.** A mark carries its own
-/// sidebearing inside its em box, and a quarter em on top of that reads as two
-/// spaces rather than as one.
+/// Whether a quarter em belongs between `a` and the `b` after it — 四分アキ,
+/// JLREQ §3.2. **Letters and digits only on the Latin side**, so `*世` keeps its
+/// marker; **Hangul is not 欧文**; and nothing against punctuation either side.
 pub fn aki(a: char, b: char) -> bool {
     let han = |c| classify(c) == Class::Ideograph;
     let latin = |c: char| {
@@ -147,12 +94,9 @@ pub fn aki(a: char, b: char) -> bool {
     han(a) && latin(b) || latin(a) && han(b)
 }
 
-/// The mark a word broken across two lines takes.
-///
-/// Never a character of the document: it is drawn past the end of the line, and
-/// [`Line::range`] still names exactly the characters the line holds. That is
-/// what keeps a caret, a selection and a hit test able to work in one index
-/// space with the buffer.
+/// The mark a word broken across two lines takes. **Never a character of the
+/// document**: it is drawn past the end of the line, and [`Line::range`] still
+/// names exactly the characters the line holds.
 pub const HYPHEN: char = '-';
 
 /// One visual line: the characters it covers, and how it ended.
@@ -174,36 +118,22 @@ pub struct Rules {
     /// before it onto the next line. See [`hangable`] for which marks this
     /// covers, and the module note for why it is off by default.
     pub hang: bool,
-    /// The width of 四分アキ, in the same unit as `max_width`. Zero sets none.
-    ///
-    /// A width rather than a flag because a quarter em is a quarter of *this
-    /// line's* em: a heading takes a wider one than the body it heads, and
-    /// nothing here knows a type size. See [`aki`] for where it is set.
+    /// The width of 四分アキ, in the same unit as `max_width`. Zero sets none. A
+    /// width rather than a flag: a quarter em is a quarter of *this line's* em,
+    /// and nothing here knows a type size.
     pub aki: u32,
 }
 
-/// Break `chars` into lines no wider than `max_width`.
-///
-/// `measure(index, char)` returns the advance of a character in whatever unit
-/// `max_width` is given in. A character wider than `max_width` on its own still
-/// gets its own line rather than looping forever.
-///
-/// The index is passed because a character's advance is not a property of the
-/// character alone: which face draws it depends on the markup around it, so
-/// `*世*` measures differently from `世`. It is an index into `chars`, and
-/// `measure` may be called more than once for the same one.
+/// Break `chars` into lines no wider than `max_width`. `measure(index, char)`
+/// takes an index because an advance is not a property of the character alone —
+/// the markup decides the face — and may be called twice for the same one.
 pub fn wrap(chars: &[char], max_width: u32, measure: impl FnMut(usize, char) -> u32) -> Vec<Line> {
     wrap_with(chars, max_width, Rules::default(), measure, |_| Vec::new())
 }
 
 /// Break `chars` into lines, with `rules` over the script rules that always
-/// apply. [`wrap()`] is this with nothing asked for.
-///
-/// `hyphenate(word)` is asked where a word may be divided, and answers with
-/// character offsets **within** the range it was given. It is consulted only
-/// for the one word an overflow lands inside — never for a line that breaks at
-/// a space — so a document costs one call per wrapped row rather than one per
-/// word. Answering with nothing switches word division off.
+/// apply. `hyphenate(word)` answers with offsets **within** the range it was
+/// given, and is asked only for the word an overflow lands inside.
 pub fn wrap_with(
     chars: &[char],
     max_width: u32,
@@ -266,9 +196,8 @@ pub fn wrap_with(
             );
 
             // **The division wins by being later**, which inside the
-            // overflowing word it always is: the last space on the line is
-            // before the word began. Where the dictionary offers nothing, or
-            // offers only what a space already reaches, the space stands.
+            // overflowing word it always is. Where the dictionary offers
+            // nothing past what a space reaches, the space stands.
             let chosen = match (soft, legal) {
                 (Some(at), Some(b)) if at <= b => Some((b, false)),
                 (Some(at), _) => Some((at, true)),
@@ -276,13 +205,8 @@ pub fn wrap_with(
             };
 
             // **Nothing is left to push down.** With no break anywhere on the
-            // line — between 「 and what follows it, or inside a word the
-            // dictionary will not divide — the fallback below breaks
-            // immediately before whatever overflowed. Where that is a mark or
-            // a space, it opens the next line with one, which is the thing
-            // these rules exist to prevent. It hangs instead, whatever the
-            // caller asked for: the alternative is not a worse line, it is a
-            // wrong one.
+            // line, the fallback would open the next one with a mark — so it
+            // hangs instead, whatever the caller asked for.
             let stranded = chosen.is_none() && !may_open_a_line(c);
 
             // The style, and the whole of its visible effect: 世界。 keeps its
@@ -326,10 +250,9 @@ pub fn wrap_with(
     lines
 }
 
-/// The space set before character `at` on a line that began at `start`.
-///
-/// Zero at the line's own start, so a row that happens to begin at a script
-/// boundary is not indented by a quarter em past the flush edge.
+/// The space set before character `at` on a line that began at `start`. Zero at
+/// the line's own start, so a row beginning at a script boundary is not
+/// indented past the flush edge.
 fn space(chars: &[char], rules: Rules, start: usize, at: usize) -> u32 {
     if at <= start || rules.aki == 0 {
         return 0;
@@ -341,11 +264,8 @@ fn space(chars: &[char], rules: Rules, start: usize, at: usize) -> u32 {
 }
 
 /// Whether `c` is a letter of a script that divides words rather than
-/// characters.
-///
-/// `is_alphabetic` alone would claim Han and kana, which are alphabetic as far
-/// as Unicode is concerned and divide by nothing a hyphenation dictionary
-/// knows; [`classify`] is what separates them.
+/// characters. `is_alphabetic` alone would claim Han and kana, so [`classify`]
+/// separates them.
 fn is_word_letter(c: char) -> bool {
     c.is_alphabetic() && classify(c) == Class::Other
 }
@@ -366,13 +286,9 @@ fn word_around(chars: &[char], at: usize) -> Option<Range<usize>> {
     Some(from..to)
 }
 
-/// The latest division of the word at `over` that leaves the line, mark and
-/// all, no wider than `max_width`.
-///
-/// `None` where the overflow did not land inside a word, where the word begins
-/// past the line's own start, or where the dictionary divides it nowhere the
-/// mark still fits. The mark is measured in the role of the character it
-/// follows, so a division inside a bold word takes a bold hyphen.
+/// The latest division of the word at `over` that leaves the line, mark and all,
+/// no wider than `max_width`. The mark is measured in the role of the character
+/// it follows, so a division inside a bold word takes a bold hyphen.
 fn soft_break(
     chars: &[char],
     rules: Rules,
@@ -609,10 +525,8 @@ mod tests {
         assert_eq!(lines, ["你好", "世", "界。、", "再见"]);
         assert!(opens_legally(&lines), "{lines:?}");
 
-        // The cap is on the style, not on the last resort. A run that cannot
-        // be placed legally anywhere still hangs, because the alternative is a
-        // line that opens with a mark. Breaking earlier is what keeps it to
-        // two glyphs past the measure rather than three.
+        // The cap is on the style, not on the last resort: a run that cannot
+        // be placed legally anywhere still hangs.
         let lines = hung("你好世界。。。再见", 4, HANG);
         assert_eq!(lines, ["你好", "世", "界。。。", "再见"]);
         assert!(opens_legally(&lines), "{lines:?}");
@@ -650,9 +564,7 @@ mod tests {
     #[test]
     fn a_word_the_dictionary_does_not_hold_is_chopped_without_a_mark() {
         // **No mark on an arbitrary chop.** A hyphen states a division the
-        // dictionary vouched for, and there is none here; on the realistic
-        // source of an unbreakable run — a URL — a mark would read as part of
-        // the address.
+        // dictionary vouched for, and in a URL it would read as an address.
         assert_eq!(
             divided("the unhyphenatable word", 10),
             ["the ", "unhyphenat", "able word"]

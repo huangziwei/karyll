@@ -1,21 +1,6 @@
-//! Which way up the window is, and how a touch maps onto it.
-//!
-//! Two separate things share the word "orientation" here:
-//!
-//! - **What the framework does on its own.** An accelerometer-driven flip, and
-//!   only ever 180°. That is the framework's choice, not the sensor's: the
-//!   part is a Kionix KX132-1211 whose tilt-position register reports six
-//!   states including both landscapes, and it is readable from
-//!   `/dev/input/eventN` like any other input device. Turning the Scribe on its
-//!   side does nothing in the stock reader because the reader is portrait-only,
-//!   not because the hardware cannot say.
-//! - **What an app asks for.** The lab126 window manager reads the window's
-//!   name as a layout spec, ending in `_O:<letter>`. Setting `L` or `R` there is
-//!   how landscape is requested, which is why the stock reader offers it as a
-//!   setting rather than as a gesture. Nothing rotates into landscape by itself.
-//!
-//! The touchscreen is panel-fixed whichever way the window is turned, so every
-//! tap is mapped here before anything looks at where it landed.
+//! Which way up the window is, and how a touch maps onto it. **The framework
+//! flips 180° on its own**; **landscape is only ever asked for**, through the
+//! `_O:<letter>` field of the window name. Touch is panel-fixed and mapped here.
 
 use std::process::Command;
 
@@ -52,27 +37,9 @@ impl Orientation {
         }
     }
 
-    /// Which way the device is physically being held, from the accelerometer's
-    /// own position code.
-    ///
-    /// **Established on hardware, and not derivable any other way.**
-    /// The driver advertises `ABS_X`, `ABS_Y` and `ABS_Z` and then reports zero
-    /// for all three forever, so there is no gravity vector to reason from —
-    /// the whole signal is one code on `ABS` 24, which the X driver calls
-    /// `rotation`.
-    ///
-    /// The four values were read off by turning the device while watching what
-    /// the window manager settled on, and every observation agreed:
-    ///
-    /// | code | | code | |
-    /// |---|---|---|---|
-    /// | 15 | `Up` | 17 | `Right` |
-    /// | 16 | `Down` | 18 | `Left` |
-    ///
-    /// The portrait pair comes first and the landscape pair second, which is a
-    /// good sign the encoding is deliberate rather than coincidence. Anything
-    /// else is `None` — the sensor emits a settling burst on power-up, and an
-    /// unknown code is a reason to hold the last orientation rather than guess.
+    /// Which way the device is physically held. **The whole signal is one code
+    /// on `ABS` 24** — `ABS_X`/`Y`/`Z` report zero forever — and an unknown code
+    /// is `None`, since the sensor emits a settling burst on power-up.
     pub fn from_tilt(code: i32) -> Option<Self> {
         match code {
             15 => Some(Self::Up),
@@ -83,12 +50,9 @@ impl Orientation {
         }
     }
 
-    /// Ask the window manager which way it currently has the screen.
-    ///
-    /// Silent, deliberately. This is polled several times a second to catch the
-    /// framework's own 180° flips, and logging every answer puts ninety
-    /// identical lines into a two-minute session's log and buries the ones that
-    /// matter. Callers log the transitions they care about.
+    /// Ask the window manager which way it currently has the screen. Silent
+    /// deliberately: this is polled several times a second, so callers log the
+    /// transitions they care about.
     pub fn detect() -> Self {
         let Ok(out) = Command::new("lipc-get-prop")
             .args(["com.lab126.winmgr", "orientation"])
@@ -102,17 +66,9 @@ impl Orientation {
         Self::from_letter(String::from_utf8_lossy(&out.stdout).trim())
     }
 
-    /// Map a point from panel coordinates onto the window.
-    ///
-    /// The point must already be in the panel's own pixel space, which is
-    /// always portrait and never changes shape. `window` is the surface as it
-    /// currently is, which in landscape has its sides swapped — so in landscape
-    /// the window's *height* is the panel's width, and vice versa.
-    ///
-    /// The two landscape mappings are a guess at which way round the compositor
-    /// turns us — there is no way to know without running it, and the log line
-    /// in the tap handler is what settles it. If taps land on the mirror of
-    /// where they should, `Left` and `Right` are the wrong way round.
+    /// Map a point from panel coordinates onto the window. The point must
+    /// already be in the panel's own pixel space, which is always portrait;
+    /// `window` in landscape has its sides swapped.
     pub fn apply(self, x: i32, y: i32, window: (u16, u16)) -> (i32, i32) {
         let (w, h) = (window.0 as i32, window.1 as i32);
         match self {
@@ -133,10 +89,8 @@ mod tests {
     const PORTRAIT: (u16, u16) = (1860, 2480);
     const LANDSCAPE: (u16, u16) = (2480, 1860);
 
-    /// The four codes read off the device, with the two pairs the right way
-    /// round — a transposition here would rotate the page ninety degrees from
-    /// where the writer is holding it, which is the whole failure this mapping
-    /// exists to avoid.
+    /// The four codes, with the two pairs the right way round: a transposition
+    /// rotates the page ninety degrees from where the writer is holding it.
     #[test]
     fn the_accelerometer_codes_are_the_ones_the_device_reported() {
         assert_eq!(Orientation::from_tilt(15), Some(Orientation::Up));
@@ -188,9 +142,7 @@ mod tests {
     #[test]
     fn a_quarter_turn_maps_the_panel_across_the_long_edge() {
         // A point halfway down the panel has to arrive halfway across a
-        // landscape window. Scaling into the window's own axes first squashes
-        // it by 1860/2480, which walks a tap aimed at the third button of five
-        // onto the second.
+        // landscape window; scaling into the window's axes first squashes it.
         let down_the_panel = 2480 / 2;
         let (x, _) = Orientation::Left.apply(900, down_the_panel, LANDSCAPE);
         assert_eq!(

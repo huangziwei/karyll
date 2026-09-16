@@ -1,15 +1,6 @@
-//! Opening the word lists the Kindle already carries.
-//!
-//! The three files are part of the firmware on every device karyll runs on —
-//! the same bytes on all of them — and belong to the segmenter the framework
-//! uses for its own word selection. karyll reads the data and leaves the
-//! libraries alone: a word list is a word list, while the libraries around it
-//! are C++ with an ICU version in their symbol names that differs per device.
-//!
-//! Which list applies follows the regional convention the Han faces already
-//! follow, because Han unification leaves nothing in the characters themselves
-//! to decide it — 干 is a word in all three conventions and a different one in
-//! each.
+//! Opening the word lists the firmware carries for its own segmenter; the
+//! libraries around them are left alone, being C++ with a per-device ICU version
+//! in their symbols. Which list applies follows the regional convention.
 
 use std::path::Path;
 use std::time::Instant;
@@ -36,11 +27,9 @@ const LISTS: [(Region, &str, Layout); 3] = [
     ),
 ];
 
-/// Read the list for `region`, or `None` when the device has not got it.
-///
-/// A missing or unreadable list is not an error worth stopping for: word
-/// selection falls back to whole runs of Han, which is what it did before any
-/// of this, so the failure costs precision and nothing else.
+/// Read the list for `region`, or `None` when the device has not got it — not
+/// an error worth stopping for, since word selection then falls back to whole
+/// runs of Han.
 pub fn load(region: Region) -> Option<Dict> {
     let &(_, path, layout) = LISTS.iter().find(|(r, _, _)| *r == region)?;
     read(Path::new(path), layout)
@@ -76,13 +65,9 @@ fn read(path: &Path, layout: Layout) -> Option<Dict> {
 mod tests {
     use super::*;
 
-    /// The real firmware files, when a copy of one is to hand.
-    ///
-    /// `KARYLL_LEXICON_DIR` points at a directory holding the device's `usr`
-    /// tree — a system dump will do — and without it this says nothing, because
-    /// a development machine has none of these files. The parser is covered
-    /// either way by the fixtures in `karyll_core::dict`; what this adds is the
-    /// only thing a fixture cannot: that the layout matches the real bytes.
+    /// The real firmware files, when a copy is to hand: `KARYLL_LEXICON_DIR`
+    /// points at a directory holding the device's `usr` tree, and without it
+    /// this says nothing. Only a real file can show the layout still matches.
     #[test]
     fn the_firmware_lists_parse_and_hold_the_words_they_should() {
         let Ok(root) = std::env::var("KARYLL_LEXICON_DIR") else {

@@ -1,21 +1,6 @@
-//! Reading the touchscreen.
-//!
-//! Without this karyll is unusable before a keyboard exists — and unescapable,
-//! since the only way out is a key chord. Touch is what makes the app reachable
-//! on a device that has never had a keyboard attached.
-//!
-//! Protocol B multitouch. A contact begins with `ABS_MT_TRACKING_ID >= 0` and
-//! ends with `-1`; **the positions follow it in the same packet**, and
-//! `SYN_REPORT` closes each
-//! packet. Only the first contact is tracked, because nothing here needs a
-//! gesture — a tap and a long press are the whole vocabulary.
-//!
-//! **Orientation is deliberately not relied upon.** The compositor rotates our
-//! window to the framework's orientation while touch is panel-fixed, and the
-//! exact transform has not been confirmed on this device. So the long press,
-//! which is the way into the menu, ignores position entirely, and menu rows span
-//! the full width so only one axis can be wrong. Raw coordinates are logged on
-//! the first contact of a session, which is what will settle it.
+//! Reading the touchscreen: protocol B multitouch, a contact opening with
+//! `ABS_MT_TRACKING_ID >= 0` and closing with `-1`, **the positions following in
+//! the same packet**. Only the first contact is tracked, and it is panel-fixed.
 
 use std::fs::File;
 use std::io::Read;
@@ -89,10 +74,8 @@ pub struct Touchscreen {
     /// Set once the current contact has already been reported as a long press,
     /// so holding does not repeat it.
     fired: bool,
-    /// A contact began or ended in the packet being read. Both are reported at
-    /// `SYN_REPORT` rather than as they arrive, because the tracking id comes
-    /// *before* the coordinates — reporting on it carries the position of the
-    /// previous touch, which is exactly one behind.
+    /// A contact began or ended in the packet being read. Reported at
+    /// `SYN_REPORT`, because the tracking id comes *before* the coordinates.
     began: bool,
     ended: bool,
     logged: bool,
@@ -107,19 +90,9 @@ impl Touchscreen {
         };
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
 
-        // **The touchscreen is deliberately NOT grabbed.**
-        //
-        // EVIOCGRAB would give us taps exclusively, and it also starves the
-        // framework of them — including the power-off dialog. A user who long
-        // presses power then cannot touch "Restart", and the only way out is
-        // holding the button for thirty seconds. No editor is worth making the
-        // device unrecoverable, so we share the panel and accept that the
-        // framework sees the same taps we do.
-        //
-        // It is also why karyll takes no screenshots of its own: the firmware's
-        // opposite-corners gesture reads the framebuffer directly, so it
-        // captures the editor's own drawing and writes it to
-        // `/mnt/us/screenshots` regardless of which process painted.
+        // **The touchscreen is deliberately NOT grabbed.** EVIOCGRAB would
+        // starve the framework of taps, including the power-off dialog, and
+        // leave the device recoverable only by a thirty-second button hold.
         let x_extent = read_extent(&file, ABS_MT_POSITION_X, 1859);
         let y_extent = read_extent(&file, ABS_MT_POSITION_Y, 2479);
         eprintln!(
@@ -217,11 +190,8 @@ impl Touchscreen {
 }
 
 /// Ask a device for an axis range, falling back to `fallback` when the ioctl is
-/// refused — a wrong range still beats no touch at all.
-///
-/// Shared with [`crate::pen`], which asks the same question of a different
-/// device about different axes. The fallback is the caller's because only the
-/// caller knows which axis it is asking about.
+/// refused — a wrong range still beats no touch at all. The fallback is the
+/// caller's, since only it knows which axis it is asking about.
 pub fn read_extent(file: &File, axis: u16, fallback: i32) -> Extent {
     let mut info = [0i32; 6];
     let ok = unsafe { libc::ioctl(file.as_raw_fd(), eviocgabs(axis) as _, info.as_mut_ptr()) } == 0;
@@ -237,12 +207,9 @@ pub fn read_extent(file: &File, axis: u16, fallback: i32) -> Extent {
     }
 }
 
-/// Find the panel by capability when the firmware alias is absent.
-///
-/// Which node is [`crate::evdev::pick_touchscreen`]'s to say — one parse of
-/// `/proc/bus/input/devices` serves the keyboard, the accelerometer and this,
-/// and a second copy of it here is the duplication that has already cost this
-/// project twice.
+/// Find the panel by capability when the firmware alias is absent. Which node
+/// is [`crate::evdev::pick_touchscreen`]'s to say: one parse of
+/// `/proc/bus/input/devices` serves the keyboard, the accelerometer and this.
 fn find_by_scan() -> Result<PathBuf> {
     let raw = std::fs::read_to_string("/proc/bus/input/devices")
         .context("read /proc/bus/input/devices")?;

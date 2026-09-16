@@ -1,13 +1,6 @@
-//! A document: text, a cursor, a selection, and its undo history.
-//!
-//! Positions here are character indices into the buffer. Visual navigation —
-//! moving by wrapped line rather than by logical line — needs the layout, and
-//! so belongs with whatever owns the font, not here.
-//!
-//! **The selection lives here rather than in the app**, because every edit has
-//! to interact with it: typing replaces it, backspace deletes it. Held outside,
-//! each of those call sites would have to remember to check. The rule is
-//! enforced in the two methods that edit, not in the dozen that call them.
+//! A document: text, a cursor, a selection, and its undo history. Positions are
+//! character indices; visual navigation needs the layout and lives elsewhere.
+//! **The selection lives here**, so the two editing methods enforce it for all.
 
 use std::ops::Range;
 
@@ -19,12 +12,9 @@ use crate::word;
 pub struct Document {
     buffer: Buffer,
     cursor: usize,
-    /// Where a selection began. The selection is the span between this and the
-    /// cursor, in whichever order they happen to fall — so extending leftwards
-    /// needs no special case.
-    ///
-    /// Not to be confused with `group_anchor` below, which is undo bookkeeping
-    /// and has nothing to do with selecting.
+    /// Where a selection began; the selection is the span between this and the
+    /// cursor, in whichever order they fall. Not `group_anchor` below, which is
+    /// undo bookkeeping.
     anchor: Option<usize>,
     history: History,
     /// Where the cursor was when the open undo group started, so an edit that
@@ -69,11 +59,9 @@ impl Document {
         self.cursor
     }
 
-    /// The selected span, ordered, or `None` when nothing is selected.
-    ///
-    /// An anchor sitting exactly on the cursor is not a selection — shift-arrow
-    /// out and back leaves an empty span, and reporting that as a selection
-    /// would make the next keystroke "replace nothing" instead of typing.
+    /// The selected span, ordered, or `None` when nothing is selected. An anchor
+    /// sitting exactly on the cursor is not a selection, or the next keystroke
+    /// would "replace nothing" instead of typing.
     pub fn selection(&self) -> Option<Range<usize>> {
         let anchor = self.anchor?;
         let (start, end) = (anchor.min(self.cursor), anchor.max(self.cursor));
@@ -113,10 +101,9 @@ impl Document {
         self.anchor = None;
     }
 
-    /// Delete the selection if there is one, reporting whether there was.
-    ///
-    /// The two edit paths call this first, which is what makes "typing replaces
-    /// the selection" true everywhere rather than everywhere someone remembered.
+    /// Delete the selection if there is one, reporting whether there was. The
+    /// two edit paths call this first, which is what makes "typing replaces the
+    /// selection" true everywhere.
     pub fn delete_selection(&mut self) -> bool {
         let Some(range) = self.selection() else {
             self.anchor = None;
@@ -219,10 +206,8 @@ impl Document {
         self.group_anchor = Some(self.cursor);
     }
 
-    /// Put `with` in place of `range`, as one undo step.
-    ///
-    /// An empty `with` is a deletion. [`Document::insert`] returns early on an
-    /// empty string, so the deletion is spelled out rather than left to it.
+    /// Put `with` in place of `range`, as one undo step. An empty `with` is a
+    /// deletion, spelled out because [`Document::insert`] returns early on one.
     pub fn replace_range(&mut self, range: Range<usize>, with: &str) {
         self.select(range);
         if with.is_empty() {
@@ -233,16 +218,9 @@ impl Document {
         }
     }
 
-    /// Put `with` in place of every one of `ranges`, as a single undo step.
-    /// Reports how many were changed.
-    ///
-    /// **Applied last first**, so each range still describes the text it was
-    /// found in: a replacement of a different length moves everything after it.
-    ///
-    /// One undo step, because it was one decision.
-    ///
-    /// `ranges` must be ordered and non-overlapping, which is what
-    /// [`crate::find::matches`] returns.
+    /// Put `with` in place of every one of `ranges`, as one undo step, reporting
+    /// how many changed. **Applied last first**, so each range still describes
+    /// the text it was found in; `ranges` must be ordered and non-overlapping.
     pub fn replace_all(&mut self, ranges: &[Range<usize>], with: &str) -> usize {
         let text: Vec<char> = with.chars().collect();
         self.break_undo_group();
@@ -297,13 +275,9 @@ impl Document {
         }
     }
 
-    /// Move the cursor to `idx`, clamped to the document, dropping any
-    /// selection.
-    ///
-    /// This is the plain move, and it clears — it is what a tap and an undo
-    /// restore call, and both should. Extending is `extend_to`, a separate verb
-    /// so the difference is legible at the call site rather than hidden in a
-    /// boolean argument.
+    /// Move the cursor to `idx`, clamped, dropping any selection. The plain
+    /// move, which a tap and an undo restore both want; extending is
+    /// `extend_to`, a separate verb rather than a boolean argument.
     pub fn set_cursor(&mut self, idx: usize) {
         let idx = idx.min(self.buffer.len());
         if idx != self.cursor {
@@ -313,11 +287,8 @@ impl Document {
         self.cursor = idx;
     }
 
-    /// Left arrow: collapse to the near edge of a selection, or step back one.
-    ///
-    /// Collapsing rather than stepping is what every text field does, and the
-    /// difference shows the moment someone selects a word and presses left
-    /// meaning "put me before that".
+    /// Left arrow: collapse to the near edge of a selection, or step back one —
+    /// what every text field does when someone selects a word and presses left.
     pub fn move_left(&mut self) {
         match self.selection() {
             Some(range) => self.set_cursor(range.start),
@@ -391,13 +362,9 @@ impl Document {
         self.extend_to(self.line_end(self.cursor));
     }
 
-    /// Where the word boundary to either side of the cursor falls.
-    ///
-    /// The buffer has a gap in the middle of it, so there is no `&[char]` to
-    /// hand out and the document is flattened per call. That is the same cost
-    /// the renderer already pays on every paint, against a keystroke that
-    /// happens at most a few times a second, so it is not worth a cleverer
-    /// arrangement.
+    /// Where the word boundary to either side of the cursor falls. The buffer
+    /// has a gap in the middle, so there is no `&[char]` to hand out and the
+    /// document is flattened per call.
     fn word_boundary(&self, forward: bool, dict: Option<&Dict>) -> usize {
         let chars = self.chars();
         if forward {
@@ -423,10 +390,8 @@ impl Document {
         self.extend_to(self.word_boundary(true, dict));
     }
 
-    /// Delete back to the start of the word — or the selection, if one is up.
-    ///
-    /// A selection wins because that is what the writer is pointing at; only
-    /// with nothing selected does this mean "the word behind me".
+    /// Delete back to the start of the word — or the selection, if one is up,
+    /// since that is what the writer is pointing at.
     pub fn delete_word_back(&mut self, dict: Option<&Dict>) {
         if self.delete_selection() {
             return;

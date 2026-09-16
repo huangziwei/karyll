@@ -1,14 +1,6 @@
-//! A gap buffer holding `char`s.
-//!
-//! Prose editing concentrates edits at the cursor, which is exactly the access
-//! pattern a gap buffer is good at: moving the gap costs a memcpy proportional
-//! to how far the cursor jumped, and typing at it is free.
-//!
-//! Storing `char` rather than UTF-8 bytes trades memory for the absence of a
-//! whole class of boundary bug — every index is a character index, so nothing
-//! can land mid-codepoint. Four bytes per character is affordable here: a long
-//! Chinese manuscript of 200k characters costs 800 KB against the ~514 MB the
-//! device has free, and UTF-8 would have cost 600 KB of that anyway.
+//! A gap buffer holding `char`s: moving the gap costs a memcpy proportional to
+//! how far the cursor jumped, and typing at it is free. **Every index is a
+//! character index**, so nothing can land mid-codepoint.
 
 /// Minimum gap size, and the amount of headroom left after a grow. Sized so a
 /// burst of typing does not reallocate on every keystroke.

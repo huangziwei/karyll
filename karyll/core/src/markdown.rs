@@ -1,17 +1,6 @@
-//! Markdown markup analysis.
-//!
-//! karyll shows Markdown source, styled — it never hides the syntax and never
-//! renders a preview. A heading stays `## Heading`; the `##` is just drawn
-//! quieter than the words. So the parser's job is not to strip markers but to
-//! *label* every character, including the markers, and hand the whole labelled
-//! run to the renderer.
-//!
-//! That means spans tile their line exactly: concatenating them reproduces the
-//! source. Nothing is dropped and nothing is synthesised.
-//!
-//! The dialect is deliberately small — the subset that appears in prose.
-//! Indented code blocks are not recognised, because a four-space indent is more
-//! likely to be a writer's indentation than code.
+//! Markdown markup analysis. karyll shows the source styled, never a preview,
+//! so this labels every character rather than stripping markers: **spans tile
+//! their line exactly**, and concatenating them reproduces the source.
 
 use std::ops::Range;
 
@@ -26,11 +15,8 @@ pub enum Block {
     ListItem {
         ordered: bool,
     },
-    /// A bullet with a box after it: `- [ ] ` or `- [x] `.
-    ///
-    /// Three things differ from a plain [`Block::ListItem`]: Enter continues it
-    /// as an *unticked* item, a key ticks it, and a done one is drawn struck
-    /// through.
+    /// A bullet with a box after it: `- [ ] ` or `- [x] `. Enter continues it
+    /// *unticked*, a key ticks it, and a done one is drawn struck through.
     Task {
         done: bool,
     },
@@ -52,17 +38,12 @@ pub enum Style {
     Syntax,
     Emphasis,
     Strong,
-    /// `~~cut this~~`, and the prose of a task that is done.
-    ///
-    /// **Not a face.** No family carries a struck-through cut; the renderer
-    /// draws the body face and rules a line through it. A rule is
-    /// orthogonal to the face under it and one `style` per span cannot say
-    /// both, so this does not combine the way [`Style::StrongEmphasis`] does.
+    /// `~~cut this~~`, and the prose of a task that is done. **Not a face**: the
+    /// renderer draws the body face and rules a line through it, so this does
+    /// not combine the way [`Style::StrongEmphasis`] does.
     Strikethrough,
     /// Both at once: `**strong with *emphasis* inside it**`. A style of its own
-    /// rather than a pair of flags, because that is the smallest change that
-    /// lets one span say it — and the face it asks for, `Role::BodyBoldItalic`,
-    /// already existed for emphasis inside a heading.
+    /// rather than a pair of flags, so one span can say it.
     StrongEmphasis,
     Code,
     /// The visible text of a link.
@@ -86,25 +67,15 @@ pub struct LineMarkup {
     /// Tiles `range` exactly, in order.
     pub spans: Vec<Span>,
     /// What `==…==` covers, **markers included**, in order and never
-    /// overlapping.
-    ///
-    /// A highlight is a field behind the text rather than a face for it, and a
-    /// run can be bold *and* highlighted — which one [`Style`] per span cannot
-    /// say. So the field is carried here as a range and the body keeps its own
-    /// styles: `==a **b** c==` is bold in the middle of a highlight. The `==`
-    /// stay [`Style::Syntax`] and are drawn quiet on top of the field.
+    /// overlapping. Carried apart from the spans because a highlight is a field
+    /// behind the text, and a run can be bold *and* highlighted.
     pub highlights: Vec<Range<usize>>,
 }
 
 impl LineMarkup {
     /// How many characters at the head of the line are its block marker —
-    /// `## `, `> `, `- [x] ` — including the space that ends it and any indent
-    /// before it. Zero for a line that has none.
-    ///
-    /// Taken from the spans rather than parsed again, so it cannot disagree
-    /// with what [`analyze`] decided; the block is what says whether the
-    /// leading syntax span is a marker at all, since a fence and a rule are
-    /// syntax end to end and neither has one.
+    /// `## `, `> `, `- [x] ` — indent and trailing space included. Taken from
+    /// the spans, so it cannot disagree with what [`analyze`] decided.
     pub fn marker(&self) -> usize {
         if !matches!(
             self.block,
@@ -211,16 +182,9 @@ fn analyze_line(chars: &[char], range: Range<usize>, in_fence: &mut bool) -> Lin
     }
 }
 
-/// A line with its markup taken out: `## The **plan**` reads `The plan`.
-///
-/// For the places that list a line rather than draw it — the outline is the one
-/// that wanted it — where `#` and `**` are noise: a reader running an eye down a
-/// column of section names is not reading Markdown, they are reading names.
-///
-/// **Built from the spans rather than by stripping characters**, so it cannot
-/// disagree with what the renderer draws. Anything [`analyze`] calls syntax is
-/// dropped and everything else kept, so a heading with a link or emphasis in it
-/// keeps the words and loses only the punctuation that made them emphatic.
+/// A line with its markup taken out: `## The **plan**` reads `The plan`. For
+/// the places that list a line rather than draw it. **Built from the spans**,
+/// so it cannot disagree with what the renderer draws.
 pub fn plain(chars: &[char], line: &LineMarkup) -> String {
     let text: String = line
         .spans
@@ -245,24 +209,9 @@ pub enum Continue {
     End(usize),
 }
 
-/// Whether Enter continues the block `line` is in, and with what.
-///
-/// **The single biggest flow win available in a Markdown editor**: without it
-/// every bullet after the first is typed by hand, which is enough friction to
-/// stop people using lists at all.
-///
-/// Three rules, and the third is the one people forget:
-///
-/// - A list item or quote with something in it continues, marker and all.
-/// - An **ordered** list counts on: `3.` is followed by `4.`, because a writer
-///   renumbering by hand is exactly what the marker exists to avoid.
-/// - A marker with **nothing after it** ends the block instead. Pressing Enter
-///   twice is how every editor gets out of a list, and without this the writer
-///   would be trapped adding empty bullets.
-///
-/// Headings deliberately do not continue: `# Title` is followed by prose, never
-/// by another heading. Fences do not either, since the closing ``` is a
-/// different thing from a new line inside the block.
+/// Whether Enter continues the block `line` is in, and with what. An ordered
+/// list counts on; a marker with nothing after it ends the block instead.
+/// Headings and fences never continue.
 pub fn continues(line: &[char]) -> Continue {
     let indent = line.iter().take_while(|c| **c == ' ').count().min(3);
     let rest = &line[indent..];
@@ -300,14 +249,9 @@ pub fn continues(line: &[char]) -> Continue {
     Continue::Marker(out)
 }
 
-/// Put `marker` around `span`, or take it off if it is already there.
-///
-/// Returns the range to replace and what to put in it, so the caller makes one
-/// edit and one undo step out of it.
-///
-/// **A toggle rather than an insert**, because the key that adds emphasis is
-/// the key a writer reaches for to remove it, and `****bold****` is what
-/// happens otherwise.
+/// Put `marker` around `span`, or take it off if it is already there. Returns
+/// the range to replace and what to put in it, so the caller makes one edit and
+/// one undo step out of it.
 pub fn toggle_emphasis(chars: &[char], span: Range<usize>, marker: &str) -> (Range<usize>, String) {
     let width = marker.chars().count();
     let inner: String = chars[span.clone()].iter().collect();
@@ -334,12 +278,8 @@ pub fn toggle_emphasis(chars: &[char], span: Range<usize>, marker: &str) -> (Ran
 }
 
 /// Set `line` to heading `level`, or back to a paragraph if it is already at
-/// that level.
-///
-/// Any heading already there is replaced rather than added to, so `##` at level
-/// one is `#` and not `###`. Indentation is dropped: a heading is not an
-/// indented thing, and leaving spaces in front of the hashes would stop it
-/// being a heading at all.
+/// that level. A heading already there is replaced, not added to, and
+/// indentation is dropped — leading spaces would stop it being a heading.
 pub fn toggle_heading(line: &[char], level: u8) -> String {
     let indent = line.iter().take_while(|c| **c == ' ').count().min(3);
     let rest = &line[indent..];
@@ -577,10 +517,8 @@ fn leading_marker(rest: &[char]) -> Option<(Block, usize)> {
 /// How many characters `[ ] ` takes, box and trailing space.
 const BOX: usize = 4;
 
-/// A task box at the head of `rest`, and whether it is ticked.
-///
-/// `x` or `X`; anything else between the brackets is not a box, so `[1]` after
-/// a bullet stays prose.
+/// A task box at the head of `rest`, and whether it is ticked. `x` or `X`;
+/// anything else between the brackets is not a box.
 fn box_at(rest: &[char]) -> Option<bool> {
     if rest.first() != Some(&'[') || rest.get(2) != Some(&']') || rest.get(3) != Some(&' ') {
         return None;
@@ -592,10 +530,8 @@ fn box_at(rest: &[char]) -> Option<bool> {
     }
 }
 
-/// Where a line's task box is, as an offset into it, and whether it is ticked.
-///
-/// The offset is of the character *between* the brackets, which is the one a
-/// tick replaces. `None` for any line that is not a task.
+/// Where a line's task box is, and whether it is ticked. The offset is of the
+/// character *between* the brackets, which is the one a tick replaces.
 pub fn task_box(line: &[char]) -> Option<(usize, bool)> {
     let indent = line.iter().take_while(|c| **c == ' ').count().min(3);
     let rest = &line[indent..];
@@ -637,11 +573,8 @@ fn all_syntax(range: Range<usize>, block: Block) -> LineMarkup {
 }
 
 /// Label the inline markup inside `range`, which must lie on one line.
-///
-/// `highlights` collects the `==…==` fields found anywhere inside `range`,
-/// including inside emphasis, which is why it is threaded through the recursion
-/// rather than returned: the ranges have to reach the line whole, and a field
-/// found inside `**…**` belongs to the same line as one found beside it.
+/// `highlights` is threaded through the recursion rather than returned, so a
+/// field found inside `**…**` reaches the line beside one found next to it.
 fn inline(chars: &[char], range: Range<usize>, highlights: &mut Vec<Range<usize>>) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     let mut text_from = range.start;
@@ -712,9 +645,8 @@ fn inline(chars: &[char], range: Range<usize>, highlights: &mut Vec<Range<usize>
         }
 
         // Highlighted text. The markers stay syntax and the body is parsed like
-        // any other, because the field this records is drawn *behind* the run
-        // and leaves the faces alone — so unlike `~~`, emphasis inside it still
-        // works.
+        // any other: the field is drawn *behind* the run, so unlike `~~`,
+        // emphasis inside it still works.
         if c == '='
             && chars.get(i + 1) == Some(&'=')
             && let Some(close) = find_run(chars, i + 2, range.end, '=', 2)
@@ -729,10 +661,8 @@ fn inline(chars: &[char], range: Range<usize>, highlights: &mut Vec<Range<usize>
                 range: close..close + 2,
                 style: Style::Syntax,
             });
-            // Pushed after the recursion so that a field nested inside this one
-            // — `==a ==b== c==` closes at the first `==`, so this cannot
-            // actually nest, but the body may still contain one after an
-            // emphasis run — stays in document order.
+            // Pushed after the recursion so a field the body turned up stays
+            // in document order.
             highlights.push(i..close + 2);
             highlights.sort_by_key(|h| h.start);
             i = close + 2;
@@ -749,10 +679,9 @@ fn inline(chars: &[char], range: Range<usize>, highlights: &mut Vec<Range<usize>
                 range: i..i + marker,
                 style: Style::Syntax,
             });
-            // **The body is parsed, not taken flat.** Pushed as one span of the
-            // outer style, the `*` inside `**a *b* c**` are bold text rather
-            // than markers and nothing between them is italic. The recursion is
-            // bounded: the inner range is strictly smaller at both ends.
+            // **The body is parsed, not taken flat**, or the `*` inside
+            // `**a *b* c**` would be bold text. Bounded: the inner range is
+            // strictly smaller at both ends.
             for span in inline(chars, i + marker..close, highlights) {
                 spans.push(Span {
                     style: nested(style, span.style),
@@ -785,15 +714,9 @@ fn inline(chars: &[char], range: Range<usize>, highlights: &mut Vec<Range<usize>
     spans
 }
 
-/// What a run inside emphasis ends up as, given the emphasis around it.
-///
-/// `outer` is only ever `Emphasis` or `Strong` — the two things that can be
-/// nested into — so anything emphatic found inside is the other one, and the
-/// pair is both.
-///
-/// **Only prose and emphasis combine.** A marker inside bold is still a marker
-/// and still drawn quiet; code inside bold is still code, which on this device
-/// means the body face, because there is no monospace to embolden.
+/// What a run inside emphasis ends up as. `outer` is only ever `Emphasis` or
+/// `Strong`, so anything emphatic inside is the other one and the pair is both.
+/// **Only prose and emphasis combine**: a marker inside bold is still a marker.
 fn nested(outer: Style, inner: Style) -> Style {
     match inner {
         Style::Text => outer,
@@ -802,11 +725,9 @@ fn nested(outer: Style, inner: Style) -> Style {
     }
 }
 
-/// An emphasis opener at `i`: how many marker characters, and what it means.
-///
-/// An opener must be followed by something other than a space, so that a lone
-/// `*` in prose or a `-` used as a dash does not open emphasis that never
-/// closes.
+/// An emphasis opener at `i`: how many marker characters, and what it means. An
+/// opener must be followed by something other than a space, so a lone `*` in
+/// prose does not open emphasis that never closes.
 fn emphasis_marker(chars: &[char], i: usize, end: usize) -> Option<(usize, Style)> {
     let c = chars[i];
     if c != '*' && c != '_' {
@@ -832,15 +753,9 @@ fn find(chars: &[char], from: usize, end: usize, target: char) -> Option<usize> 
     (from..end).find(|&i| chars[i] == target)
 }
 
-/// Find the closing run for an opener of `len` copies of `target`.
-///
-/// **A run of exactly `len` wins, wherever it is.** A longer one closes only if
-/// there is no exact match at all, and that ordering is what makes nesting
-/// work: in `*a **b** c*` the `**` in the middle is the inner pair's, and taking
-/// the first run that was merely long enough closed the outer emphasis on it —
-/// giving `a **b` in italics and the rest as prose. The looser rule is kept as
-/// the fallback because `**bold***` should still be bold followed by a stray
-/// asterisk, which is what every other renderer does with it.
+/// Find the closing run for an opener of `len` copies of `target`. **A run of
+/// exactly `len` wins, wherever it is**, which is what makes nesting work; a
+/// longer one closes only if there is no exact match, for `**bold***`.
 fn find_run(chars: &[char], from: usize, end: usize, target: char, len: usize) -> Option<usize> {
     let mut longer = None;
     let mut i = from;
@@ -1051,11 +966,9 @@ mod tests {
 
     #[test]
     fn a_bare_run_of_equals_closes_on_itself_and_marks_nothing() {
-        // `is_rule` knows -, * and _ but not =, so a line of them reaches the
-        // inline parser and `====` is an opener that finds its closer with no
-        // body between. An empty field draws as its own two markers, which is
-        // what the characters are. Recorded because setext underlining looks
-        // like this and karyll does not read setext.
+        // `is_rule` knows -, * and _ but not =, so `====` is an opener that
+        // finds its closer with no body between. karyll does not read setext,
+        // whose underlining looks like this.
         assert_eq!(highlighted("===="), ["===="]);
         assert_eq!(
             labelled("===="),
@@ -1156,10 +1069,8 @@ mod tests {
         assert!(styles.contains(&Style::Url), "and the target still quiet");
     }
 
-    /// The reason a longer closing run is still accepted when there is no exact
-    /// one. Every other renderer reads this as bold followed by a stray
-    /// asterisk, and requiring an exact match would have made the whole thing
-    /// prose.
+    /// Why a longer closing run is still accepted when there is no exact one:
+    /// every other renderer reads this as bold followed by a stray asterisk.
     #[test]
     fn a_trailing_extra_marker_still_closes() {
         assert_eq!(

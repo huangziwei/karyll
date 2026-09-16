@@ -1,20 +1,7 @@
 #!/bin/sh
-# Regenerate the home-screen tile's cover art (documents/Karyll.sh).
-#
-# The jailbreak hotfix indexes a `documents/*.sh` scriptlet as a library tile
-# and draws whatever PNG its `# Icon:` header carries as a base64 data URI. That
-# header is one line tens of kilobytes long, so it is generated rather than
-# hand-edited.
-#
-# Pipeline: assets/cover.svg -> rsvg-convert -> pngquant -> assets/cover.png ->
-# base64 -> the `# Icon:` line. Both tools are optional; without them the script
-# degrades in the order below and says which step it skipped.
-#
-# This rewrites ONLY the `# Icon:` line. The shebang, the other headers and the
-# script body are left untouched, so the scriptlet stays a normal file you can
-# edit by hand — run this after changing the cover, not after changing the body.
-#
-# Usage: device/make-tile.sh
+# Regenerate the home-screen tile's cover art: assets/cover.svg -> rsvg-convert
+# -> pngquant -> base64 -> the `# Icon:` header of documents/Karyll.sh.
+# **Rewrites ONLY that line.** Both tools are optional.
 set -eu
 
 cd "$(dirname "$0")"
@@ -37,10 +24,8 @@ grep -q '^# Icon: ' "$TILE" || {
 if [ -f "$SVG" ] && command -v rsvg-convert >/dev/null 2>&1; then
     echo "==> Rendering $SVG -> $PNG (${WIDTH}x${HEIGHT})"
     rsvg-convert -w "$WIDTH" -h "$HEIGHT" -o "$PNG" "$SVG"
-    # Quantize to an 8-bit palette. The tile ships inline as base64 inside a
-    # file pushed over USB, so the PNG's size is the scriptlet's size. The cover
-    # is three flat values plus the greys along their edges, which is a handful
-    # of palette entries — the truecolour render is pure waste here.
+    # Quantize to an 8-bit palette: the PNG ships inline as base64, so its size
+    # is the scriptlet's, and the cover is three flat values plus edge greys.
     if command -v pngquant >/dev/null 2>&1; then
         pngquant --force --skip-if-larger --output "$PNG" -- "$PNG"
     else
