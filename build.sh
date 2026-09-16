@@ -192,9 +192,8 @@ relink() {
 VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
 [ -n "$VERSION" ] || { echo "error: could not read version from Cargo.toml" >&2; exit 1; }
 
-# What the binary is built from — the link flags here decide it as much as the
-# crate does. The stamp below moves when these move, and a second run over an
-# unchanged tree recompiles nothing.
+# What the binary is built from: the link flags here decide it as much as the
+# crate does.
 SOURCES="karyll Cargo.toml Cargo.lock build.sh .cargo/config.toml"
 
 # Stamp the build: a log on the device names the binary that wrote it. Read off
