@@ -7,6 +7,7 @@ mod hyphen;
 mod ime;
 mod keymap;
 mod lexicon;
+mod lipc;
 mod orientation;
 mod osk;
 mod pen;
@@ -192,6 +193,7 @@ fn main() -> Result<()> {
         osk: false,
         osk_height: 0,
         osk_wanted: true,
+        lipc: None,
         paired: Vec::new(),
         connected: None,
         last_edit: None,
@@ -565,6 +567,10 @@ struct Editor {
     /// is nothing else to type on, so this is only ever cleared by a tap — on
     /// `[ Keys ]`, or on the keyboard's own hide key.
     osk_wanted: bool,
+    /// The bus name the keyboard's predictor commits to, held open for as long
+    /// as the keyboard stands. Without it the engine has nowhere to deliver a
+    /// word and only what it does not eat arrives, over X.
+    lipc: Option<lipc::Service>,
     /// Keyboards the daemon knows, refreshed when the panel opens and after
     /// anything changes them. Hit-testing a tap reads this, never the daemon.
     paired: Vec<hid::Device>,
@@ -583,7 +589,9 @@ struct Editor {
     /// The Hangul syllable being typed: a few bytes of state, with no plugin
     /// and no dictionary behind them.
     korean: ime::Korean,
-    /// Whether keys are going to an input method at all. Ctrl+Space toggles it.
+    /// Whether keys are going to an input method at all: set by
+    /// [`Editor::set_language`] from the source picked, and false where its
+    /// engine would not load.
     cjk: bool,
     /// The keys sent towards the current word, what the engine makes of them,
     /// and what it offers. `preedit` is what the bar shows and what `Enter`
@@ -732,6 +740,11 @@ impl Editor {
                 fds.push(a.fd());
                 fds.len() - 1
             });
+            // Not an input device: the keyboard's predictor writes its commits
+            // here, and a word waiting on the socket must wake the loop.
+            if let Some(service) = self.lipc.as_ref() {
+                fds.push(service.raw_fd());
+            }
             let ready = wait(&fds, TICK_MS)?;
 
             // Log-only, and before anything can repaint: this run establishes
@@ -779,6 +792,14 @@ impl Editor {
                 if self.dispatch(actions)? {
                     return Ok(());
                 }
+            }
+
+            // Words the keyboard's predictor committed. Drained whether or not
+            // `poll` named the socket: a set can arrive in the same wake as the
+            // keystroke that produced it.
+            if self.committed() {
+                self.note_input();
+                self.paint()?;
             }
 
             // A read that fails drops the descriptor. `wait` reports a hangup
@@ -1097,18 +1118,9 @@ impl Editor {
         }
         let mut cells = match self.mode {
             // Ordered by how often a finger reaches for it. The status line
-            // reports the autosave, and what is here depends on what there is
-            // to type on: see below.
+            // reports the autosave, and Outline is `Ctrl`/`⌘`+`Shift`+`O`.
             Mode::Writing => {
-                let mut cells = vec![Bar::Exit, Bar::Files, Bar::Config];
-                if self.osk {
-                    // The two things a writer on the glass has no other route
-                    // to. **`[ Help ]` is what the strip gives up**: six cells
-                    // is what a 1264 px panel holds, per the `strips` tests.
-                    cells.extend([Bar::Find, Bar::Outline]);
-                } else {
-                    cells.push(Bar::Help);
-                }
+                let mut cells = vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help];
                 // **Only where it is the way a writer types at all.** Last, and
                 // so as far from `[ Exit ]` as the strip goes: this cell is
                 // reached for constantly and that one must not be.
@@ -2834,7 +2846,6 @@ impl Editor {
             Bar::Help => self.open_help()?,
             Bar::Outline => self.open_outline()?,
             Bar::Keys => self.toggle_osk()?,
-            Bar::Find => self.open_find()?,
             Bar::New => self.start_naming(true)?,
             Bar::Rename => self.start_naming(false)?,
             Bar::PageBack => self.turn_page(true)?,
@@ -3302,15 +3313,27 @@ impl Editor {
         if want == self.osk {
             return Ok(());
         }
-        // A keyboard that would not come up must not leave the page laid out
-        // around a band that is not there. Asking again every tick would be a
-        // `lipc-set-prop` five times a second, so the ask is dropped instead.
+        // **Before the keyboard, not after.** Its predictor addresses commits to
+        // this name, and a word committed before the name is held is lost.
+        if want && self.lipc.is_none() {
+            match lipc::Service::open(osk::CLIENT) {
+                Ok(service) => {
+                    eprintln!("lipc: {} is open", service.name());
+                    self.lipc = Some(service);
+                }
+                // Every key the predictor does not eat still arrives over X.
+                Err(err) => eprintln!("?? lipc: {err:#} — Latin typing only"),
+            }
+        }
+        // The page must not be laid out around a band that is not there, and
+        // asking again every tick would be five `lipc-set-prop` a second.
         if want && !osk::open() {
             self.osk_wanted = false;
             return Ok(());
         }
         if !want {
             osk::close();
+            self.lipc = None;
         }
         self.osk_height = if want { self.measure_osk() } else { 0 };
         eprintln!(
@@ -3879,8 +3902,6 @@ impl Editor {
         lines
     }
 
-    /// Move to the next input source. Ctrl+Space and the language button are
-    /// the same action: they cannot disagree about what is selected.
     fn cycle_language(&mut self) {
         self.set_language(self.language.next(&self.enabled));
         // Say which one, beside the caret. The strip is hidden while writing:
@@ -3981,6 +4002,12 @@ impl Editor {
     /// in [`ime::compose`]. [`Editor::compose_plugin`] drives a session with
     /// candidates; [`Editor::compose_hangul`] drives the state machine here.
     fn compose_key(&mut self, action: &Action) -> Composed {
+        // **Never two engines over one document.** While the on-screen keyboard
+        // stands, it composes: its candidate bar is on its own window and its
+        // words arrive through [`Editor::committed`].
+        if self.osk {
+            return Composed::Passed;
+        }
         let Some(script) = self.language.script() else {
             return Composed::Passed;
         };
@@ -4213,6 +4240,68 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// Take back `count` characters from wherever typed text is landing, which
+    /// is what the keyboard's predictor asks for when a candidate covers text
+    /// it has already committed.
+    fn delete_committed(&mut self, count: usize) {
+        for _ in 0..count {
+            match self.sink() {
+                Sink::Page => {
+                    self.doc.backspace();
+                    self.last_edit = Some(std::time::Instant::now());
+                }
+                Sink::Find => {
+                    if self.edit_field(|field| {
+                        field.pop();
+                    }) {
+                        self.research();
+                    }
+                }
+                Sink::Name => {
+                    if let Mode::Naming { name, .. } = &mut self.mode {
+                        name.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take whatever the on-screen keyboard's predictor has set on this app's
+    /// bus name into the document, answering whether anything moved.
+    fn committed(&mut self) -> bool {
+        let Some(service) = self.lipc.as_mut() else {
+            return false;
+        };
+        let sets = service.drain();
+        let mut moved = false;
+        for set in sets {
+            moved |= self.keyboard_set(&set.property, &set.value);
+        }
+        moved
+    }
+
+    /// One property the keyboard set. `keyboardCommit` carries the text;
+    /// `keyboardSetPreeditString` `position:str`; `keyboardDelete`
+    /// `before:after`; `keyboardReplace` `before:after:str`.
+    fn keyboard_set(&mut self, property: &str, value: &str) -> bool {
+        match property {
+            "keyboardCommit" => {
+                self.preedit.clear();
+                self.insert_committed(value);
+            }
+            "keyboardSetPreeditString" => preedit_text(value).clone_into(&mut self.preedit),
+            "keyboardDelete" => self.delete_committed(delete_count(value)),
+            "keyboardReplace" => {
+                let (before, said) = replace_parts(value);
+                self.delete_committed(before);
+                self.preedit.clear();
+                self.insert_committed(&said);
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Throw away the half-typed word, in the engine as well as here.
@@ -4849,6 +4938,29 @@ fn osk_band(said: i32, height: u16) -> u16 {
     (said.clamp(0, u16::MAX as i32) as u16).min(height / 2)
 }
 
+/// The text a `keyboardSetPreeditString` carries, past the `position:` it opens
+/// with. Free of the editor, with [`delete_count`] and [`replace_parts`]: these
+/// are the keyboard's wire format and the one part of it that can be got wrong.
+fn preedit_text(value: &str) -> &str {
+    value.split_once(':').map_or(value, |(_, said)| said)
+}
+
+/// How many characters back a `keyboardDelete` takes. `before:after`.
+fn delete_count(value: &str) -> usize {
+    let before = value.split_once(':').map_or(value, |(before, _)| before);
+    before.parse().unwrap_or(0)
+}
+
+/// What a `keyboardReplace` asks for: how many characters back to take, and
+/// what to put in their place. `before:after:str`, and `str` keeps any colons
+/// of its own.
+fn replace_parts(value: &str) -> (usize, String) {
+    let mut parts = value.splitn(3, ':');
+    let before = parts.next().unwrap_or_default().parse().unwrap_or(0);
+    let said = parts.nth(1).unwrap_or_default().to_string();
+    (before, said)
+}
+
 /// Whether the action strip is on screen. Free of the editor, so the safety
 /// rules stay testable: the strip is the only way out without a keyboard, and
 /// the only way to dismiss the on-screen one.
@@ -5263,6 +5375,7 @@ fn help_items() -> Vec<ui::Item> {
         row("Extend a selection", "Shift + tap"),
         row("The pen", "Places the cursor. It does not write."),
         row("With no keyboard", "One comes up on screen by itself"),
+        row("Its language and words", "Set on the keyboard, not here"),
         row("Putting it away", "The Keys button, along the foot"),
         row("Delete a document", "Its Delete chip, twice"),
         row("Replace every match", "Its All chip, twice"),
@@ -5621,9 +5734,6 @@ enum Bar {
     /// strip where there is no Bluetooth keyboard, because that is the only
     /// place it is the answer to anything.
     Keys,
-    /// Open the find bar. It has a shortcut and no cell, because a writer with
-    /// keys has `Ctrl`/`⌘`+`F` — and one typing on the glass has neither.
-    Find,
 }
 
 impl Bar {
@@ -5644,7 +5754,6 @@ impl Bar {
             Bar::New => "New document",
             Bar::Rename => "Rename",
             Bar::Keys => "Keys",
-            Bar::Find => "Find",
             // Filled in by `strip_labels`, which knows what was typed.
             Bar::Query => "Find:",
             Bar::Count => "",
@@ -6221,23 +6330,12 @@ nine words in this one under the third level
                 paged.extend(paging);
                 out.push((name, paged));
             }
-            // The writing strip's other two forms: with no Bluetooth keyboard
-            // attached, and with the on-screen one standing. Appended, so the
-            // lookup above keeps its meaning.
+            // The writing strip with no Bluetooth keyboard attached, which is
+            // the only form carrying `[ Keys ]`. Appended, so the lookup above
+            // keeps its meaning.
             out.push((
                 "writing, no keyboard",
                 vec![Bar::Exit, Bar::Files, Bar::Config, Bar::Help, Bar::Keys],
-            ));
-            out.push((
-                "writing, keyboard up",
-                vec![
-                    Bar::Exit,
-                    Bar::Files,
-                    Bar::Config,
-                    Bar::Find,
-                    Bar::Outline,
-                    Bar::Keys,
-                ],
             ));
             out
         }
@@ -6386,6 +6484,42 @@ nine words in this one under the third level
             for bar in [Bar::Count, Bar::Change, Bar::All, Bar::Done, Bar::Replace] {
                 assert_eq!(Field::of(bar), None, "{bar:?}");
             }
+        }
+    }
+
+    /// The on-screen keyboard's predictor writes these, and karyll reads them:
+    /// a misread is a word landing mangled in the document.
+    mod keyboard_wire {
+        use super::*;
+
+        #[test]
+        fn a_preedit_is_the_text_past_its_position() {
+            assert_eq!(preedit_text("0:nihao"), "nihao");
+            assert_eq!(preedit_text("3:你好"), "你好");
+            // The text keeps colons of its own.
+            assert_eq!(preedit_text("0:a:b"), "a:b");
+            // Nothing before the separator is the whole value.
+            assert_eq!(preedit_text("nihao"), "nihao");
+            assert_eq!(preedit_text(""), "");
+        }
+
+        #[test]
+        fn a_delete_takes_the_count_it_opens_with() {
+            assert_eq!(delete_count("2:0"), 2);
+            assert_eq!(delete_count("0:0"), 0);
+            assert_eq!(delete_count("11:3"), 11);
+            // Anything unreadable takes nothing rather than guessing.
+            assert_eq!(delete_count("x:0"), 0);
+            assert_eq!(delete_count(""), 0);
+        }
+
+        #[test]
+        fn a_replace_names_a_count_and_the_text_after_it() {
+            assert_eq!(replace_parts("2:0:你好"), (2, "你好".to_string()));
+            assert_eq!(replace_parts("0:0:"), (0, String::new()));
+            // The third field is the remainder, colons and all.
+            assert_eq!(replace_parts("1:0:a:b:c"), (1, "a:b:c".to_string()));
+            assert_eq!(replace_parts(""), (0, String::new()));
         }
     }
 

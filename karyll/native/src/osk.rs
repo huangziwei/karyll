@@ -1,25 +1,6 @@
-//! The framework's own on-screen keyboard, for a Kindle with no Bluetooth
-//! keyboard beside it.
-//!
-//! **Named `osk` and not `keyboard`, because in this app a keyboard is a
-//! physical one.** `keyboard_present`, `keyboard_items` and the exclusive
-//! evdev grab all mean the Bluetooth one; this is the other thing.
-//!
-//! It is not drawn here and it is not ours. [`open`] asks `com.lab126.keyboard`
-//! for it over lipc and the framework maps its own window over the foot of
-//! ours; what is tapped on it arrives as ordinary X `KeyPress` events on the
-//! window that holds focus, which is why [`crate::window::Window`] selects
-//! `KEY_PRESS`. So there are only three things to do: raise it, put it away,
-//! and know how much of the screen it is standing on.
-//!
-//! **The flags byte asks for no predictor.** Bit 0 would turn on the
-//! framework's own candidate bar, and then committed text stops arriving over
-//! X and starts arriving as `keyboardCommit` properties set on a lipc service
-//! this app would have to stand up and own. karyll already has an input
-//! method, a candidate box and a lexicon — see [`crate::ime`] — and running
-//! the framework's beside them would mean two engines over one document and a
-//! second candidate bar drawn across the first. Every key comes in raw and
-//! karyll composes, exactly as it does from the Bluetooth keyboard.
+//! The framework's on-screen keyboard, asked for over lipc: it maps its own
+//! window over the foot of ours. **It composes with its own predictor**, whose
+//! candidate bar is drawn on that window and whose commits arrive over lipc.
 
 use std::process::Command;
 
@@ -28,18 +9,18 @@ const SERVICE: &str = "com.lab126.keyboard";
 const OPEN: &str = "open";
 const CLOSE: &str = "close";
 
-/// The name [`open`] hands over, and [`close`] matches against. It only names
-/// the asker; nothing answers on it while [`FLAGS`] asks for no predictor.
-const CLIENT: &str = "com.karyll.editor";
+/// The name [`open`] hands over, and [`close`] matches against. The keyboard
+/// addresses its commits to it, so [`crate::lipc::Service`] must hold this name
+/// on the bus before the keyboard is raised.
+pub const CLIENT: &str = "com.karyll.editor";
 
 /// The layout [`open`] asks for. `pad` and `web` are the two the framework
 /// matches against; any other value draws the alphabetic one.
 const LAYOUT: &str = "abc";
 
 /// Bit 0 runs the predictor and its candidate bar, bit 1 asks for surrounding
-/// text, bit 2 makes backspace take a word. None of the three: see the module
-/// note.
-const FLAGS: u32 = 0x0;
+/// text, bit 2 makes backspace take a word.
+const FLAGS: u32 = 0x1;
 
 /// The live layout, rewritten on a keyboard language change.
 const KEYMAP: &str = "/var/local/system/current.keymap";
@@ -80,13 +61,9 @@ fn set(prop: &str, value: &str) -> bool {
     }
 }
 
-/// How much of a `panel` px tall panel it covers, anchored to the foot and
-/// full width: [`KEYMAP`] first, then [`PANELS`], then a third.
-///
-/// **`panel` is the panel's own height, not the window's.** The figure in the
-/// keymap is a property of the hardware, and it does not turn with us: on a
-/// Scribe held sideways the band is still 808 px of a window 1860 px tall.
-/// Callers pass the long side either way.
+/// How much of a `panel` px tall panel it covers, anchored to the foot and full
+/// width: [`KEYMAP`] first, then [`PANELS`], then a third. **`panel` is the
+/// hardware's own height** — the band does not turn with the window.
 pub fn height(panel: i32) -> i32 {
     if let Some(said) = std::fs::read_to_string(KEYMAP).ok().and_then(|said| {
         let head: String = said.chars().take(2048).collect();
