@@ -192,10 +192,33 @@ relink() {
 VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
 [ -n "$VERSION" ] || { echo "error: could not read version from Cargo.toml" >&2; exit 1; }
 
-# Stamp the build: a log on the device names the binary that wrote it. An
-# inherited KARYLL_BUILD wins, carrying a release tag; the time of day separates
-# two builds made the same afternoon.
-BUILD_STAMP=${KARYLL_BUILD:-$(date +%H%M%S)}
+# What the binary is built from — the link flags here decide it as much as the
+# crate does. The stamp below moves when these move, and a second run over an
+# unchanged tree recompiles nothing.
+SOURCES="karyll Cargo.toml Cargo.lock build.sh .cargo/config.toml"
+
+# Stamp the build: a log on the device names the binary that wrote it. Read off
+# the source and never the clock — `build.rs` has cargo watch KARYLL_BUILD, so a
+# stamp that moves on its own rebuilds karyll-native on every run.
+build_stamp() {
+    head=$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null) || { echo unknown; return; }
+    dirt=$(git -C "$ROOT" status --porcelain -- $SOURCES 2>/dev/null)
+    [ -n "$dirt" ] || { echo "$head"; return; }
+    # Uncommitted work, hashed: two different working trees must not share a
+    # stamp, and one that has not changed must not invent a new one.
+    delta=$({
+        git -C "$ROOT" diff HEAD -- $SOURCES
+        git -C "$ROOT" ls-files --others --exclude-standard -- $SOURCES |
+            while read -r f; do
+                printf '%s\n' "$f"
+                cat "$ROOT/$f"
+            done
+    } 2>/dev/null | shasum -a 256 | cut -c1-7)
+    echo "$head+$delta"
+}
+
+# An inherited KARYLL_BUILD wins, carrying a release tag.
+BUILD_STAMP=${KARYLL_BUILD:-$(build_stamp)}
 
 # Read with whichever tool can parse a foreign ELF here: macOS has LLVM's
 # `objdump` and a Linux box has GNU `readelf`. Absent tools and empty greps are
