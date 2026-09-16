@@ -473,7 +473,6 @@ enum Composed {
     Took,
     /// Not handled, and the composition was committed on the way out.
     Finished,
-    /// Untouched.
     Passed,
 }
 
@@ -1859,7 +1858,7 @@ impl Editor {
         // Read again, in place of dropping the row: the words and ages of
         // everything else are a snapshot from when the panel opened, and one of
         // them may be the document just opened in place of this.
-        self.mode = Mode::Files(list_documents());
+        self.set_mode(Mode::Files(list_documents()));
         self.panel_page = 0;
         self.panel_focus = None;
         self.paint()
@@ -1867,7 +1866,7 @@ impl Editor {
 
     /// Show what the keys and the glass do.
     fn open_help(&mut self) -> Result<()> {
-        self.mode = Mode::Help;
+        self.set_mode(Mode::Help);
         self.panel_page = 0;
         self.panel_focus = None;
         self.paint()
@@ -1880,7 +1879,7 @@ impl Editor {
         let sections = self.sections();
         let cursor = self.doc.cursor();
         let here = sections.iter().rposition(|s| s.at <= cursor).unwrap_or(0);
-        self.mode = Mode::Outline(sections);
+        self.set_mode(Mode::Outline(sections));
         let capacity = self.layout().capacity().max(1);
         self.panel_page = here / capacity;
         self.panel_focus = None;
@@ -2012,7 +2011,7 @@ impl Editor {
         // A half-tapped Delete does not survive leaving the list.
         self.arming = None;
         self.panel_focus = None;
-        self.mode = Mode::Writing;
+        self.set_mode(Mode::Writing);
         self.paint()
     }
 
@@ -2328,7 +2327,7 @@ impl Editor {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default()
         };
-        self.mode = Mode::Naming { for_new, name };
+        self.set_mode(Mode::Naming { for_new, name });
         self.paint()
     }
 
@@ -2837,7 +2836,7 @@ impl Editor {
             Bar::Done if self.find.is_some() => self.close_find()?,
             Bar::Done | Bar::Cancel => self.leave_panel()?,
             Bar::Files => {
-                self.mode = Mode::Files(list_documents());
+                self.set_mode(Mode::Files(list_documents()));
                 self.panel_page = 0;
                 self.panel_focus = None;
                 self.arming = None;
@@ -2852,7 +2851,7 @@ impl Editor {
             Bar::PageOn => self.turn_page(false)?,
             Bar::PageAt => {}
             Bar::Config => {
-                self.mode = Mode::Config;
+                self.set_mode(Mode::Config);
                 // What the daemon remembers, read fresh — the Keyboard section
                 // is drawn from it. Last session's scan results are not: those
                 // keyboards were in the room at the time of the scan.
@@ -2869,7 +2868,7 @@ impl Editor {
     /// Switch to another document, saving the current one first.
     fn open(&mut self, path: PathBuf) -> Result<()> {
         self.load(path)?;
-        self.mode = Mode::Writing;
+        self.set_mode(Mode::Writing);
         self.paint()
     }
 
@@ -3294,7 +3293,7 @@ impl Editor {
     }
 
     /// Put the on-screen keyboard away, or ask for it back. What the `[ Keys ]`
-    /// cell does, and the only thing that overrides [`Editor::reconcile_osk`].
+    /// cell does, and the only thing that overrides [`Editor::settle_osk`].
     fn toggle_osk(&mut self) -> Result<()> {
         self.osk_wanted = !self.osk_wanted;
         // A writer reaching for the keyboard wants the page it is about to
@@ -3305,13 +3304,27 @@ impl Editor {
         self.reconcile_osk()
     }
 
-    /// Stand the on-screen keyboard up wherever there is nothing else to type
-    /// on, and lay the page out again. Called every tick: a keyboard arriving or
-    /// leaving is the whole of the question, and neither announces itself.
+    /// Settle the on-screen keyboard and lay the page out again. Called every
+    /// tick: a keyboard arriving or leaving is the whole of the question, and
+    /// neither announces itself.
     fn reconcile_osk(&mut self) -> Result<()> {
-        let want = self.osk_wanted && !self.keyboard_present && !self.window.buried();
+        if self.settle_osk() {
+            self.paint()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Bring the keyboard into line with the page without painting, and answer
+    /// whether it moved. Split out for [`Editor::set_mode`]: a panel measures
+    /// against the height it is about to have, not the one it is leaving.
+    fn settle_osk(&mut self) -> bool {
+        let want = self.osk_wanted
+            && takes_typing(&self.mode)
+            && !self.keyboard_present
+            && !self.window.buried();
         if want == self.osk {
-            return Ok(());
+            return false;
         }
         // **Before the keyboard, not after.** Its predictor addresses commits to
         // this name, and a word committed before the name is held is lost.
@@ -3329,7 +3342,7 @@ impl Editor {
         // asking again every tick would be five `lipc-set-prop` a second.
         if want && !osk::open() {
             self.osk_wanted = false;
-            return Ok(());
+            return false;
         }
         if !want {
             osk::close();
@@ -3350,7 +3363,15 @@ impl Editor {
         self.window.set_typing(want);
         // Every row moves: the band is a third of the screen.
         self.frame = None;
-        self.paint()
+        true
+    }
+
+    /// Show another page, settling the on-screen keyboard against it first.
+    /// Every caller measures a layout afterwards, and a panel laid out while
+    /// the keyboard is still standing is laid out for a screen a third short.
+    fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.settle_osk();
     }
 
     /// Follow the framework when it has turned the screen. The compositor
@@ -3520,7 +3541,7 @@ impl Editor {
                         let _ = std::fs::write(&path, "");
                         self.open(path)?;
                     } else {
-                        self.mode = Mode::Writing;
+                        self.set_mode(Mode::Writing);
                         self.paint()?;
                     }
                     return Ok(true);
@@ -3537,7 +3558,7 @@ impl Editor {
                 return Ok(true);
             }
             Action::Escape => {
-                self.mode = Mode::Writing;
+                self.set_mode(Mode::Writing);
                 self.paint()?;
                 return Ok(true);
             }
@@ -3545,7 +3566,7 @@ impl Editor {
             // opening shortcut follows — see [`Editor::reopens`]. Only for a
             // new document: a rename is opened from the Files strip.
             Action::NewDocument if for_new => {
-                self.mode = Mode::Writing;
+                self.set_mode(Mode::Writing);
                 self.paint()?;
                 return Ok(true);
             }
@@ -3555,7 +3576,7 @@ impl Editor {
             // As in the find bar: with a CJK engine on, every letter goes to
             // the engine. This is the only way back to a Latin filename.
             Action::CycleLanguage => {
-                self.mode = Mode::Naming { for_new, name };
+                self.set_mode(Mode::Naming { for_new, name });
                 self.cycle_language();
                 self.paint()?;
                 return Ok(false);
@@ -3563,7 +3584,7 @@ impl Editor {
             Action::Insert(c) if in_filename(*c) => name.push(*c),
             _ => {}
         }
-        self.mode = Mode::Naming { for_new, name };
+        self.set_mode(Mode::Naming { for_new, name });
         self.paint()?;
         Ok(false)
     }
@@ -3580,7 +3601,7 @@ impl Editor {
         }
         self.path = Some(path);
         self.doc.mark_saved();
-        self.mode = Mode::Writing;
+        self.set_mode(Mode::Writing);
         self.paint()
     }
 
@@ -3713,7 +3734,7 @@ impl Editor {
                     // Out of Config: a keyboard that works wants typing on. The
                     // strip changes from `[ Done ]` to the writing row as it
                     // goes, and the next tap there is spent looking.
-                    self.mode = Mode::Writing;
+                    self.set_mode(Mode::Writing);
                     self.strip_changed = true;
                     return self.paint();
                 }
@@ -5457,6 +5478,12 @@ fn outline_items(sections: &[Section], cursor: usize) -> Vec<ui::Item> {
         .collect()
 }
 
+/// Whether the page `mode` is showing is one a keyboard is for. The panels are
+/// read and tapped, and one standing over them covers a third of the list.
+fn takes_typing(mode: &Mode) -> bool {
+    matches!(mode, Mode::Writing | Mode::Naming { .. })
+}
+
 /// Whether one line of the panel `mode` is showing can take the keyboard. What
 /// a line means is the mode's to say: a row with no chips is a document in the
 /// Files list, a heading in the outline, and a fact on the Help page.
@@ -6536,6 +6563,25 @@ nine words in this one under the third level
         assert!(strip_visible(true, true, false, true, true));
         // And the case that actually happens — nothing paired, keyboard up.
         assert!(strip_visible(true, false, false, true, true));
+    }
+
+    /// The panels are read and tapped. Only the draft and a filename are typed
+    /// into, and the keyboard follows them.
+    #[test]
+    fn only_the_pages_that_are_typed_into_take_the_keyboard() {
+        assert!(takes_typing(&Mode::Writing));
+        assert!(takes_typing(&Mode::Naming {
+            for_new: true,
+            name: String::new(),
+        }));
+        assert!(takes_typing(&Mode::Naming {
+            for_new: false,
+            name: "draft".into(),
+        }));
+        assert!(!takes_typing(&Mode::Files(Vec::new())));
+        assert!(!takes_typing(&Mode::Config));
+        assert!(!takes_typing(&Mode::Help));
+        assert!(!takes_typing(&Mode::Outline(Vec::new())));
     }
 
     /// What the firmware states, on the panels karyll targets. The band does

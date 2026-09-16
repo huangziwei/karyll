@@ -32,7 +32,6 @@ pub enum Block {
 /// one looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
-    /// Prose.
     Text,
     /// Markup characters: `##`, `**`, `` ` ``, `](`. Drawn quieter than prose.
     Syntax,

@@ -1820,9 +1820,9 @@ mod tests {
 
     #[test]
     fn moving_the_cursor_to_the_next_sentence_makes_the_rows_it_touches_dirty() {
-        // The trap this field exists for. A cursor moving between sentences
-        // changes no text, no size and no position, and both rows count as
-        // unchanged without `focus` in the comparison.
+        // A cursor moving between sentences changes no text, no size and no
+        // position: without `focus` in the comparison both rows count as
+        // unchanged.
         let text = "One here. Two there.";
         let chars: Vec<char> = text.chars().collect();
         let mut before = line(0..20, 0);

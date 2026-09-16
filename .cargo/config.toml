@@ -1,35 +1,10 @@
-# Target-specific only, so host (macOS) builds and `cargo test` stay untouched
-# and this only applies when cross-compiling to the Kindle.
-#
-#   ./build.sh                                        the real build
-#   cargo check --target armv7-unknown-linux-gnueabihf -p karyll-native
-#
-# **Two targets, because the Kindles run two ARM ABIs.** They are the same
-# 32-bit armv7 userspace either way; what differs is how floats are passed, and
-# a binary built for the wrong one names a loader the device does not have and
-# never starts. `build.sh` builds both and ships both, and the launcher picks by
-# looking for the loader each one names.
-#
-# Linker: rustc's bundled rust-lld. Apple's `ld` cannot link ELF, and this is the
-# pure-Rust cross path — no zig, no GNU cross-binutils. It holds only as long as
-# no crate in the graph has a C build script, which is why every dependency is
-# chosen for being pure Rust. If that ever changes the fallback is
-# `brew install zig && cargo install cargo-zigbuild`, then `cargo zigbuild`.
-#
-# The prerequisite is `rustup target add` for both. rustc resolves `rust-lld`
-# from the active toolchain's own `lib/rustlib/<host>/bin`, so it needs no entry
-# on PATH.
+# Two targets, because the Kindles run two ARM ABIs: a binary built for the
+# wrong one names a loader the device does not have and never starts.
+# `build.sh` builds both, and the launcher picks by the loader each one names.
 
-# **This is what karyll ships as.** Dynamically linked against the device's own
-# glibc, because CJK input works by `dlopen`-ing Amazon's zh_CN predictor plugin
-# off the device and a static binary has no dynamic loader to do it with. That
-# is not a limitation to code around: it is the difference between the two kinds
-# of binary.
-#
-# The sysroot flags are NOT here — `build.sh` sets them, because the sysroot has
-# to be assembled before it can be pointed at. It is Debian jessie's glibc for
-# each architecture, fetched and checksummed on first build, so `./build.sh`
-# works from a fresh clone with no device involved.
+# `rust-lld` because Apple's `ld` cannot link ELF. The pure-Rust cross path
+# holds only while no crate in the graph has a C build script. The sysroot is
+# `build.sh`'s: it has to be assembled before it can be pointed at.
 
 # Hard float: the Scribe and the Colorsoft.
 [target.armv7-unknown-linux-gnueabihf]

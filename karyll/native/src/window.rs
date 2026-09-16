@@ -38,7 +38,6 @@ pub const FIELD_QUIET: u8 = 0xE4;
 /// colour; every other byte in the backing store is a luminance. Kept low and
 /// contiguous so the match in `Palette::pixel` is a small jump table.
 pub mod ink {
-    /// The caret.
     pub const CARET: u8 = 0x01;
     /// A `==highlight==` field on the focused row.
     pub const FIELD: u8 = 0x02;
